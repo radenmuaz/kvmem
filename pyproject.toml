@@ -1,0 +1,27 @@
+[project]
+name = "kvmem"
+version = "0.1.0"
+description = "Key-value memory store"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jax",
+    "equinox"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

@@ -1,29 +1,25 @@
-# KV-as-Fast-Weights — Implementation Handover
-
-This is a handover document for implementing stages 0 and 1 of the KV-as-Fast-Weights project, plus outlines of subsequent stages. The architectural decisions in §2 are **locked** — don't relitigate them while implementing. The existing reference implementations (`kv_fast_weights_compression.py`, `kv_fast_weights_lm.py`, `kv_fast_weights_regression.py`) and `PROJECT_SUMMARY.md` are prerequisites; read those first.
-
----
+# KV-as-Fast-Weights — Implementation Plan
 
 ## 1. Project Context
 
 The project builds a transformer architecture in which **new information is absorbed by writing to the KV cache rather than by gradient updates to weights**. Slow MLP weights hold *procedural* skills (read, write, retrieve, compress); the KV cache holds *declarative* content. "Training on new data" at deployment becomes a single forward pass that produces a compressed KV memory — no backprop at inference.
 
-Stages 0 and 1 validate the core primitive (compression + multi-pass refinement on a single chunk) before any of the streaming, SRS, or scale-up work begins. The synthetic task is in-context Markov-chain language modeling at the scale already used in the reference implementations.
+Stages 0 and 1 validate the core primitive (compression + multi-pass refinement on a single chunk) before any of the streaming, SRS, or scale-up work begins. The synthetic task is byte-level Markov-chain language modeling.
 
 ---
 
-## 2. Locked Architectural Decisions
-
-These were settled before implementation begins. Do not change without checking back.
+## 2. Architectural Decisions
 
 | Decision | Choice | Why |
 |---|---|---|
-| Architecture style | Decoder-only with custom attention mask | Simpler than encoder-decoder; existing reference works; switch to hybrid only at stage 2 |
-| Position embeddings | **None** (NoPE — no learned positional terms) | Enables arbitrary memory length; better length generalization |
-| Memory tokens | **Single fixed marker** from existing vocab (reserved low-frequency or held-out corpus token) | No vocab augmentation; arbitrary N; saves ~2Nd params |
-| Strength gating | Per-position softplus gate on attention keys | Soft sparsification, capacity regularization |
-| Training target | **NTP on independent continuation** (NOT reconstruction of `x_S`) | Theoretically motivated by IPTT (arXiv:2604.06169); eliminates shortcut issues that reconstruction had |
-| Mask design | `Y` blocks are write-only sinks; `Y` can't see source; cross-`Y` blocked | Train-inference consistency: memory writes use only what's available at inference |
+| Architecture style | Decoder-only with custom attention mask | Simpler than encoder-decoder |
+| Position embeddings | **None** (NoPE) | Enables arbitrary memory length; better length generalization |
+| Memory tokens | **Sequential bytes 0x00–0x{N-1}** bracketed by STX/ETX control bytes | Gives each slot unique layer-0 input (helps differentiation); bracket bytes signal region boundaries; all from byte vocab |
+| Strength gating | **None** | Removed; mask structure alone enforces the bottleneck |
+| Training target | **NTP on independent continuation** (NOT reconstruction of `x_S`) | Motivated by IPTT (arXiv:2604.06169); eliminates shortcut issues |
+| Mask design | `Y` blocks are write-only sinks; `Y` can't see source; cross-`Y` blocked | Train-inference consistency |
+| Vocab | **Byte-level: V = 256** (values 0–255) | Realistic; no vocab augmentation |
+| **Variable N training** | **N sampled randomly each batch** from `N_set = {2, 4, 8, 16, 32}` | Model learns to compress into any N; masks precomputed per N at startup |
 
 ---
 
@@ -31,536 +27,406 @@ These were settled before implementation begins. Do not change without checking 
 
 | Symbol | Meaning |
 |---|---|
-| `V` | Vocabulary size (no augmentation; one corpus token is reserved as marker `m`) |
+| `V` | Vocabulary size = 256 (byte-level, 0–255) |
 | `L_S` | Source chunk length |
-| `N` | Number of memory positions per pass |
+| `N` | Number of **inner** memory positions per pass (varies per batch during training) |
 | `L_y` | Continuation length per pass |
 | `T` | Number of refinement passes (stage 1+) |
 | `d` | Model dimension |
 | `H` | Number of attention heads, `d_h = d/H` |
 | `S, M, Y` | Source, memory, continuation region position sets |
-| `m` | Reserved marker token (single fixed corpus token ID) |
+---
+
+## 4. Segment Protocol
+
+### 4.1 Design principle: delimiter-based, not content-based
+
+Memory slots are identified by **position between delimiters**, not by their token ID. This generalizes to arbitrary N and arbitrary corpus without collision.
+
+**Two layers of the byte vocab:**
+- `0x00–0x1F` — ASCII control codes, reserved as **protocol bytes**. Never appear in data content. The model learns these as structural signals.
+- `0x20–0xFF` — printable ASCII + high bytes, used for **data content**.
+
+This separation is enforced in data generation: Markov chains and real text corpora are constrained to `0x20–0xFF`. If a corpus contains control bytes, strip or remap them before training.
+
+### 4.2 Segment byte registry
+
+A small set of control bytes act as open/close delimiters for named segment types. Allocate pairs as needed; unused pairs cost nothing.
+
+| Open | Close | ASCII names | Segment type | Stage introduced |
+|---|---|---|---|---|
+| `0x02` | `0x03` | STX / ETX | **Memory write** (M region) | Stage 0 |
+| `0x04` | `0x05` | EOT / ENQ | **Continuation / query** (Y region) | Stage 0 (implicit — Y is already delimited by mask, add explicit tokens if needed) |
+| `0x06` | `0x07` | ACK / BEL | **SRS rehearsal chunk** | Stage 3 |
+| `0x08` | `0x09` | BS / HT   | **Self-eval probe** | Stage 4 |
+| `0x0A` | `0x0B` | LF / VT   | Reserved | — |
+| `0x0C` | `0x0D` | FF / CR   | Reserved | — |
+
+Adding a new segment type in a future stage = allocate the next pair, update the mask builder, update data generation. Zero architecture changes.
+
+### 4.3 Memory block format
+
+Inner memory slots are all **`0x00` (NUL)** — identical, N of them, no slot index encoded in token ID:
+
+```
+memory_block(N) = [ 0x02 | 0x00 × N | 0x03 ]
+                  [ STX  | NUL × N   | ETX  ]
+  total tokens  = N + 2
+```
+
+The **mask region M covers only the N NUL slots**. STX and ETX are treated as source-like (causal, visible to everything after them).
+
+Slot differentiation comes from **depth + causal asymmetry** (NoPE): slot k sees k more tokens than slot 0, producing distinct attention patterns at every layer. This is the correct place to solve it — not in token IDs. If collapse occurs, increase n_layers.
+
+**Why not sequential bytes `0x00, 0x01, ..., 0x{N-1}`:**
+- Breaks if N exceeds training max (slots beyond max have embeddings trained only in data context)
+- Collides with data if corpus contains control bytes
+- Encodes N into the token sequence, making the model N-dependent
+- False solution: slot diversity should come from model depth, not input encoding
+
+### 4.4 Generalization properties
+
+| Property | Sequential (Option B) | NUL + delimiters (adopted) |
+|---|---|---|
+| N generalization beyond training max | Breaks | Fully general |
+| Corpus collision risk | Yes (`0x00–0x1F` in data) | No (data constrained to `0x20+`) |
+| New segment types (SRS, self-eval, etc.) | No mechanism | Add open/close pair |
+| Slot collapse fix | Fragile (baked into IDs) | Architecture (n_layers) |
+
+### 4.5 Variable N during training
+
+N is **randomized per batch** from `N_set = {2, 4, 8, 16, 32}`. This forces the model to learn compression at multiple granularities in a single training run.
+
+Implementation:
+- At startup, precompute `mask_cache[N]` for each N in `N_set` (masks are static numpy arrays, cheap)
+- Each training step: sample `N ~ Uniform(N_set)`, fetch `mask_cache[N]`, build batch with that N
+- Sequence length varies per step: `L = L_S + (N+2) + L_y` (the +2 is STX+ETX)
+- Pass mask as a traced array into jit (preferred over `static_argnums` — avoids recompilation per N)
+
+At **eval**, fix N to each value in `N_set` and measure the sweep.
+
+### 4.6 N range justification
+
+| N | KV floats (all layers) | vs model params |
+|---|---|---|
+| 2  | `2 × L_layers × 2 × d` | tiny |
+| 4  | `2 × L_layers × 4 × d` | — |
+| 8  | `2 × L_layers × 8 × d` | — |
+| 16 | `2 × L_layers × 16 × d` | — |
+| 32 | `2 × L_layers × 32 × d` | — |
+
+With defaults `d=128, L_layers=4`:
+- N=2:  **2,048 floats** (8 KB @ fp32)
+- N=8:  **8,192 floats** (32 KB)
+- N=32: **32,768 floats** (128 KB)
 
 ---
 
-## 4. Common Architecture (used by both stages)
+## 5. KV Cache Size Rule of Thumb
 
-### 4.1 Input embedding (NoPE)
+The KV cache at inference holds K and V tensors for each layer at each memory position:
 
-For input token sequence `z` of length `L`:
+```
+KV_floats = 2 × n_layers × N × d
+KV_bytes  = KV_floats × 4          (float32)
+KV_bytes  = KV_floats × 2          (bfloat16)
+```
+
+Derivation: each layer stores `K ∈ R^{N×d}` and `V ∈ R^{N×d}`, so `2Nd` floats per layer, times `n_layers`.
+
+**Comparison to model weight count:**
+
+For our default model (`V=256, d=128, H=4, d_ff=512, n_layers=4`):
+
+| Component | Params |
+|---|---|
+| Embedding `V×d` | 32,768 |
+| Per-layer attn `4d²` (Q,K,V,O) | 65,536 |
+| Per-layer FFN `2·d·d_ff` | 131,072 |
+| Output head `V×d` | 32,768 (tied or separate) |
+| **Total model** | **~820K** |
+
+| N | KV floats | % of model params |
+|---|---|---|
+| 2  | 2,048  | 0.25% |
+| 4  | 4,096  | 0.50% |
+| 8  | 8,192  | 1.0% |
+| 16 | 16,384 | 2.0% |
+| 32 | 32,768 | 4.0% |
+| 64 | 65,536 | 8.0% |
+
+**Rule of thumb**: `KV_params ≈ 2·L·N·d`. For a 4-layer 128-dim model, each memory slot costs **1024 floats** (4 KB fp32). The KV cache is a very small fraction of model size at practical N values.
+
+---
+
+## 6. Common Architecture
+
+### 6.1 Input embedding (NoPE)
+
 ```
 h^(0)_i = E[z_i]      # token embedding only, no positional term
 ```
-`E ∈ R^{V × d}`, learned from random init.
+`E ∈ R^{V × d}`, learned. `V = 256`.
 
-### 4.2 Strength head
+### 6.2 Transformer block (pre-norm)
 
-Per-position scalar gate, computed once from `h^(0)` and reused at every attention layer:
-```
-s_tilde_i = w_2^T · GELU(W_1 · LayerNorm(h^(0)_i))
-l_i       = -softplus(-s_tilde_i)         # = log sigmoid(s_tilde_i), in (-inf, 0]
-s_i       = exp(l_i) = sigmoid(s_tilde_i) # in (0, 1]
-```
-`W_1 ∈ R^{d×d}`, `w_2 ∈ R^d`.
-
-### 4.3 Transformer block (pre-norm)
-
-For layer ℓ:
 ```
 h_hat   = LayerNorm(h^(ℓ-1))
-Q,K,V   = h_hat @ W_Q, h_hat @ W_K, h_hat @ W_V    # split into H heads, head dim d_h
+Q,K,V   = h_hat @ W_Q, h_hat @ W_K, h_hat @ W_V
 
-# Attention logits with mask and strength gate on keys
-A_ij^h  = (Q_i^h · K_j^h) / sqrt(d_h) + mask_ij + l_j
+A_ij^h  = (Q_i^h · K_j^h) / sqrt(d_h) + mask_ij
 alpha^h = softmax_j(A^h)
 o_i^h   = sum_j alpha^h_ij · V_j^h
 
-# Merge heads, project, residual
 o       = Concat_h(o^h) @ W_O
 u       = h^(ℓ-1) + o
-h^(ℓ)   = u + W_2 · GELU(W_1 · LayerNorm(u))       # FFN, no bias
+h^(ℓ)   = u + W_2 · GELU(W_1 · LayerNorm(u))
 ```
 
-### 4.4 Output
+### 6.3 Output
 
 ```
-logits_i = W_out @ LayerNorm(h^(L_layers)_i)       # W_out ∈ R^{V × d}
+logits_i = LayerNorm(h^(n_layers)_i) @ W_out^T
 ```
 
-### 4.5 Default hyperparameters
+### 6.4 Default hyperparameters
 
-| Param | Stage 0/1 default |
+| Param | Value |
 |---|---|
-| `V` | 32 (Markov chain vocab) |
+| `V` | 256 |
 | `L_S` | 96 |
 | `L_y` | 32 |
-| `N` | 8 (sweep over {1, 2, 4, 8, 16, 32, 64} in stage 0) |
+| `N_set` | {2, 4, 8, 16, 32} (sampled per batch during training) |
 | `T` | 1 (stage 0), sweep {1, 2, 4, 8} (stage 1) |
 | `d` | 128 |
-| `n_layers` | 4 (consider 8 for stage 1 if NoPE collapses; see §10) |
+| `n_layers` | 4 (increase to 8 if slot collapse) |
 | `H` | 4 (`d_h = 32`) |
-| `d_ff` | 4·d = 512 |
-| `lambda_cont` | 2.0 (continuation NTP weight) |
-| `lambda_c` | 1e-3 (capacity penalty) |
+| `d_ff` | 512 |
+| `lambda_cont` | 2.0 |
 | Batch size | 64 |
-| Optimizer | AdamW, lr = 1e-3, warmup 1000 steps, cosine to 1e-5 |
+| Optimizer | AdamW (hand-rolled), lr=1e-3, warmup 1000 steps, cosine to 1e-5 |
 | Gradient clip | 1.0 |
 | Training steps | 50k |
 
 ---
 
-## 5. Stage 0 — Single-pass NTP through the bottleneck
+## 7. Stage 0 — Single-pass NTP through the bottleneck
 
-### 5.1 Goal
-
-Validate that `N` memory positions can encode a useful predictive prior over `L_S` source tokens, measured by continuation perplexity through the bottleneck.
-
-### 5.2 Sequence layout
+### 7.1 Sequence layout
 
 ```
-z = [ x_S ; m, m, ..., m ; y ]
-    [ L_S ;     N         ; L_y ]
-Total length L = L_S + N + L_y
+z = [ x_S (L_S) | STX | 0x00..0x{N-1} (N) | ETX | y (L_y) ]
+
+S    = [0, L_S)
+STX_pos = L_S                          (1 token)
+M    = [L_S+1, L_S+1+N)               (N inner memory slots)
+ETX_pos = L_S+1+N                     (1 token)
+Y    = [L_S+2+N, L_S+2+N+L_y)
+
+Total length L = L_S + 2 + N + L_y
 ```
 
-- `x_S`: `L_S` tokens sampled from a Markov chain (fresh per sample, both transition matrix and stationary distribution).
-- Memory section: `N` copies of the fixed marker token `m`.
-- `y`: `L_y` tokens — **independent continuation** sampled from the same chain, starting from the terminal state `x_S[L_S - 1]`. Not a copy of `x_S`.
+### 7.2 Attention mask
 
-Position sets:
-```
-S = [0, L_S)
-M = [L_S, L_S + N)
-Y = [L_S + N, L_S + N + L_y)
-```
-
-### 5.3 Attention mask
-
-```
-m_ij = -inf  if j > i                                   (causal)
-m_ij = -inf  if j in Y  and  i not in Y                 (Y is write-only)
-m_ij = -inf  if i in Y  and  j in S                     (bottleneck)
-m_ij = 0     otherwise
-```
-
-The "Y is write-only" rule is trivial at stage 0 (nothing comes after Y) but matters for consistency with stage 1.
+Rules (STX/ETX are treated like S — causally visible, not part of bottleneck):
 
 ```python
 def make_mask_stage0(L_S, N, L_y):
-    L = L_S + N + L_y
+    # M = [L_S+1, L_S+1+N)  (inner slots only)
+    # Y = [L_S+2+N, L_S+2+N+L_y)
+    L = L_S + 2 + N + L_y
     rows = np.arange(L)[:, None]
     cols = np.arange(L)[None, :]
-    causal = cols <= rows
-    is_S = (cols < L_S)
-    is_Y_row = (rows >= L_S + N)
-    is_Y_col = (cols >= L_S + N)
+
+    M_start, M_end = L_S + 1, L_S + 1 + N
+    Y_start        = L_S + 2 + N
+
+    causal         = cols <= rows
+    is_S_or_brk    = cols < M_start                  # S + STX
+    is_Y_row       = rows >= Y_start
+    is_Y_col       = cols >= Y_start
+    is_M_col       = (cols >= M_start) & (cols < M_end)
+
+    # Y is a write-only sink: nothing can attend to Y positions
     block_y_writeonly = is_Y_col & (~is_Y_row)
-    block_y_sees_S    = is_Y_row & is_S
+    # Y cannot see S (or STX): bottleneck forces reading only through M
+    block_y_sees_S    = is_Y_row & is_S_or_brk
+    # Y cannot see M either: M is what Y reads through, not directly
+    # Wait — Y *should* see M (that's the point). Only block S.
+
     blocked = block_y_writeonly | block_y_sees_S
     visible = causal & ~blocked
-    return jnp.where(jnp.array(visible), 0.0, -1e9)
+    return np.where(visible, 0.0, -1e9)
 ```
 
-### 5.4 Loss
+Clarification of Y's visibility:
+- `Y` sees: `M` (the memory), `ETX`, causal within `Y`
+- `Y` does NOT see: `S`, `STX` (bottleneck enforced)
+- `Y` does NOT see: other `Y` blocks (only applies in stage 1)
 
-Position masks over the `L-1` shifted prediction positions:
-```
-mask_src[i]  = 1 if 0 <= i <= L_S - 2                     # source NTP
-mask_mem[i]  = 1 if L_S - 1 <= i <= L_S + N - 2           # predicts deterministic markers → DROP
-mask_cont[i] = 1 if L_S + N - 1 <= i <= L - 2             # continuation NTP
-```
-
-Per-token NLL: `n_i = -log_softmax(logits_i)[z_{i+1}]`.
+### 7.3 Loss
 
 ```
-L_src  = (1/B) sum_b  ( sum_i mask_src[i]  · n_{b,i}  / sum_i mask_src[i]  )
-L_cont = (1/B) sum_b  ( sum_i mask_cont[i] · n_{b,i}  / sum_i mask_cont[i] )
-L_cap  = (1/(B·L)) sum_b sum_i s_{b,i}
+mask_src[i]  = 1  if  0 <= i <= L_S - 2
+mask_cont[i] = 1  if  ETX_pos <= i <= L - 2   # ETX position predicts first y token
 
-L = L_src + lambda_cont · L_cont + lambda_c · L_cap
+L_src  = mean NLL over src positions
+L_cont = mean NLL over cont positions
+L      = L_src + lambda_cont * L_cont
 ```
 
-### 5.5 Evaluation
+### 7.4 Evaluation conditions
 
-Three conditions on held-out samples (replicate the existing `compression.py` setup):
+- **matched**: `y` continues same chain as `x_S`
+- **cross**: `y` continues a different chain
+- **uniform**: `x_S` is random bytes; `y` from a fresh chain
 
-- **matched**: `y` continues the same chain `x_S` came from.
-- **cross**: `y` continues a *different* chain than `x_S`.
-- **uniform**: `x_S` replaced by random tokens; `y` from a fresh chain.
-
-Report:
+For each condition and each `N ∈ N_set`:
 ```
-bpt_matched = L_cont(matched) / log(2)
-bpt_cross   = L_cont(cross)   / log(2)
-bpt_uniform = L_cont(uniform) / log(2)
-gain        = bpt_uniform - bpt_matched   # bits/token of useful info in memory
+bpt = L_cont / log(2)
+gain = bpt_uniform - bpt_matched
 ```
 
-### 5.6 Success criteria
+### 7.5 Success criteria
 
 | Criterion | Required |
 |---|---|
-| `bpt_matched < bpt_uniform` | Yes (memory carries info) |
-| `bpt_cross > bpt_uniform` | Yes (wrong cache actively hurts — confirms bottleneck is used) |
-| `bpt_matched` approaches chain entropy as `N` grows | Trend check across `N` sweep |
-| Memory strength `mean(s_i over M)` substantially higher than source strength | Yes (gating learned to expose memory) |
+| `bpt_matched < bpt_uniform` | Yes |
+| `bpt_cross > bpt_uniform` | Yes |
+| `bpt_matched` decreasing as N grows | Trend |
 
-### 5.7 Sweep deliverable
+### 7.6 Sweep deliverable
 
-Plot `bpt_matched, bpt_cross, bpt_uniform` as a function of `N ∈ {1, 2, 4, 8, 16, 32, 64}`. This is the headline output of stage 0.
-
-### 5.8 Inference (deployment mode, not eval)
-
-```
-# Ingest
-tokens = concatenate([x_S, [m]*N])
-_, kv_cache = model.apply(params, tokens, return_cache=True)
-M_kv = extract_kv_at_positions(kv_cache, positions=range(L_S, L_S+N))
-
-# Query (reused N times)
-def query(q):
-    # Prepend M_kv as KV prefix; forward query tokens with causal mask
-    logits, _ = model.apply_with_prefix_cache(params, q, prefix_cache=M_kv)
-    return logits
-```
+Plot `bpt_matched, bpt_cross, bpt_uniform` vs `N ∈ {2, 4, 8, 16, 32}`.
 
 ---
 
-## 6. Stage 1 — Multi-pass NTP refinement
+## 8. Stage 1 — Multi-pass NTP refinement
 
-### 6.1 Goal
-
-Validate that `T` memory-writing passes produce monotonically better predictive memory, measured as decreasing continuation NLL across `t = 1, ..., T`.
-
-### 6.2 Sequence layout
+### 8.1 Sequence layout
 
 ```
-z = [ x_S ; m^N ; y^(1) ; m^N ; y^(2) ; ... ; m^N ; y^(T) ]
+z = [ x_S | MB | y^(1) | MB | y^(2) | ... | MB | y^(T) ]
+
+where MB = [ STX | 0x00..0x{N-1} | ETX ]  (N+2 tokens)
+
+Total length L = L_S + T*(N+2+L_y)
 ```
 
-Total length `L = L_S + T·(N + L_y)`.
+Each `y^(t)` is an **independent fresh continuation** (same chain, different walk, same terminal state).
 
-**Critical**: Each `y^(t)` is an **independent fresh sample** of the continuation from the same Markov chain (different random seed each time, but all starting from `x_S[L_S - 1]`). This is the key change from the autoencoding spec.
-
-Position sets:
-```
-p_m(t) = L_S + (t-1)·(N + L_y)              # start of M^(t)
-p_y(t) = p_m(t) + N                         # start of Y^(t)
-M^(t)  = [p_m(t), p_m(t) + N)
-Y^(t)  = [p_y(t), p_y(t) + L_y)
-```
-
-### 6.3 Attention mask
-
-Four blocking rules combined with causality:
-
-```
-m_ij = -inf  if j > i                                       (causal)
-m_ij = -inf  if j in any Y^(s)  and  i not in any Y^(s)     (Y is write-only)
-m_ij = -inf  if i in Y^(t)  and  j in S                     (bottleneck)
-m_ij = -inf  if i in Y^(t)  and  j in Y^(s),  s != t        (cross-Y blocked)
-m_ij = 0     otherwise
-```
-
-Effect:
-- `M^(t)` attends to: `S`, `M^(<t)`, and own causal positions in `M^(t)`. **Never** to any `Y`.
-- `Y^(t)` attends to: `M^(≤t)` and own causal positions in `Y^(t)`. Not `S`, not other `Y^(s)`.
+### 8.2 Attention mask
 
 ```python
 def make_mask_stage1(L_S, N, L_y, T):
-    L = L_S + T * (N + L_y)
-    rows = np.arange(L)
-    cols = np.arange(L)
+    block_size = N + 2 + L_y   # STX + inner + ETX + y
+    L = L_S + T * block_size
 
-    # Region tags
-    is_S = rows < L_S
-    in_block = ~is_S
-    offset = np.where(in_block, rows - L_S, 0)
-    pass_idx = offset // (N + L_y)        # 0..T-1
-    within = offset % (N + L_y)
-    is_M = in_block & (within < N)
-    is_Y = in_block & (within >= N)
+    # For each position, compute which pass it belongs to and whether it's M or Y
+    # M^(t) attends to: S, STX/ETX (own block), M^(<=t), own causal
+    # Y^(t) attends to: M^(<=t), ETX of own block, own causal
+    # Y^(t) does NOT see: S, other Y^(s), M^(>t)
 
-    is_S_col = is_S[None, :]
-    is_Y_col = is_Y[None, :]
-    is_Y_row = is_Y[:, None]
-    pass_row = pass_idx[:, None]
-    pass_col = pass_idx[None, :]
-
-    causal = cols[None, :] <= rows[:, None]
-    block_y_writeonly = is_Y_col & (~is_Y_row)
-    block_y_sees_S    = is_Y_row & is_S_col
-    block_y_cross     = is_Y_row & is_Y_col & (pass_row != pass_col)
-    blocked = block_y_writeonly | block_y_sees_S | block_y_cross
-
-    visible = causal & (~blocked)
-    return jnp.where(jnp.array(visible), 0.0, -1e9)
+    block_y_writeonly = ...    # Y cols blocked for non-Y rows
+    block_y_sees_S    = ...    # Y rows can't see S
+    block_y_cross     = ...    # Y rows can't see other Y blocks
+    ...
 ```
 
-### 6.4 Loss
+### 8.3 Loss with pass weighting
 
-Per-pass continuation NLL:
 ```
-L_cont_t = (1/(B·L_y)) sum_b sum_{k=0..L_y-1}
-             -log_softmax(logits_{b, p_y(t) - 1 + k})[ y^(t)_{b,k} ]
-```
+beta_t = t / sum(1..T)    # linear ramp
 
-(Prediction at position `p_y(t) - 1`, the last memory token of pass `t`, predicts the first y-token `y^(t)_0`.)
-
-Pass weighting (start with linear ramp normalized to sum to 1):
-```
-beta_t = (t/T)^gamma / sum_{s=1..T} (s/T)^gamma,    gamma = 1
+L_cont_t = mean NLL over Y^(t) positions
+L = L_src + lambda_cont * sum_t (beta_t * L_cont_t)
 ```
 
-Total:
-```
-L = L_src + lambda_cont · sum_{t=1..T} beta_t · L_cont_t + lambda_c · L_cap
-```
-
-### 6.5 Evaluation
-
-**Primary metric — per-pass curve:**
-```
-bpt_cont(t) = L_cont_t / log(2),  for t = 1..T
-```
-The curve should be monotone decreasing in `t` (compute-via-unrolling refinement).
-
-**Diagnostic — truncation ablation (critical):**
-
-Train a model at `T = 4`. At eval, *truncate* the sequence after `M^(t)` for `t ∈ {1, 2, 3, 4}` and append a fresh `m^N; y` block, measuring continuation NLL with only the first `t` passes of memory available.
-
-Compare to a *dedicated* `T = 1` model (trained from scratch with only one pass).
-
-| Outcome | Interpretation |
-|---|---|
-| Truncated-at-1 ≈ dedicated `T=1` model, full `T=4` better | Multi-pass is real refinement |
-| Truncated-at-1 worse than dedicated `T=1` model | Model leans on later passes; first pass underperforms — failure mode |
-| All truncations flat | No real refinement; each pass redundant |
-
-This diagnostic decides whether stage 1 is genuinely working before stage 2 starts.
-
-### 6.6 Success criteria
+### 8.4 Success criteria
 
 | Criterion | Required |
 |---|---|
-| Monotone decrease `bpt_cont(t+1) ≤ bpt_cont(t)` | Yes |
+| Monotone `bpt_cont(t+1) ≤ bpt_cont(t)` | Yes |
 | `bpt_cont(T=4) < bpt_cont(T=1)` by ≥ 0.1 bits | Yes |
-| Truncation diagnostic: `T=1` truncated ≥ dedicated `T=1` | Yes |
-| Memory slot similarity check (diversity diagnostic) | See §10 |
-
-### 6.7 Inference
-
-At deployment, drop `Y` blocks entirely (they're write-only sinks; nothing reads them):
-```
-tokens = concatenate([x_S, [m]*N, [m]*N, ..., [m]*N])  # T memory blocks back-to-back
-_, kv_cache = model.apply(params, tokens, return_cache=True)
-M_kv = extract_kv_at(kv_cache, positions=range_of(M^(T)))
-```
-
-This is shorter than the training-length sequence (no Y blocks), so inference is cheaper than training. Verify the mask between `M^(t)` positions matches training (it does because `M` never attends to `Y`).
-
-### 6.8 Sweep deliverable
-
-Plot `bpt_cont(t)` as a function of `t` for `T ∈ {1, 2, 4, 8}`, and the truncation diagnostic plot.
+| Truncation diagnostic: T=1 truncated ≥ dedicated T=1 | Yes |
 
 ---
 
-## 7. Future Stages (preview)
-
-Implementation of stages 2+ is contingent on stages 0 and 1 passing their success criteria. Don't start any of these without confirmation.
-
-### Stage 2 — Streaming, no rehearsal
-- Layout: `[c_1; m^N; c_2; m^N; ...; c_C; m^N; y_target]`
-- Each `m^N` block writes memory conditioned on current chunk + all prior memory
-- Test interference: held-out `y_target` continues which chunk? Probe perplexity as a function of chunk-recency
-- **At this boundary, consider switching to shared encoder-decoder hybrid** with explicit persistent `M` tensor and cross-attention. See §11.
-
-### Stage 3 — Random-schedule rehearsal training
-- Insert random "revisit" chunks into the stream
-- Train the model to accept revisits (memory updates from a re-shown chunk)
-- Tests whether the procedural runtime can use rehearsal slots
-
-### Stage 4 — Self-evaluation head
-- Add a head `r_phi(M, c)` predicting reconstruction NLL for chunk `c` given current memory
-- Trained by regression against actual NLL (supervised by forward signal, no backprop at inference)
-- Calibration check: rank correlation between `r_phi` and true NLL
-
-### Stage 5 — SRS controller
-- Self-evaluation head drives a priority queue of chunks to rehearse
-- Decision at each step: ingest new chunk vs. rehearse highest-difficulty old chunk
-- Compare SRS-driven streaming to no-rehearsal and random-rehearsal baselines
-
-### Stage 6 — Backprop baseline
-- Train an identical-architecture model with full backprop on the streamed corpus
-- Headline number: gap between SRS streaming model and backprop baseline
-- Sweep `(N, T, B)` to plot gap-vs-compute curve
-
-### Stage 7 — Real text
-- Move from synthetic Markov chains to small natural-language corpus (a few thousand tokens)
-- Watch for: tokenizer choice, position-embedding extrapolation if you've reintroduced any, capacity scaling
-- Single-epoch streaming over diverse corpus to avoid memorization
-
----
-
-## 8. Implementation Notes
-
-### 8.1 Repo structure (suggested)
+## 9. File Layout
 
 ```
-kv_fast_weights/
-├── PROJECT_SUMMARY.md             # existing
-├── STAGE_IMPLEMENTATION_PLAN.md   # this file
-├── kv_fast_weights_compression.py # existing reference (stage 0 baseline)
-├── kv_fast_weights_lm.py          # existing reference
-├── kv_fast_weights_regression.py  # existing reference
-├── common/
-│   ├── model.py                   # shared transformer block, strength head
-│   ├── mask.py                    # mask constructors (stage 0, stage 1)
-│   ├── data.py                    # Markov chain sampling
-│   └── eval.py                    # bpt computation, conditions
-├── stage0/
-│   ├── train.py
-│   └── eval.py
-├── stage1/
-│   ├── train.py
-│   └── eval.py
-└── reports/
-    ├── stage0_sweep_N.png
-    ├── stage1_curve_T.png
-    └── stage1_truncation_diagnostic.png
+kvmem/
+├── data.py      # Markov chain dataset (byte-level, V=256, variable N)
+├── stage0.py    # Stage 0: single-pass, variable-N training, N sweep eval
+└── stage1.py    # Stage 1: multi-pass, T sweep, truncation diagnostic
 ```
 
-Start by abstracting the existing `kv_fast_weights_compression.py` into the `common/` modules; the model and data code is reusable.
+All model code (Equinox modules, mask builders, AdamW, training loop) lives inside each stage file.
 
-### 8.2 Dependencies
+### 9.1 Dependencies
 
-Match the existing reference implementations exactly:
-- JAX (CPU-only OK for stages 0–1; small models)
-- Flax (Linen API)
-- Optax
-- numpy
-- matplotlib (for plots only)
-- No other dependencies
+- `jax`
+- `equinox`
+- `numpy`
+- `matplotlib`
 
-### 8.3 Things to NOT do
+No optax. No flax.
 
-- **Don't add position embeddings.** NoPE is locked.
-- **Don't use dedicated memory token IDs.** Reserved corpus token only.
-- **Don't make `y` a copy of `x_S` (autoencoding).** Always independent continuation.
-- **Don't allow `M` to attend to `Y` blocks.** That's the train-inference consistency rule.
-- **Don't allow `Y^(t)` to attend to `Y^(<t)`.** Different samples per pass, no cross-attention.
-- **Don't introduce IPTT-style gradient-at-inference fast-weight updates.** This project's commitment is no-backprop at inference.
-
-### 8.4 Things to watch for
-
-- **Slot collapse**: with NoPE and a single marker token, all memory positions have identical input at layer 0. Differentiation comes from causal-mask asymmetry. At 4 layers / 128 dim this may be borderline; if memory slots end up encoding redundant information, increase depth to 8 layers before tweaking anything else. Diagnostic: cosine similarity between final-layer hidden states at `M` positions.
-- **NoPE depth shortage**: NoPE relies on depth to derive positional info from causal-mask counts. Watch test perplexity and consider 8 layers if 4 isn't enough.
-- **Strength-head collapse**: if `s_i` for memory positions collapses toward 0, capacity penalty is too aggressive — lower `lambda_c`.
-- **Marker token leakage**: if the marker token `m` appears in the actual data (Markov chain output), it'll confuse memory-boundary detection. Reserve a token outside the chain's vocabulary by sampling chains over `[0, V-2)` and using `m = V-1`.
-
-### 8.5 Validation order
-
-1. Implement stage 0 with `N = 8`, single seed, verify `bpt_matched < bpt_uniform` and `bpt_cross > bpt_uniform` (sanity).
-2. Sweep `N` for stage 0; produce the curve.
-3. Implement stage 1 with `T = 4` and `N` from stage 0's best.
-4. Verify monotone `bpt_cont(t)` curve.
-5. Run the truncation diagnostic.
-6. Stop and report back before stage 2.
-
-### 8.6 What to report back
-
-After stage 0:
-- `bpt_matched, bpt_cross, bpt_uniform` for the `N` sweep
-- The strength-head profile by region (mean `s_i` over S, M, Y)
-- Whether the success criteria in §5.6 are met
-- Training curves (loss vs. step) — sanity check
-
-After stage 1:
-- Per-pass `bpt_cont(t)` curve for `T ∈ {1, 2, 4, 8}`
-- Truncation diagnostic results
-- Slot-collapse diagnostic (cosine similarity matrix between memory positions at the final layer)
-- Whether the success criteria in §6.6 are met
-
----
-
-## 9. Theoretical background (reference only)
-
-The training target is NTP on independent continuations rather than reconstruction of the source, based on:
-
-- **IPTT (Feng et al., arXiv:2604.06169, 2026)**: proves that NTP-aligned targets are strictly better than reconstruction targets for in-context predictive tasks. Their Theorem 1: with reconstruction targets, the expected logit change for the correct next token is negligible; with NTP-aligned targets, it's bounded below by a positive quantity proportional to embedding norms and key-query alignment.
-
-- **Fast-weight programmers (Schlag et al. 2021)**: linear attention is equivalent to fast-weight programming; the KV cache *is* the fast-weight matrix `W_fast = sum_i k_i v_i^T`.
-
-The "multi-pass refinement" claim of stage 1 is about **compute unrolling**, not new information per pass — each pass sees the same `x_S` plus the prior memory state. The refinement signal is the same as in deep equilibrium models or Universal Transformers: more compute on the same data, not more data. Refinement should be expected to be bounded, not unlimited.
-
----
-
-## 10. Key diagnostic: memory slot diversity
-
-After training, run this check on the final model:
+### 9.2 AdamW (hand-rolled)
 
 ```python
-def slot_diversity(params, x_S):
-    """Returns NxN cosine similarity matrix between memory slot hidden states."""
-    tokens = concatenate([x_S, [m]*N])
-    h_final = model.apply(params, tokens, return_hidden=True)
-    M_hidden = h_final[L_S:L_S+N]                           # (N, d)
-    M_normed = M_hidden / jnp.linalg.norm(M_hidden, axis=-1, keepdims=True)
-    return M_normed @ M_normed.T                             # (N, N) cosine sim
+def adam_step(params, grads, opt_state, lr, b1=0.9, b2=0.999, eps=1e-8, wd=0.01):
+    m, v, step = opt_state
+    m     = jax.tree.map(lambda m_, g: b1*m_ + (1-b1)*g,    m, grads)
+    v     = jax.tree.map(lambda v_, g: b2*v_ + (1-b2)*g**2, v, grads)
+    m_hat = jax.tree.map(lambda m_: m_ / (1 - b1**step), m)
+    v_hat = jax.tree.map(lambda v_: v_ / (1 - b2**step), v)
+    params = jax.tree.map(
+        lambda p, mh, vh: p - lr * (mh / (jnp.sqrt(vh) + eps) + wd * p),
+        params, m_hat, v_hat
+    )
+    return params, (m, v, step + 1)
 ```
 
-Expected: off-diagonal entries should average well below 0.9. If they're near 1.0, memory slots have collapsed to redundant copies and effective compression rank is much less than `N`.
+LR: linear warmup 1000 steps → cosine decay to 1e-5 over 50k steps.
 
-If collapse is detected:
-1. First: increase depth (`n_layers = 8`).
-2. If still collapsing: add tiny input noise at memory positions *during training only* (Gaussian, std `1e-3`).
-3. If still collapsing: switch to sequential markers `m_0, m_1, ..., m_{N-1}` (using the first `N` corpus tokens; zero param cost) instead of single shared marker.
+### 9.3 Things NOT to do
 
----
+- No position embeddings (NoPE)
+- No strength head / capacity penalty
+- No single repeated marker token — use sequential bytes `0x00..0x{N-1}`
+- No autoencoding target — always independent continuation `y`
+- No M attending to Y
+- No cross-Y attention in stage 1
 
-## 11. Stage 2 architecture revisit
+### 9.4 Memory slot diversity diagnostic
 
-At the stage 1 → stage 2 boundary, evaluate whether to switch from decoder-only to shared-weight encoder-decoder hybrid:
+```python
+def slot_diversity(model, tokens, L_S, N):
+    h = get_final_hidden(model, tokens)      # (L, d)
+    M_h = h[L_S+1 : L_S+1+N]               # inner slots only, (N, d)
+    M_n = M_h / jnp.linalg.norm(M_h, axis=-1, keepdims=True)
+    return M_n @ M_n.T                       # (N, N) cosine sim
+```
 
-| Pro decoder-only continuation | Pro hybrid switch |
-|---|---|
-| Existing code works | Persistent `M` becomes a first-class state |
-| `L_src` keeps LM competence | Streaming + SRS naturally maps onto `M`-state operations |
-| In-context learning capabilities preserved | Bottleneck structural (no mask gymnastics) |
-| Simpler implementation | Multi-chunk attention growth is bounded |
-
-If stage 1 results show that the decoder-only mask becomes unwieldy at `T > 8` or with multiple chunks queued, switch. The hybrid spec:
-
-- Same backbone weights, one set of parameters
-- Encoder pass: causal mask over `[x_S; m^N]`, extract `M ∈ R^{N×d}` from hidden states at marker positions
-- Decoder pass: causal mask over query tokens, with cross-attention to `M` at each layer
-- Cross-attention has a learned null memory `M_0 ∈ R^{1×d}` for the encoder-mode-or-pass-1 case (see §11 of the conversation log for derivation)
-
-Don't implement this for stage 1 — only revisit after stage 1 completes.
+Off-diagonal average should be < 0.9. If collapse: increase n_layers to 8.
 
 ---
 
-## 12. Out-of-scope for this handover
+## 10. Future Stages (not yet)
 
-- Real-text experiments (deferred to stage 7)
-- Backprop baseline (deferred to stage 6)
-- Self-evaluation head training (deferred to stage 4)
-- SRS scheduling logic (deferred to stage 5)
-- GPU scaling, larger models (deferred to stage 7)
-
-If during implementation any of these seem necessary earlier, flag it and discuss before proceeding.
+Stage 2: Streaming (multiple chunks).
+Stage 3: Random-schedule rehearsal.
+Stage 4: Self-evaluation head.
+Stage 5: SRS controller.
+Stage 6: Backprop baseline.
+Stage 7: Real text (byte-level, e.g. Quran text already in repo).
 
 ---
 
-## 13. Acceptance summary
+## 11. Acceptance Summary
 
-A successful stage 0 + stage 1 implementation produces:
-
-1. Three reusable common modules (`model.py`, `mask.py`, `data.py`).
-2. Stage 0: a sweep over `N` showing the `bpt_matched / bpt_cross / bpt_uniform` curves.
-3. Stage 1: a multi-pass refinement curve (`bpt_cont(t)` vs `t` for several `T`).
-4. Stage 1: the truncation diagnostic plot.
-5. Diagnostic outputs: strength-head profile, slot-diversity matrix.
-6. A short markdown report (`reports/stage01_summary.md`) summarizing what was found, what worked, what didn't, and a go/no-go recommendation for stage 2.
-
-The go/no-go recommendation should be made *honestly* based on the data. If the truncation diagnostic fails (first-pass memory from a 4-pass-trained model is worse than dedicated single-pass training), say so — that's a failure mode that needs addressing before stage 2 is worth doing.
+1. `data.py` — byte-level Markov chains, variable N, bracket memory tokens
+2. `stage0.py` — variable-N training, N sweep eval, bpt curves
+3. `stage1.py` — T sweep, per-pass bpt, truncation diagnostic
+4. `reports/stage01_summary.md` — go/no-go for stage 2
