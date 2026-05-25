@@ -194,8 +194,8 @@ logits_i = LayerNorm(h^(n_layers)_i) @ W_out^T
 | Param | Value |
 |---|---|
 | `V` | 256 |
-| `L_S` | 96 |
-| `L_y` | 32 |
+| `L_S` | 128 (fixed throughout training) |
+| `L_y` | **curriculum-scheduled** — grows from 8 → 128 over training (see §6.5) |
 | `N_set` | {2, 4, 8, 16, 32} (sampled per batch during training) |
 | `T` | 1 (stage 0), sweep {1, 2, 4, 8} (stage 1) |
 | `d` | 128 |
@@ -208,6 +208,27 @@ logits_i = LayerNorm(h^(n_layers)_i) @ W_out^T
 | Gradient clip | 1.0 |
 | Training steps | 50k |
 
+### 6.5 Continuation length curriculum
+
+The model is trained with a curriculum over `L_y` (continuation length). This forces progressive compression: easy tasks build the basic bottleneck, hard tasks force near-lossless encoding.
+
+**Discrete schedule** — three phases, each with a fixed `L_y`:
+
+| Phase | Steps | `L_y` | Compression task |
+|---|---|---|---|
+| Easy   | 0–15k  | 8   | Predict 8 tokens from N-slot KV (16:1 ratio at N=8) |
+| Medium | 15k–35k| 32  | Predict 32 tokens — standard difficulty |
+| Hard   | 35k–50k| 128 | Predict `L_S = 128` tokens — forces near-lossless KV compression |
+
+`y` is always an **independent continuation** from the Markov chain (not reconstruction of `x_S`). At `L_y = L_S = 128`, `y` is a fresh 128-token walk from the terminal state — the model must store enough structure about the chain to predict an equally long continuation. This is strictly harder than reconstruction because there is no shortcut copy path.
+
+Masks are precomputed at startup for the Cartesian product `N_set × L_y_set = {2,4,8,16,32} × {8,32,128}` — 15 masks total. Each step fetches `mask_cache[(N, L_y)]`.
+
+**Why this curriculum:**
+- At `L_y = 8`, even weak compression is sufficient — the model learns the basic write/read mechanism
+- At `L_y = 32`, meaningful predictive structure must be stored — the default prior work benchmark
+- At `L_y = 128 = L_S`, the continuation is as long as the source — the KV must encode the full statistical fingerprint of the chain to beat the uniform baseline by a meaningful margin
+
 ---
 
 ## 7. Stage 0 — Single-pass NTP through the bottleneck
@@ -215,77 +236,81 @@ logits_i = LayerNorm(h^(n_layers)_i) @ W_out^T
 ### 7.1 Sequence layout
 
 ```
-z = [ x_S (L_S) | STX | 0x00..0x{N-1} (N) | ETX | y (L_y) ]
+z = [ x_S (L_S) | STX | NUL×N | ETX | y (L_y) ]
 
-S    = [0, L_S)
-STX_pos = L_S                          (1 token)
-M    = [L_S+1, L_S+1+N)               (N inner memory slots)
-ETX_pos = L_S+1+N                     (1 token)
-Y    = [L_S+2+N, L_S+2+N+L_y)
+S        = [0,       L_S)          source (L_S = 128, fixed)
+STX_pos  =  L_S                    open delimiter
+M        = [L_S+1,   L_S+1+N)     N inner memory slots — the KV region
+ETX_pos  =  L_S+1+N               close delimiter
+Y        = [L_S+2+N, L_S+2+N+L_y) continuation (L_y varies by curriculum phase)
 
 Total length L = L_S + 2 + N + L_y
 ```
 
-### 7.2 Attention mask
+Token values:
+- `x_S`: Markov chain bytes over `[0x20, 0xFF]`, length `L_S = 128`
+- `STX = 0x02`, `NUL = 0x00`, `ETX = 0x03`
+- `y`: independent continuation of same chain from terminal state, length `L_y`
+- N sampled from `N_set = {2, 4, 8, 16, 32}` per batch
+- L_y sampled from `L_y_set = {8, 32, 128}` per batch according to curriculum phase (see §6.5)
 
-Rules (STX/ETX are treated like S — causally visible, not part of bottleneck):
+### 7.2 Attention mask
 
 ```python
 def make_mask_stage0(L_S, N, L_y):
-    # M = [L_S+1, L_S+1+N)  (inner slots only)
-    # Y = [L_S+2+N, L_S+2+N+L_y)
-    L = L_S + 2 + N + L_y
+    L       = L_S + 2 + N + L_y
+    M_start = L_S + 1
+    Y_start = L_S + 2 + N
+
     rows = np.arange(L)[:, None]
     cols = np.arange(L)[None, :]
 
-    M_start, M_end = L_S + 1, L_S + 1 + N
-    Y_start        = L_S + 2 + N
+    causal          = cols <= rows
+    is_S_or_STX     = cols < M_start          # S + STX col
+    is_Y_col        = cols >= Y_start
+    is_Y_row        = rows >= Y_start
 
-    causal         = cols <= rows
-    is_S_or_brk    = cols < M_start                  # S + STX
-    is_Y_row       = rows >= Y_start
-    is_Y_col       = cols >= Y_start
-    is_M_col       = (cols >= M_start) & (cols < M_end)
+    block_y_sink    = is_Y_col & ~is_Y_row    # Y is write-only
+    block_y_sees_s  = is_Y_row & is_S_or_STX  # Y cannot see S or STX
 
-    # Y is a write-only sink: nothing can attend to Y positions
-    block_y_writeonly = is_Y_col & (~is_Y_row)
-    # Y cannot see S (or STX): bottleneck forces reading only through M
-    block_y_sees_S    = is_Y_row & is_S_or_brk
-    # Y cannot see M either: M is what Y reads through, not directly
-    # Wait — Y *should* see M (that's the point). Only block S.
-
-    blocked = block_y_writeonly | block_y_sees_S
+    blocked = block_y_sink | block_y_sees_s
     visible = causal & ~blocked
-    return np.where(visible, 0.0, -1e9)
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
 ```
 
-Clarification of Y's visibility:
-- `Y` sees: `M` (the memory), `ETX`, causal within `Y`
-- `Y` does NOT see: `S`, `STX` (bottleneck enforced)
-- `Y` does NOT see: other `Y` blocks (only applies in stage 1)
+Visibility: Y sees M, ETX, and causal-Y. Y does NOT see S or STX.
 
 ### 7.3 Loss
 
 ```
 mask_src[i]  = 1  if  0 <= i <= L_S - 2
-mask_cont[i] = 1  if  ETX_pos <= i <= L - 2   # ETX position predicts first y token
+mask_cont[i] = 1  if  ETX_pos <= i <= L - 2
 
 L_src  = mean NLL over src positions
 L_cont = mean NLL over cont positions
 L      = L_src + lambda_cont * L_cont
 ```
 
-### 7.4 Evaluation conditions
+At `L_y = 128`, `mask_cont` spans 128 positions — as many as the source. This is the hardest curriculum level.
+
+### 7.4 Curriculum mask cache
+
+At startup, precompute `mask_cache[(N, L_y)]` for all `N ∈ {2,4,8,16,32}` × `L_y ∈ {8,32,128}` = 15 masks. Fetch by `(N, L_y)` each step.
+
+### 7.5 Evaluation conditions
+
+For each `(N, L_y)` in the eval grid, evaluate three conditions:
 
 - **matched**: `y` continues same chain as `x_S`
 - **cross**: `y` continues a different chain
 - **uniform**: `x_S` is random bytes; `y` from a fresh chain
 
-For each condition and each `N ∈ N_set`:
 ```
-bpt = L_cont / log(2)
-gain = bpt_uniform - bpt_matched
+bpt(condition, N, L_y) = mean_cont_NLL / log(2)
+gain(N, L_y) = bpt_uniform - bpt_matched
 ```
+
+Primary eval uses `L_y = 128` (hardest) as the headline number.
 
 ### 7.5 Success criteria
 
