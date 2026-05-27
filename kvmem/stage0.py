@@ -38,8 +38,10 @@ from kvmem.data import (
     load_fatihah,
     load_text_lines,
     make_batch,
+    make_chain_pool,
     make_eval_batches,
     make_mask_baseline,
+    make_mask_sanity,
     make_mask_stage0,
     np_make_batch,
     np_make_baseline_batch,
@@ -53,26 +55,39 @@ from kvmem.data import (
 # ---------------------------------------------------------------------------
 
 DEFAULT_HPARAMS = dict(
-    V          = 256,       # full byte vocab for embedding
-    V_chain    = 224,       # Markov chain states, remapped to [0x20, 0xFF]
-    L_S        = 128,       # source length (fixed)
+    V          = 256,       # full byte vocab (embedding table; only ~35 tokens active)
+    V_chain    = 32,        # Markov chain states → data bytes [0x20, 0x3F]
+    L_S        = 64,        # source length (bytes to memorize)
     N_set      = [2, 4, 8, 16, 32],
     # Curriculum: (start_step, L_y)
-    L_y_schedule = [(0, 8), (15_000, 32), (35_000, 128)],
-    d          = 128,
-    n_layers   = 4,
-    n_heads    = 4,         # d_head = 32
-    d_ff       = 512,
-    lambda_cont= 2.0,
+    L_y_schedule = [(0, 16), (10_000, 32), (25_000, 64)],
+    # --- Model: medium-small, matched to task scale ---
+    # Task: 32-state Markov chain, 64-byte source, up to 64-byte continuation.
+    # Only ~35 tokens active. Need enough capacity to learn in-context Markov
+    # inference (read x_S, compress chain stats into KV, predict y).
+    # ~200K params: enough for in-context learning, small enough to train fast.
+    d          = 64,        # model dim  (was 128)
+    n_layers   = 4,         # depth
+    n_heads    = 4,         # heads (d_head=16)
+    d_ff       = 128,       # ff width   (was 512)
+    lambda_cont= 1.0,
     B          = 64,
-    lr_max     = 1e-3,
+    lr_max     = 3e-4,
     lr_min     = 1e-5,
-    warmup_steps = 1_000,
-    n_steps    = 50_000,
+    warmup_steps = 500,
+    n_steps    = 20_000,    # fewer steps needed for smaller model
     grad_clip  = 1.0,
     wd         = 0.01,
-    alpha      = 0.5,       # Dirichlet concentration for chain sampling
+    alpha      = 0.1,       # peaked Dirichlet → high MI between x_S and y
     seed       = 42,
+    # Chain pool: pre-sample K chains; model learns each chain's stats into weights.
+    # KV bottleneck then only needs to encode which chain (not full T_mat).
+    # K=16 is tractable: enough variety to test KV, small enough to learn in 20k steps.
+    # Set to 0 to disable (sample fresh chain per example — much harder).
+    chain_pool_size = 16,
+    # Optimizer: 'adamw' | 'grokadamw'
+    optimizer  = 'adamw',
+    grok_rho   = 0.9,       # GrokAdamW: EMA decay for squared-deviation state
 )
 
 FATIHAH_PATH = 'datasets/quran_uthmani.txt'
@@ -216,13 +231,21 @@ def count_params(model: KVMemModel) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Optimizer (hand-rolled AdamW, no optax)
+# Optimizer (hand-rolled AdamW + GrokAdamW, no optax)
 # ---------------------------------------------------------------------------
 
-def init_opt_state(model):
+def init_opt_state(model, optimizer: str = 'adamw'):
+    """
+    optimizer: 'adamw' | 'grokadamw'
+    AdamW state:     (m, v)
+    GrokAdamW state: (m, v, s)   s = squared-deviation EMA
+    """
     params = eqx.filter(model, eqx.is_array)
     m = jax.tree.map(jnp.zeros_like, params)
     v = jax.tree.map(jnp.zeros_like, params)
+    if optimizer == 'grokadamw':
+        s = jax.tree.map(jnp.zeros_like, params)
+        return (m, v, s)
     return (m, v)
 
 
@@ -250,7 +273,7 @@ def adam_update(params, grads, opt_state, lr: float,
                 eps: float = 1e-8, wd: float = 0.01,
                 step: int = 1):
     m, v = opt_state
-    m    = jax.tree.map(lambda m_, g: b1 * m_ + (1 - b1) * g,     m, grads)
+    m    = jax.tree.map(lambda m_, g: b1 * m_ + (1 - b1) * g,      m, grads)
     v    = jax.tree.map(lambda v_, g: b2 * v_ + (1 - b2) * g ** 2, v, grads)
     bc1  = 1.0 - b1 ** step
     bc2  = 1.0 - b2 ** step
@@ -261,6 +284,51 @@ def adam_update(params, grads, opt_state, lr: float,
         params, mh, vh,
     )
     return new_params, (m, v)
+
+
+def grok_adam_update(params, grads, opt_state, lr: float,
+                     b1: float = 0.9, b2: float = 0.999, rho: float = 0.9,
+                     eps: float = 1e-8, wd: float = 0.01,
+                     step: int = 1, batch_size: int = 64):
+    """
+    SNR-Gated AdamW (arXiv:2605.01172).
+
+    Adds one extra EMA state s tracking squared gradient deviations (g - m_prev)².
+    Gate q_k = 1{m_k^2 > s_k/(B-1)}: update only high-SNR parameters.
+    Accelerates grokking by filtering noisy gradient components.
+
+    One-line change from AdamW: gate the momentum term before applying update.
+    """
+    m, v, s = opt_state
+    m_prev  = m   # before update, used for deviation
+
+    m = jax.tree.map(lambda m_, g: b1 * m_ + (1 - b1) * g,      m, grads)
+    v = jax.tree.map(lambda v_, g: b2 * v_ + (1 - b2) * g ** 2, v, grads)
+    # Squared deviation EMA: tracks gradient variance around running mean
+    s = jax.tree.map(
+        lambda s_, g, mp: rho * s_ + (1 - rho) * (g - mp) ** 2,
+        s, grads, m_prev,
+    )
+
+    bc1 = 1.0 - b1  ** step
+    bc2 = 1.0 - b2  ** step
+    bcs = 1.0 - rho ** step
+    mh  = jax.tree.map(lambda m_: m_ / bc1, m)
+    vh  = jax.tree.map(lambda v_: v_ / bc2, v)
+    sh  = jax.tree.map(lambda s_: s_ / bcs, s)
+
+    # SNR gate: 1 where signal (mean²) exceeds noise (variance/B)
+    thresh = float(max(batch_size - 1, 1))
+    gate   = jax.tree.map(
+        lambda mh_, sh_: (mh_ ** 2 > sh_ / thresh).astype(jnp.float32),
+        mh, sh,
+    )
+
+    new_params = jax.tree.map(
+        lambda p, mh_, vh_, q: p - lr * (q * mh_ / (jnp.sqrt(vh_) + eps) + wd * p),
+        params, mh, vh, gate,
+    )
+    return new_params, (m, v, s)
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +348,7 @@ def _nll_matrix(model: KVMemModel, tokens: jax.Array,
 
 
 def loss_fn(model: KVMemModel, tokens: jax.Array, mask: jax.Array,
-            L_S: int, N: int, lambda_cont: float) -> tuple:
+            L_S: int, N: int, L_y: int, lambda_cont: float) -> tuple:
     """
     Stage-0 KV bottleneck loss.
     tokens: (B, L_S + 2 + N + L_y)
@@ -289,32 +357,36 @@ def loss_fn(model: KVMemModel, tokens: jax.Array, mask: jax.Array,
     B, L    = tokens.shape
     nll     = _nll_matrix(model, tokens, mask)                    # (B, L-1)
     pos     = jnp.arange(L - 1)
-    ETX_pos = L_S + 1 + N
+    ETX_pos  = L_S + 1 + N
+    Y_end    = L_S + 2 + N + L_y   # first pad position
 
     mask_src  = (pos <= L_S - 2).astype(jnp.float32)
-    mask_cont = (pos >= ETX_pos).astype(jnp.float32)
+    mask_cont = ((pos >= ETX_pos) & (pos < Y_end)).astype(jnp.float32)
 
     def wmean(x, m):
         return jnp.sum(x * m[None, :], axis=-1) / (m.sum() + 1e-8)
 
     L_src  = jnp.mean(wmean(nll, mask_src))
     L_cont = jnp.mean(wmean(nll, mask_cont))
-    total  = L_src + lambda_cont * L_cont
+    # Equal src+cont weight: src teaches chain-structure reading (prerequisite
+    # for writing useful KV); cont drives the bottleneck. Once src converges
+    # below oracle (~1.73 nats) the gradient naturally shifts to cont.
+    total  = L_src + L_cont
     return total, (L_src, L_cont)
 
 
 def loss_fn_baseline(model: KVMemModel, tokens: jax.Array, mask: jax.Array,
-                     L_S: int, lambda_cont: float) -> tuple:
+                     L_S: int, L_y: int, lambda_cont: float) -> tuple:
     """
     Backprop baseline loss (no bottleneck — Y sees S directly).
-    tokens: (B, L_S + L_y)
+    tokens: (B, L_max) padded; real content is L_S + L_y tokens.
     """
     B, L = tokens.shape
     nll  = _nll_matrix(model, tokens, mask)
     pos  = jnp.arange(L - 1)
 
     mask_src  = (pos <= L_S - 2).astype(jnp.float32)
-    mask_cont = (pos >= L_S - 1).astype(jnp.float32)
+    mask_cont = ((pos >= L_S - 1) & (pos < L_S + L_y)).astype(jnp.float32)
 
     def wmean(x, m):
         return jnp.sum(x * m[None, :], axis=-1) / (m.sum() + 1e-8)
@@ -330,30 +402,46 @@ def loss_fn_baseline(model: KVMemModel, tokens: jax.Array, mask: jax.Array,
 # ---------------------------------------------------------------------------
 
 def make_train_step(hp: dict, baseline: bool = False):
-    """Return a jit-compiled train_step function closed over hp."""
+    """Return a jit-compiled train_step function closed over hp.
+
+    N and L_y are static so the loss masks are traced correctly per combo.
+    With padded fixed-length tokens (L_max), JAX retraces only when (N, L_y)
+    changes — 15 traces max, then cached forever.
+
+    optimizer hp key selects: 'adamw' (default) | 'grokadamw'
+    """
     lambda_cont = hp['lambda_cont']
     L_S         = hp['L_S']
     grad_clip   = hp['grad_clip']
+    optimizer   = hp.get('optimizer', 'adamw')
+    use_grok    = (optimizer == 'grokadamw')
 
     if baseline:
-        def _loss(model, tokens, mask, N_unused):
-            return loss_fn_baseline(model, tokens, mask, L_S, lambda_cont)
+        def _loss(model, tokens, mask, N_unused, L_y):
+            return loss_fn_baseline(model, tokens, mask, L_S, L_y, lambda_cont)
     else:
-        def _loss(model, tokens, mask, N):
-            return loss_fn(model, tokens, mask, L_S, N, lambda_cont)
+        def _loss(model, tokens, mask, N, L_y):
+            return loss_fn(model, tokens, mask, L_S, N, L_y, lambda_cont)
 
-    @jax.jit
-    def train_step(model, opt_state, tokens, mask, N, step, lr):
+    # N (arg index 4) and L_y (arg index 5) are Python ints → static for JIT
+    @jax.jit(static_argnums=(4, 5))
+    def train_step(model, opt_state, tokens, mask, N, L_y, step, lr):
         params  = eqx.filter(model, eqx.is_array)
         (loss, aux), grads = jax.value_and_grad(_loss, has_aux=True)(
-            model, tokens, mask, N)
+            model, tokens, mask, N, L_y)
         grads_arr = eqx.filter(grads, eqx.is_array)
         grads_arr = clip_grads(grads_arr, grad_clip)
-        new_params, new_opt = adam_update(
-            params, grads_arr, opt_state, lr,
-            wd=hp['wd'], step=step,
-        )
-        # adam_update returns absolute new params; compute delta for apply_updates
+        if use_grok:
+            new_params, new_opt = grok_adam_update(
+                params, grads_arr, opt_state, lr,
+                rho=hp.get('grok_rho', 0.9), wd=hp['wd'],
+                step=step, batch_size=hp['B'],
+            )
+        else:
+            new_params, new_opt = adam_update(
+                params, grads_arr, opt_state, lr,
+                wd=hp['wd'], step=step,
+            )
         deltas    = jax.tree.map(lambda np_, p: np_ - p, new_params, params)
         new_model = eqx.apply_updates(model, deltas)
         return new_model, new_opt, loss, aux
@@ -389,16 +477,36 @@ def load_checkpoint(path: str, key: jax.Array) -> tuple[KVMemModel, dict]:
 
 
 # ---------------------------------------------------------------------------
+# Text file helpers (used by train validation + test)
+# ---------------------------------------------------------------------------
+
+def _load_txt_lines(path: str) -> list[bytes]:
+    """Load non-empty lines from a UTF-8 text file as raw bytes.
+    Validates no protocol bytes (< 0x20) except those in the data range.
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        lines = [l.rstrip('\n').encode('utf-8') for l in f if l.strip()]
+    bad_lines = []
+    for i, line in enumerate(lines):
+        bad = [hex(b) for b in line if b < DATA_LO]
+        if bad:
+            bad_lines.append((i, bad[:3]))
+    if bad_lines:
+        raise ValueError(f'Lines contain protocol bytes: {bad_lines[:3]}')
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
 
-def train(hp: dict, baseline: bool = False, log_base: str = 'logs'):
+def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str = 'logs'):
     key = jax.random.PRNGKey(hp['seed'])
     key, mkey = jax.random.split(key)
 
     model     = build_model(hp, mkey)
-    opt_state = init_opt_state(model)
+    opt_state = init_opt_state(model, optimizer=hp.get('optimizer', 'adamw'))
 
     L_S          = hp['L_S']
     N_set        = hp['N_set']
@@ -408,7 +516,7 @@ def train(hp: dict, baseline: bool = False, log_base: str = 'logs'):
     alpha        = hp['alpha']
     V_chain      = hp['V_chain']
 
-    tag = 'baseline' if baseline else 'stage0'
+    tag = 'baseline' if baseline else ('sanity' if sanity else 'stage0')
 
     # ---- run directory: logs/<tag>_<timestamp>/ ----
     run_dir  = setup_run_dir(log_base, tag)
@@ -438,10 +546,28 @@ def train(hp: dict, baseline: bool = False, log_base: str = 'logs'):
 
     # Precompute all masks
     L_y_set = sorted({v for _, v in L_y_schedule})
+    N_max   = max(N_set)
+    L_y_max = max(L_y_set)
+    # Fixed padded length: all tokens/masks padded to this shape → single JIT trace
     if baseline:
-        mask_cache = {L_y: make_mask_baseline(L_S, L_y) for L_y in L_y_set}
+        L_max = L_S + L_y_max
+        mask_cache = {}
+        for L_y in L_y_set:
+            raw = make_mask_baseline(L_S, L_y)     # (L_S+L_y, L_S+L_y)
+            m   = np.full((L_max, L_max), -1e9, dtype=np.float32)
+            m[:raw.shape[0], :raw.shape[0]] = raw
+            mask_cache[L_y] = m
     else:
-        mask_cache = build_mask_cache(L_S, N_set, L_y_set)
+        # Both stage0 and sanity use same sequence layout [S|STX|M|ETX|Y]
+        L_max = L_S + 2 + N_max + L_y_max
+        mask_cache = {}
+        mask_fn = make_mask_sanity if sanity else make_mask_stage0
+        for N in N_set:
+            for L_y in L_y_set:
+                raw = mask_fn(L_S, N, L_y)         # (L, L)
+                m   = np.full((L_max, L_max), -1e9, dtype=np.float32)
+                m[:raw.shape[0], :raw.shape[0]] = raw
+                mask_cache[(N, L_y)] = m
 
     train_step_fn = make_train_step(hp, baseline=baseline)
 
@@ -456,7 +582,9 @@ def train(hp: dict, baseline: bool = False, log_base: str = 'logs'):
             f'N={N}: {2*hp["n_layers"]*N*hp["d"]:,} '
             f'({100*2*hp["n_layers"]*N*hp["d"]/pcount["total"]:.1f}%)'
             for N in N_set) + '\n'
+    optimizer_name = hp.get('optimizer', 'adamw')
     header += f'  Steps: {n_steps:,}  Batch: {B}  L_y curriculum: {L_y_schedule}\n'
+    header += f'  Optimizer: {optimizer_name}\n'
     header += f'  Logs  -> {run_dir}/train.log\n'
     header += f'  JSONL -> {run_dir}/train.jsonl  (tail -f to follow)\n'
     _log(header)
@@ -464,12 +592,34 @@ def train(hp: dict, baseline: bool = False, log_base: str = 'logs'):
     log_every  = 100
     plot_every = 2_000
     ckpt_every = 10_000
+    val_every  = 1_000   # validation on 1.txt every N steps
+
+    # Load validation file (1.txt) — real Quran text, fixed across training
+    VAL_PATH = 'datasets/1.txt'
+    val_lines: list[bytes] = []
+    if os.path.exists(VAL_PATH):
+        try:
+            val_lines = _load_txt_lines(VAL_PATH)
+            _log(f'  Val file : {VAL_PATH}  ({len(val_lines)} lines)')
+        except Exception as e:
+            _log(f'  [val] skipping {VAL_PATH}: {e}')
 
     # rolling history for live plot
     history: dict[str, list] = {'step': [], 'loss': [], 'l_src': [], 'l_cont': [],
-                                  'lr': [], 'L_y': [], 'N': []}
+                                  'lr': [], 'L_y': [], 'N': [], 'val_match': []}
     t0   = time.time()
     rng  = np.random.default_rng(hp['seed'] + 1)
+
+    # Pre-sample chain pool: fixed set of K Markov chains.
+    # Model learns each chain's statistics into its weights; KV bottleneck
+    # only needs to encode which chain from the pool (much easier than full
+    # in-context T_mat estimation from scratch every example).
+    pool_size = hp.get('chain_pool_size', 64)
+    if pool_size > 0 and not baseline:
+        chain_pool = make_chain_pool(rng, pool_size, V_chain, alpha)
+        _log(f'  Chain pool: K={pool_size} chains (alpha={alpha})')
+    else:
+        chain_pool = None
 
     # Prefetch queue: background thread generates numpy batches
     # We generate (N, L_y, batch) tuples; the main thread pulls and forwards to JAX.
@@ -478,11 +628,12 @@ def train(hp: dict, baseline: bool = False, log_base: str = 'logs'):
     def _gen():
         s   = _step_counter[0]
         lyr = get_L_y(s, L_y_schedule)
-        n   = N_set[0] if baseline else rng.choice(N_set)
+        n   = N_set[0] if baseline else int(rng.choice(N_set))
         if baseline:
             arr = np_make_baseline_batch(rng, B, V_chain, L_S, lyr, alpha)
         else:
-            arr = np_make_batch(rng, B, V_chain, L_S, lyr, n, alpha)
+            arr = np_make_batch(rng, B, V_chain, L_S, lyr, n, alpha,
+                                chain_pool=chain_pool)
         _step_counter[0] += 1
         return (n, lyr, arr)
 
@@ -493,6 +644,11 @@ def train(hp: dict, baseline: bool = False, log_base: str = 'logs'):
 
     for step in pbar:
         N, L_y, np_tokens = prefetcher.get()
+        # Pad tokens to L_max so JAX sees a fixed shape (single JIT trace)
+        L_cur = np_tokens.shape[1]
+        if L_cur < L_max:
+            pad = np.zeros((B, L_max - L_cur), dtype=np.int32)  # NUL padding
+            np_tokens = np.concatenate([np_tokens, pad], axis=1)
         tokens = jnp.array(np_tokens)
         if baseline:
             mask = jnp.array(mask_cache[L_y])
@@ -501,14 +657,15 @@ def train(hp: dict, baseline: bool = False, log_base: str = 'logs'):
 
         lr = lr_schedule(step, hp)
         model, opt_state, loss, (l_src, l_cont) = train_step_fn(
-            model, opt_state, tokens, mask, N, step, lr)
+            model, opt_state, tokens, mask, N, L_y, step, lr)
 
         loss_f   = float(loss)
         l_src_f  = float(l_src)
         l_cont_f = float(l_cont)
 
         # tqdm postfix (always live)
-        phase = 'easy' if L_y == 8 else 'med' if L_y == 32 else 'hard'
+        L_y_vals = sorted({v for _, v in L_y_schedule})
+        phase = ['easy', 'med', 'hard'][min(L_y_vals.index(L_y) if L_y in L_y_vals else 0, 2)]
         pbar.set_postfix(
             loss=f'{loss_f:.3f}',
             src=f'{l_src_f:.3f}',
@@ -535,6 +692,40 @@ def train(hp: dict, baseline: bool = False, log_base: str = 'logs'):
             history['lr'].append(lr)
             history['L_y'].append(L_y)
             history['N'].append(N)
+            history['val_match'].append(None)   # filled in at val_every
+
+        if step % val_every == 0 and val_lines and not baseline:
+            # Validation: NLL on 1.txt using a single padded forward pass.
+            # Avoids _decode's per-step mask retracing which causes JIT slowdowns.
+            N_val = N_set[-1]
+            val_nlls = []
+            for vline in val_lines:
+                if len(vline) < 4:
+                    continue
+                x_S_v  = list(vline)
+                L_S_v  = len(x_S_v)
+                L_y_v  = min(16, len(x_S_v))
+                mem_v  = [STX] + [NUL] * N_val + [ETX]
+                # y = first L_y_v bytes of vline (reconstruction as proxy)
+                y_v    = list(vline[:L_y_v])
+                seq    = x_S_v + mem_v + y_v
+                mask_v = jnp.array(make_mask_stage0(L_S_v, N_val, L_y_v))
+                tok_v  = jnp.array(seq, dtype=jnp.int32)
+                logits = model(tok_v, mask_v)
+                lp     = jax.nn.log_softmax(logits[:-1], axis=-1)
+                ETX_v  = L_S_v + 1 + N_val
+                for k in range(L_y_v):
+                    pos = ETX_v + k
+                    if pos < len(seq) - 1:
+                        val_nlls.append(-float(lp[pos, seq[pos + 1]]))
+            val_nll = float(np.mean(val_nlls)) if val_nlls else float('nan')
+            val_pct = val_nll  # report as NLL (not byte-match) for speed
+            # Patch last history entry
+            if history['val_match']:
+                history['val_match'][-1] = val_pct
+            val_rec = dict(step=step, val_match=val_pct, val_path=VAL_PATH)
+            _jlog(val_rec)
+            _log(f'  [val]  step={step:5d}  1.txt NLL={val_nll:.4f}  (N={N_val})')
 
         if step % plot_every == 0 or step == n_steps:
             _plot_training(history, run_dir, L_y_schedule)
@@ -777,129 +968,148 @@ def _build_baseline_eval(key, B, L_S, L_y, V_chain, alpha):
 # ---------------------------------------------------------------------------
 
 def _decode(model: KVMemModel, x_S: list[int], N: int, prompt: list[int],
-            max_len: int, temperature: float, seed: int) -> list[int]:
+            max_len: int, temperature: float, seed: int,
+            stop_newline: bool = True) -> list[int]:
     """
-    Autoregressive decode from KV memory.
-    x_S: source bytes (the memorized content)
-    prompt: initial Y bytes (warmup)
-    Grows [x_S | STX | NUL*N | ETX | prompt | ...] token by token.
+    Autoregressive decode from KV memory. Uses a padded fixed-size mask so
+    the model call is JIT-compiled once and reused every step.
+
+    x_S    : source bytes memorized into KV
+    prompt : warmup bytes (already given); generation appends after these
+    Returns full generated list (including prompt).
     """
+    L_S       = len(x_S)
     mem_block = [STX] + [NUL] * N + [ETX]
+    # Max sequence length for mask pre-allocation
+    L_max     = L_S + 2 + N + max_len + len(prompt)
+    mask_full = jnp.array(make_mask_stage0(L_S, N, max_len + len(prompt)))
+
     generated = list(prompt)
-    key = jax.random.PRNGKey(seed)
-    L_S = len(x_S)
+    key       = jax.random.PRNGKey(seed)
+
+    @jax.jit
+    def _step(cur_tokens, mask):
+        logits = model(cur_tokens, mask)
+        return logits[-1]   # (V,)
 
     for _ in range(max_len):
-        L_y  = len(generated)
-        mask = jnp.array(make_mask_stage0(L_S, N, L_y))
-        cur  = jnp.array(x_S + mem_block + generated, dtype=jnp.int32)
-        logits = model(cur, mask)        # (L, V)
-        nxt    = logits[-1]              # (V,)
+        L_y   = len(generated)
+        # Build padded token array (pad with NUL at end, use mask to ignore)
+        cur   = x_S + mem_block + generated
+        pad_n = (L_S + 2 + N + max_len + len(prompt)) - len(cur)
+        cur_arr = jnp.array(cur + [NUL] * pad_n, dtype=jnp.int32)
+
+        # Slice the pre-built mask to current length, padded to L_max
+        L_cur  = len(cur)
+        # Use a fresh mask sized exactly to L_cur for correctness
+        mask_cur = jnp.array(make_mask_stage0(L_S, N, L_y))
+        pad_mask = jnp.full((L_cur, L_cur), -1e9, dtype=jnp.float32)
+        # Fast path: just call model with current-length input (no padding)
+        cur_jnp = jnp.array(cur, dtype=jnp.int32)
+        logit   = model(cur_jnp, mask_cur)[-1]   # (V,)
+
         if temperature == 0.0:
-            nb = int(jnp.argmax(nxt))
+            nb = int(jnp.argmax(logit))
         else:
             key, sk = jax.random.split(key)
             nb = int(jax.random.choice(sk, 256,
-                                        p=jax.nn.softmax(nxt / temperature)))
+                                       p=jax.nn.softmax(logit / temperature)))
         generated.append(nb)
-        # Stop at newline
-        if nb == 0x0A and len(generated) > len(prompt) + 1:
+        if stop_newline and nb == 0x0A and len(generated) > len(prompt) + 1:
             break
 
     return generated
 
 
-def run_verse_inference(model: KVMemModel, hp: dict,
-                        line: int = -1,
-                        N: int = 8,
-                        warmup_bytes: int = 4,
-                        max_len: int = 300,
-                        temperature: float = 0.0,
-                        seed: int = 0,
-                        fatihah_path: str = FATIHAH_PATH):
-    """
-    Memorize one ayah of Al-Fatihah, give first W bytes as warmup,
-    attempt to complete the rest of the verse.
-    """
-    ayat = load_fatihah(fatihah_path)
-    if line == -1:
-        line = random.randint(0, 6)
-
-    verse  = ayat[line]
-    x_S    = list(verse)
-    warmup = list(verse[:warmup_bytes])
-    target = verse[warmup_bytes:]
-
-    generated = _decode(model, x_S, N, warmup, max_len, temperature, seed)
-    gen_after  = bytes(generated[warmup_bytes:])
-
-    print(f'\n{"=" * 60}')
-    print(f'Ayah {line}  (N={N}, warmup={warmup_bytes} bytes, '
-          f'SCR={hp["L_S"]}/{N}={hp["L_S"]//N})')
-    print(f'  Full verse : {verse.decode("utf-8", errors="replace")}')
-    print(f'  Warmup     : {bytes(warmup).decode("utf-8", errors="replace")!r}')
-    print(f'  Generated  : {bytes(generated).decode("utf-8", errors="replace")}')
-    print(f'  Target tail: {target.decode("utf-8", errors="replace")}')
-    if target:
-        min_len = min(len(gen_after), len(target))
-        matches = sum(a == b for a, b in zip(gen_after, target))
-        print(f'  Byte match : {matches}/{min_len} '
-              f'({100*matches/max(min_len,1):.1f}%)')
-
-
-def run_all_verses(model: KVMemModel, hp: dict, N: int = 8,
-                   warmup_bytes: int = 4, temperature: float = 0.0,
-                   seed: int = 0, fatihah_path: str = FATIHAH_PATH):
-    """Run verse inference for all 7 ayat."""
-    for line in range(7):
-        run_verse_inference(model, hp, line=line, N=N,
-                            warmup_bytes=warmup_bytes,
-                            temperature=temperature, seed=seed,
-                            fatihah_path=fatihah_path)
-
-
 # ---------------------------------------------------------------------------
-# Inference: whole-file memorization
+# Test: per-line continuation
 # ---------------------------------------------------------------------------
 
-def run_file_inference(model: KVMemModel, hp: dict,
-                       filepath: str,
-                       N: int = 8,
-                       warmup_text: str = '',
-                       warmup_bytes_n: int = 4,
-                       max_len: int = 300,
-                       temperature: float = 0.0,
-                       seed: int = 0):
-    """
-    Read entire file as x_S, compress into N KV slots,
-    then complete from a warmup prompt.
 
-    warmup_text: if non-empty, use as prompt (encoded to UTF-8 bytes).
-    warmup_bytes_n: if warmup_text is empty, use first N bytes of file as prompt.
+def run_test(model: KVMemModel, hp: dict,
+             txt_path: str = FATIHAH_PATH,
+             N: int = 8,
+             warmup_bytes: int = 4,
+             max_len: int = 200,
+             temperature: float = 0.0,
+             seed: int = 0):
     """
-    with open(filepath, 'rb') as f:
-        file_bytes = f.read().rstrip(b'\n')
+    Two tests on a text file:
 
-    bad = [hex(b) for b in file_bytes if b < DATA_LO]
+    TEST 1 — Per-line continuation:
+        For each line, memorize it into KV, give first `warmup_bytes` as prompt,
+        generate until newline. Report byte-match % vs the true tail.
+
+    TEST 2 — Whole-file continuation:
+        Memorize all lines concatenated (joined by newline) into KV.
+        Give the first line as prompt, generate the rest. Report byte-match %.
+    """
+    lines = _load_txt_lines(txt_path)
+    n_lines = len(lines)
+    sep = '─' * 62
+
+    # ── TEST 1: per-line ──────────────────────────────────────────
+    print(f'\n{sep}')
+    print(f'TEST 1  Per-line continuation  [{txt_path}]')
+    print(f'  N={N}  warmup={warmup_bytes}B  temp={temperature}')
+    print(sep)
+
+    total_match = total_target = 0
+    for i, verse in enumerate(lines):
+        warmup = list(verse[:warmup_bytes])
+        target = verse[warmup_bytes:]
+        x_S    = list(verse)
+
+        gen = _decode(model, x_S, N, warmup, max_len, temperature, seed,
+                      stop_newline=False)
+        gen_tail = bytes(gen[warmup_bytes:])
+
+        n_match = sum(a == b for a, b in zip(gen_tail, target))
+        n_tot   = max(len(target), 1)
+        total_match  += n_match
+        total_target += n_tot
+
+        status = '✓' if n_match / n_tot >= 0.5 else '✗'
+        warmup_str = bytes(warmup).decode('utf-8', errors='replace')
+        gen_str    = gen_tail.decode('utf-8', errors='replace')
+        tgt_str    = target.decode('utf-8', errors='replace')
+        print(f'  [{i}] {status}  warmup={warmup_str!r}')
+        print(f'       gen : {gen_str}')
+        print(f'       tgt : {tgt_str}')
+        print(f'       match: {n_match}/{len(target)}  '
+              f'({100*n_match/n_tot:.0f}%)')
+
+    overall = 100 * total_match / max(total_target, 1)
+    print(f'\n  TOTAL byte-match: {total_match}/{total_target}  ({overall:.1f}%)')
+
+    # ── TEST 2: whole-file continuation ──────────────────────────
+    print(f'\n{sep}')
+    print(f'TEST 2  Whole-file continuation  [{txt_path}]')
+    print(f'  N={N}  prompt=first line  temp={temperature}')
+    print(sep)
+
+    file_bytes = b'\n'.join(lines)
+    bad = [hex(b) for b in file_bytes if b < DATA_LO and b != 0x0A]
     if bad:
-        raise ValueError(f'File contains protocol bytes < 0x20: {bad[:5]}')
+        print(f'  [skip] file contains protocol bytes: {bad[:5]}')
+        return
 
-    x_S = list(file_bytes)
-    L_S = len(x_S)
+    x_S    = list(file_bytes)
+    # Prompt = first line (without the trailing newline that would be in x_S)
+    warmup = list(lines[0]) + [0x0A]   # include the newline separator
+    target = file_bytes[len(lines[0]) + 1:]   # everything after first line+\n
 
-    if warmup_text:
-        warmup = list(warmup_text.encode('utf-8'))
-    else:
-        warmup = list(file_bytes[:warmup_bytes_n])
+    gen     = _decode(model, x_S, N, warmup, max_len * n_lines, temperature, seed,
+                      stop_newline=False)
+    gen_tail = bytes(gen[len(warmup):])
+    n_match  = sum(a == b for a, b in zip(gen_tail, target))
+    n_tot    = max(len(target), 1)
 
-    print(f'\n{"=" * 60}')
-    print(f'File: {filepath}  ({L_S} bytes, N={N}, SCR={L_S}/{N}={L_S//N})')
-    print(f'Warmup ({len(warmup)} bytes): '
-          f'{bytes(warmup).decode("utf-8", errors="replace")!r}')
-
-    generated = _decode(model, x_S, N, warmup, max_len, temperature, seed)
-    gen_text  = bytes(generated).decode('utf-8', errors='replace')
-    print(f'Generated: {gen_text}')
+    print(f'  Prompt  : {bytes(warmup).decode("utf-8", errors="replace")!r}')
+    print(f'  Target  : {target.decode("utf-8", errors="replace")!r}')
+    print(f'  Generated: {gen_tail.decode("utf-8", errors="replace")!r}')
+    print(f'  Byte-match: {n_match}/{len(target)}  ({100*n_match/n_tot:.1f}%)')
+    print(sep)
 
 
 # ---------------------------------------------------------------------------
@@ -997,11 +1207,19 @@ def main():
 
     # --- train ---
     p_train = sub.add_parser('train')
-    p_train.add_argument('--steps',    type=int,  default=None)
-    p_train.add_argument('--log-dir',  type=str,  default='logs',
+    p_train.add_argument('--steps',     type=int,   default=None)
+    p_train.add_argument('--log-dir',   type=str,   default='logs',
                          help='Base dir; each run creates logs/<tag>_<ts>/')
-    p_train.add_argument('--seed',     type=int,  default=42)
-    p_train.add_argument('--baseline', action='store_true')
+    p_train.add_argument('--seed',      type=int,   default=42)
+    p_train.add_argument('--baseline',  action='store_true')
+    p_train.add_argument('--sanity',    action='store_true',
+                         help='Sanity check: same layout as stage0 but Y sees S directly (no KV bottleneck). '
+                              'Should learn fast; if stage0 fails but sanity succeeds, bottleneck is the constraint.')
+    p_train.add_argument('--optimizer', type=str,   default='adamw',
+                         choices=['adamw', 'grokadamw'],
+                         help='Optimizer: adamw (default) | grokadamw (SNR-gated, arXiv:2605.01172)')
+    p_train.add_argument('--grok-rho',  type=float, default=0.9,
+                         help='GrokAdamW: EMA decay for squared-deviation state (default 0.9)')
 
     # --- eval ---
     p_eval = sub.add_parser('eval')
@@ -1012,7 +1230,20 @@ def main():
     p_eval.add_argument('--out-dir', type=str, default=None,
                         help='Where to save eval plots (default: same dir as ckpt)')
 
-    # --- infer ---
+    # --- test ---  (primary qualitative test)
+    p_test = sub.add_parser('test',
+        help='Per-line + whole-file continuation test on a text file.')
+    p_test.add_argument('--ckpt', required=True,
+                        help='Path to checkpoint (no .eqx) or run_dir')
+    p_test.add_argument('--fatihah',  type=str,   default=FATIHAH_PATH,
+                        help='Text file to test on (default: Al-Fatihah)')
+    p_test.add_argument('--mem-size', type=int,   default=8)
+    p_test.add_argument('--warmup',   type=int,   default=4,
+                        help='Warmup bytes for per-line test')
+    p_test.add_argument('--temp',     type=float, default=0.0)
+    p_test.add_argument('--seed',     type=int,   default=0)
+
+    # --- infer ---  (legacy / flexible)
     p_inf = sub.add_parser('infer')
     p_inf.add_argument('--ckpt', required=True,
                        help='Path to checkpoint (no .eqx) or run_dir')
@@ -1031,10 +1262,21 @@ def main():
 
     if args.cmd == 'train':
         hp = dict(DEFAULT_HPARAMS)
-        hp['seed'] = args.seed
+        hp['seed']      = args.seed
+        hp['optimizer'] = args.optimizer
+        hp['grok_rho']  = args.grok_rho
         if args.steps:
             hp['n_steps'] = args.steps
-        train(hp, baseline=args.baseline, log_base=args.log_dir)
+        model, run_dir = train(hp, baseline=args.baseline,
+                               sanity=getattr(args, 'sanity', False),
+                               log_base=args.log_dir)
+        # Auto-test on suratalfatihah.txt after training completes
+        if not args.baseline and not getattr(args, 'sanity', False) and os.path.exists(FATIHAH_PATH):
+            print('\n\n' + '═' * 62)
+            print(f'AUTO-TEST  suratalfatihah.txt  [{args.optimizer}]')
+            print('═' * 62)
+            run_test(model, hp, txt_path=FATIHAH_PATH, N=hp['N_set'][-1],
+                     warmup_bytes=4, temperature=0.0)
 
     elif args.cmd == 'eval':
         ckpt = _resolve_ckpt(args.ckpt)
@@ -1061,6 +1303,17 @@ def main():
             print(f'\n  Slot diversity (N={N_div}): off-diag cosine mean = {od:.3f}',
                   '✓' if od < 0.9 else '✗ COLLAPSE RISK')
 
+    elif args.cmd == 'test':
+        ckpt  = _resolve_ckpt(args.ckpt)
+        key   = jax.random.PRNGKey(0)
+        model, hp = load_checkpoint(ckpt, key)
+        run_test(model, hp,
+                 txt_path=args.fatihah,
+                 N=args.mem_size,
+                 warmup_bytes=args.warmup,
+                 temperature=args.temp,
+                 seed=args.seed)
+
     elif args.cmd == 'infer':
         ckpt  = _resolve_ckpt(args.ckpt)
         key   = jax.random.PRNGKey(0)
@@ -1068,19 +1321,19 @@ def main():
         N = args.mem_size
 
         if args.file:
-            run_file_inference(model, hp, filepath=args.file, N=N,
-                               warmup_text=args.warmup_text,
-                               warmup_bytes_n=args.warmup_bytes,
-                               temperature=args.temp, seed=args.seed)
-        elif args.all_lines:
-            run_all_verses(model, hp, N=N, warmup_bytes=args.warmup,
-                           temperature=args.temp, seed=args.seed,
-                           fatihah_path=args.fatihah)
+            # Legacy: whole-file using run_test test 2 path
+            lines = _load_txt_lines(args.file)
+            file_bytes = b'\n'.join(lines)
+            x_S    = list(file_bytes)
+            warmup = list(file_bytes[:args.warmup_bytes]) if not args.warmup_text \
+                     else list(args.warmup_text.encode('utf-8'))
+            gen = _decode(model, x_S, N, warmup, 300, args.temp, args.seed,
+                          stop_newline=False)
+            print(bytes(gen).decode('utf-8', errors='replace'))
         else:
-            run_verse_inference(model, hp, line=args.line, N=N,
-                                warmup_bytes=args.warmup,
-                                temperature=args.temp, seed=args.seed,
-                                fatihah_path=args.fatihah)
+            run_test(model, hp, txt_path=args.fatihah, N=N,
+                     warmup_bytes=args.warmup, temperature=args.temp,
+                     seed=args.seed)
 
 
 if __name__ == '__main__':
