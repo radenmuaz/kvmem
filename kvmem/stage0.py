@@ -55,36 +55,32 @@ from kvmem.data import (
 # ---------------------------------------------------------------------------
 
 DEFAULT_HPARAMS = dict(
-    V          = 256,       # full byte vocab (embedding table; only ~35 tokens active)
-    V_chain    = 32,        # Markov chain states → data bytes [0x20, 0x3F]
-    L_S        = 64,        # source length (bytes to memorize)
+    V          = 256,       # full byte vocab (embedding table)
+    # --- Task: easy enough for AR decode to work ---
+    # V_chain=8, alpha=0.05, K=8: few states, peaked rows, small pool.
+    # From state s, ~1-2 dominant successors → inferable from 64 tokens.
+    # AR decode should achieve >50% accuracy (random baseline: 12.5%).
+    V_chain    = 8,         # 8 states → data bytes [0x20, 0x27]
+    L_S        = 64,        # source length
     N_set      = [2, 4, 8, 16, 32],
     # Curriculum: (start_step, L_y)
     L_y_schedule = [(0, 16), (10_000, 32), (25_000, 64)],
-    # --- Model: medium-small, matched to task scale ---
-    # Task: 32-state Markov chain, 64-byte source, up to 64-byte continuation.
-    # Only ~35 tokens active. Need enough capacity to learn in-context Markov
-    # inference (read x_S, compress chain stats into KV, predict y).
-    # ~200K params: enough for in-context learning, small enough to train fast.
-    d          = 64,        # model dim  (was 128)
-    n_layers   = 4,         # depth
-    n_heads    = 4,         # heads (d_head=16)
-    d_ff       = 128,       # ff width   (was 512)
+    d          = 64,
+    n_layers   = 4,
+    n_heads    = 4,
+    d_ff       = 128,
     lambda_cont= 1.0,
     B          = 64,
     lr_max     = 3e-4,
     lr_min     = 1e-5,
     warmup_steps = 500,
-    n_steps    = 20_000,    # fewer steps needed for smaller model
+    n_steps    = 20_000,
     grad_clip  = 1.0,
     wd         = 0.01,
-    alpha      = 0.1,       # peaked Dirichlet → high MI between x_S and y
+    alpha      = 0.05,      # peaked rows (min clamped to 1e-3 in data.py)
     seed       = 42,
-    # Chain pool: pre-sample K chains; model learns each chain's stats into weights.
-    # KV bottleneck then only needs to encode which chain (not full T_mat).
-    # K=16 is tractable: enough variety to test KV, small enough to learn in 20k steps.
-    # Set to 0 to disable (sample fresh chain per example — much harder).
-    chain_pool_size = 16,
+    # Chain pool: K=8, small enough that each chain is well-represented in x_S
+    chain_pool_size = 8,
     # Optimizer: 'adamw' | 'grokadamw'
     optimizer  = 'adamw',
     grok_rho   = 0.9,       # GrokAdamW: EMA decay for squared-deviation state
@@ -693,6 +689,41 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
             history['L_y'].append(L_y)
             history['N'].append(N)
             history['val_match'].append(None)   # filled in at val_every
+
+        if step % val_every == 0 and chain_pool is not None and not baseline and not sanity:
+            # AR eval on held-out Markov examples (unseen chains from pool).
+            # Uses same pool so model has seen these chain statistics during training,
+            # but the specific x_S and y sequences are fresh (different walks).
+            _N_ar = N_set[-1]
+            _ar_rng = np.random.default_rng(step)   # deterministic per step
+            _ar_pool = chain_pool   # trained pool
+            _ar_correct = _ar_total = 0
+
+            def _np_walk(T, start, n):
+                s = [start]
+                for _ in range(n-1): s.append(_ar_rng.choice(len(T), p=T[s[-1]]))
+                return s
+
+            for _t in range(32):   # 32 fresh examples
+                _ki = int(_ar_rng.integers(0, len(_ar_pool)))
+                _T  = _ar_pool[_ki]
+                _start = int(_ar_rng.integers(0, V_chain))
+                _x_raw = _np_walk(_T, _start, L_S)
+                _term  = _x_raw[-1]
+                _y_raw = _np_walk(_T, _term, 17)   # 1 warmup + 16 to predict
+                _x_S   = [v + DATA_LO for v in _x_raw]
+                _y_true = [v + DATA_LO for v in _y_raw]
+                _warmup = _y_true[:1]
+                _gen = _decode(model, _x_S, _N_ar, _warmup,
+                               max_len=16, temperature=0.0, seed=_t, stop_newline=False)
+                _ar_correct += sum(a == b for a, b in zip(_gen[1:], _y_true[1:17]))
+                _ar_total   += 16
+
+            ar_acc = 100 * _ar_correct / _ar_total
+            ar_random = 100 / V_chain
+            _log(f'  [ar]   step={step:5d}  AR acc={ar_acc:.1f}%  (random={ar_random:.1f}%  N={_N_ar})')
+            val_rec_ar = dict(step=step, ar_acc=ar_acc, ar_random=ar_random)
+            _jlog(val_rec_ar)
 
         if step % val_every == 0 and val_lines and not baseline:
             # Validation: NLL on 1.txt using a single padded forward pass.

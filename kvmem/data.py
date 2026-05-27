@@ -400,7 +400,7 @@ def np_make_one(rng: np.random.Generator, V_chain: int, L_S: int,
                 L_y: int, N: int, alpha: float) -> np.ndarray:
     """Build one [x_S | STX | NUL*N | ETX | y] sequence using numpy."""
     # Sample transition matrix via Dirichlet (gamma trick)
-    g = rng.gamma(alpha, size=(V_chain, V_chain)).astype(np.float32)
+    g = rng.gamma(max(alpha, 1e-3), size=(V_chain, V_chain)).astype(np.float32)
     T_mat = g / g.sum(axis=1, keepdims=True)
 
     start = rng.integers(0, V_chain)
@@ -468,7 +468,7 @@ def make_chain_pool(rng: np.random.Generator, K: int, V_chain: int,
     """
     pool = np.empty((K, V_chain, V_chain), dtype=np.float32)
     for k in range(K):
-        g = rng.gamma(alpha, size=(V_chain, V_chain)).astype(np.float32)
+        g = rng.gamma(max(alpha, 1e-3), size=(V_chain, V_chain)).astype(np.float32)
         pool[k] = g / g.sum(axis=1, keepdims=True)
     return pool
 
