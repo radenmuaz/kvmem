@@ -46,6 +46,7 @@ from kvmem.data import (
     np_make_batch,
     np_make_baseline_batch,
     np_make_eval_batches,
+    np_make_recall_batch,
     sample_transition_matrix,
     stationary_distribution,
 )
@@ -371,6 +372,29 @@ def loss_fn(model: KVMemModel, tokens: jax.Array, mask: jax.Array,
     return total, (L_src, L_cont)
 
 
+def loss_fn_recall(model: KVMemModel, tokens: jax.Array, mask: jax.Array,
+                   L_S: int, N: int) -> tuple:
+    """
+    Recall loss: Y = copy of x_S.
+    tokens: (B, L_S + 2 + N + L_S)  where the last L_S tokens mirror the first L_S.
+    Only NTP on Y positions (ETX+1 .. ETX+L_S).
+    No src auxiliary — the source is already the target.
+    """
+    B, L   = tokens.shape
+    nll    = _nll_matrix(model, tokens, mask)    # (B, L-1)
+    pos    = jnp.arange(L - 1)
+    ETX_pos = L_S + 1 + N
+    Y_end   = L_S + 2 + N + L_S   # = L
+
+    mask_cont = ((pos >= ETX_pos) & (pos < Y_end - 1)).astype(jnp.float32)
+
+    def wmean(x, m):
+        return jnp.sum(x * m[None, :], axis=-1) / (m.sum() + 1e-8)
+
+    L_cont = jnp.mean(wmean(nll, mask_cont))
+    return L_cont, (jnp.zeros(()), L_cont)
+
+
 def loss_fn_baseline(model: KVMemModel, tokens: jax.Array, mask: jax.Array,
                      L_S: int, L_y: int, lambda_cont: float) -> tuple:
     """
@@ -397,7 +421,7 @@ def loss_fn_baseline(model: KVMemModel, tokens: jax.Array, mask: jax.Array,
 # Training step (not jitted — jit at call site with closure over hp)
 # ---------------------------------------------------------------------------
 
-def make_train_step(hp: dict, baseline: bool = False):
+def make_train_step(hp: dict, baseline: bool = False, recall: bool = False):
     """Return a jit-compiled train_step function closed over hp.
 
     N and L_y are static so the loss masks are traced correctly per combo.
@@ -405,6 +429,7 @@ def make_train_step(hp: dict, baseline: bool = False):
     changes — 15 traces max, then cached forever.
 
     optimizer hp key selects: 'adamw' (default) | 'grokadamw'
+    recall mode: Y = copy of x_S; only cont loss, no src auxiliary.
     """
     lambda_cont = hp['lambda_cont']
     L_S         = hp['L_S']
@@ -415,6 +440,10 @@ def make_train_step(hp: dict, baseline: bool = False):
     if baseline:
         def _loss(model, tokens, mask, N_unused, L_y):
             return loss_fn_baseline(model, tokens, mask, L_S, L_y, lambda_cont)
+    elif recall:
+        def _loss(model, tokens, mask, N, L_y):
+            # L_y is always L_S in recall mode (Y = copy of x_S)
+            return loss_fn_recall(model, tokens, mask, L_S, N)
     else:
         def _loss(model, tokens, mask, N, L_y):
             return loss_fn(model, tokens, mask, L_S, N, L_y, lambda_cont)
@@ -493,11 +522,229 @@ def _load_txt_lines(path: str) -> list[bytes]:
 
 
 # ---------------------------------------------------------------------------
+# Recall training — learn general copy/recall on synthetic data, test on real text
+# ---------------------------------------------------------------------------
+
+RECALL_HPARAMS = dict(
+    V             = 256,
+    d             = 64,
+    n_layers      = 4,
+    n_heads       = 4,
+    d_ff          = 128,
+    N             = 32,
+    B             = 64,
+    lr_max        = 3e-4,
+    lr_min        = 1e-6,    # very low — maintain training pressure for grokking
+    warmup_steps  = 500,
+    n_steps       = 100_000, # long — grokking needs extended training
+    grad_clip     = 1.0,
+    wd            = 0.1,     # strong weight decay — key for grokking generalization
+    seed          = 42,
+    optimizer     = 'grokadamw',
+    grok_rho      = 0.95,
+    seg_len       = 64,
+    warmup_bytes  = 4,
+    val_every     = 1_000,
+    ckpt_every    = 5_000,
+    log_every     = 100,
+)
+
+
+def _make_synthetic_recall_batch(rng: np.random.Generator, B: int,
+                                 seg_len: int, N: int) -> np.ndarray:
+    """
+    Training batch: random bytes in [DATA_LO, 0xFF], Y = exact copy of x_S.
+    Sequence: [x_S | STX | NUL*N | ETX | x_S]
+    Shape: (B, seg_len + 2 + N + seg_len)
+    """
+    L   = seg_len + 2 + N + seg_len
+    out = np.empty((B, L), dtype=np.int32)
+    for i in range(B):
+        seg = rng.integers(DATA_LO, 256, size=seg_len).astype(np.int32)
+        out[i, :seg_len]                = seg
+        out[i, seg_len]                 = STX
+        out[i, seg_len+1 : seg_len+1+N] = NUL
+        out[i, seg_len+1+N]             = ETX
+        out[i, seg_len+2+N:]            = seg   # Y = exact copy
+    return out
+
+
+def _eval_recall_on_file(model, corpus_path: str, seg_len: int, N: int,
+                         warmup_bytes: int, rng: np.random.Generator,
+                         n_eval: int = 32) -> float:
+    """
+    Evaluate AR recall on a real text file (zero overlap with training data).
+    Samples n_eval segments of seg_len bytes from the file, encodes each into KV,
+    gives warmup_bytes prompt, decodes to end, returns byte-match %.
+    """
+    with open(corpus_path, 'rb') as f:
+        raw = f.read()
+    corpus = bytes(b for b in raw if b >= DATA_LO)
+    if len(corpus) < seg_len:
+        return float('nan')
+
+    correct = total = 0
+    n = min(n_eval, max(1, len(corpus) - seg_len + 1))
+    # Stride evenly through corpus
+    offsets = [int(i * (len(corpus) - seg_len) / max(n - 1, 1)) for i in range(n)]
+    for et, offset in enumerate(offsets):
+        seg    = corpus[offset : offset + seg_len]
+        x_S    = list(seg)
+        warmup = x_S[:warmup_bytes]
+        target = x_S[warmup_bytes:]
+        gen    = _decode(model, x_S, N, warmup,
+                         max_len=seg_len - warmup_bytes,
+                         temperature=0.0, seed=et, stop_newline=False)
+        gen_tail = gen[warmup_bytes:]
+        correct += sum(a == b for a, b in zip(gen_tail, target))
+        total   += len(target)
+    return 100.0 * correct / max(total, 1)
+
+
+def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs'):
+    """
+    Train model for general copy/recall using SYNTHETIC RANDOM BYTES only.
+    No real text seen during training.
+
+    Every val_every steps, evaluate AR recall on the provided test_files
+    (real text — zero overlap with training data).
+
+    Goal: model learns the general algorithm:
+        read x_S → compress losslessly into M slots → reconstruct from M + warmup
+    If this generalizes, it works on any byte sequence not seen during training.
+    """
+    seg_len      = hp['seg_len']
+    N            = hp['N']
+    B            = hp['B']
+    n_steps      = hp['n_steps']
+    warmup_bytes = hp['warmup_bytes']
+    val_every    = hp['val_every']
+    ckpt_every   = hp['ckpt_every']
+    log_every    = hp['log_every']
+
+    key = jax.random.PRNGKey(hp['seed'])
+    key, mkey = jax.random.split(key)
+    model     = build_model(hp, mkey)
+    optimizer = hp.get('optimizer', 'adamw')
+    opt_state = init_opt_state(model, optimizer=optimizer)
+
+    run_dir  = setup_run_dir(log_base, 'recall')
+    ckpt_dir = os.path.join(run_dir, 'checkpoints')
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    raw_log_f   = open(os.path.join(run_dir, 'train.log'),   'w', buffering=1)
+    train_log_f = open(os.path.join(run_dir, 'train.jsonl'), 'w', buffering=1)
+
+    def _log(msg):
+        tqdm.write(msg)
+        raw_log_f.write(msg + '\n')
+        raw_log_f.flush()
+
+    def _jlog(rec):
+        train_log_f.write(json.dumps(rec) + '\n')
+        train_log_f.flush()
+
+    with open(os.path.join(run_dir, 'hparams.json'), 'w') as f:
+        json.dump({**hp, 'test_files': test_files}, f, indent=2)
+
+    pcount   = count_params(model)
+    mask_jnp = jnp.array(make_mask_stage0(seg_len, N, seg_len))
+    L_seq    = seg_len + 2 + N + seg_len
+    ETX_pos  = seg_len + 1 + N
+
+    _log(f'\n=== Recall training (synthetic→real) | run_dir={run_dir} ===')
+    _log(f'  Training: SYNTHETIC random bytes  [DATA_LO={DATA_LO:#x}..0xFF]')
+    _log(f'  Test files: {test_files}')
+    _log(f'  Params: {pcount["total"]:,}')
+    _log(f'  seg_len={seg_len}  N={N}  KV_floats={2*hp["n_layers"]*N*hp["d"]:,}')
+    _log(f'  Steps={n_steps}  Batch={B}  Optimizer={hp.get("optimizer","adamw")}')
+
+    rng = np.random.default_rng(hp['seed'] + 1)
+    t0  = time.time()
+
+    use_grok = (optimizer == 'grokadamw')
+
+    @jax.jit
+    def _step_jit(model, opt_state, tokens, step, lr):
+        params = eqx.filter(model, eqx.is_array)
+
+        def _loss(m):
+            B_loc, L = tokens.shape
+            logits = jax.vmap(lambda tok: m(tok, mask_jnp))(tokens)
+            lp     = jax.nn.log_softmax(logits[:, :-1], axis=-1)
+            tgts   = tokens[:, 1:]
+            nll    = -lp[jnp.arange(B_loc)[:, None],
+                         jnp.arange(L - 1)[None, :], tgts]
+            pos       = jnp.arange(L - 1)
+            Y_end     = ETX_pos + seg_len
+            mask_cont = ((pos >= ETX_pos) & (pos < Y_end)).astype(jnp.float32)
+            return (jnp.sum(nll * mask_cont[None, :])
+                    / (mask_cont.sum() * B_loc + 1e-8))
+
+        loss, grads = jax.value_and_grad(_loss)(model)
+        grads_arr = eqx.filter(grads, eqx.is_array)
+        grads_arr = clip_grads(grads_arr, max_norm=hp['grad_clip'])
+        if use_grok:
+            new_params, new_opt = grok_adam_update(
+                params, grads_arr, opt_state, lr,
+                rho=hp.get('grok_rho', 0.95), wd=hp['wd'],
+                step=step, batch_size=hp['B'])
+        else:
+            new_params, new_opt = adam_update(
+                params, grads_arr, opt_state, lr, wd=hp['wd'], step=step)
+        deltas    = jax.tree.map(lambda np_, p: np_ - p, new_params, params)
+        new_model = eqx.apply_updates(model, deltas)
+        return new_model, new_opt, loss
+
+    pbar = tqdm(range(1, n_steps + 1), desc='recall', unit='step',
+                dynamic_ncols=True, file=sys.stdout)
+
+    for step in pbar:
+        np_tokens = _make_synthetic_recall_batch(rng, B, seg_len, N)
+        tokens    = jnp.array(np_tokens)
+        lr        = lr_schedule(step, hp)
+        model, opt_state, loss = _step_jit(model, opt_state, tokens, step, lr)
+
+        loss_f = float(loss)
+        pbar.set_postfix(loss=f'{loss_f:.4f}', lr=f'{lr:.1e}', refresh=False)
+
+        if step % log_every == 0:
+            elapsed = time.time() - t0
+            _log(f'  step={step:5d}/{n_steps}  loss={loss_f:.4f}  lr={lr:.2e}  {elapsed:.0f}s')
+            _jlog(dict(step=step, loss=loss_f, lr=lr, elapsed=elapsed))
+
+        if step % val_every == 0:
+            eval_rng = np.random.default_rng(step)
+            for fpath in test_files:
+                if not os.path.exists(fpath):
+                    continue
+                acc = _eval_recall_on_file(model, fpath, seg_len, N,
+                                           warmup_bytes, eval_rng)
+                fname = os.path.basename(fpath)
+                _log(f'  [val]  step={step:5d}  {fname}  recall={acc:.1f}%  '
+                     f'(warmup={warmup_bytes}B  tgt={seg_len-warmup_bytes}B)')
+                _jlog(dict(step=step, file=fpath, recall_pct=acc))
+
+        if step % ckpt_every == 0 or step == n_steps:
+            ckpt_path = os.path.join(ckpt_dir, f'recall_step{step}')
+            save_checkpoint(ckpt_path, model, step, hp)
+            _log(f'  [ckpt] {ckpt_path}')
+
+    pbar.close()
+    _log(f'\nDone. Total time: {time.time()-t0:.0f}s')
+    _log(f'Run dir: {run_dir}')
+    train_log_f.close()
+    raw_log_f.close()
+    return model, run_dir
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
 
-def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str = 'logs'):
+def train(hp: dict, baseline: bool = False, sanity: bool = False,
+          recall: bool = False, log_base: str = 'logs'):
     key = jax.random.PRNGKey(hp['seed'])
     key, mkey = jax.random.split(key)
 
@@ -512,7 +759,7 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
     alpha        = hp['alpha']
     V_chain      = hp['V_chain']
 
-    tag = 'baseline' if baseline else ('sanity' if sanity else 'stage0')
+    tag = 'baseline' if baseline else ('sanity' if sanity else ('recall' if recall else 'stage0'))
 
     # ---- run directory: logs/<tag>_<timestamp>/ ----
     run_dir  = setup_run_dir(log_base, tag)
@@ -553,6 +800,16 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
             m   = np.full((L_max, L_max), -1e9, dtype=np.float32)
             m[:raw.shape[0], :raw.shape[0]] = raw
             mask_cache[L_y] = m
+    elif recall:
+        # Recall: Y = copy of x_S. L_y is always L_S.
+        # Mask is make_mask_stage0(L_S, N, L_S) for each N.
+        L_max = L_S + 2 + N_max + L_S   # Y region = L_S
+        mask_cache = {}
+        for N in N_set:
+            raw = make_mask_stage0(L_S, N, L_S)
+            m   = np.full((L_max, L_max), -1e9, dtype=np.float32)
+            m[:raw.shape[0], :raw.shape[0]] = raw
+            mask_cache[N] = m
     else:
         # Both stage0 and sanity use same sequence layout [S|STX|M|ETX|Y]
         L_max = L_S + 2 + N_max + L_y_max
@@ -565,7 +822,7 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
                 m[:raw.shape[0], :raw.shape[0]] = raw
                 mask_cache[(N, L_y)] = m
 
-    train_step_fn = make_train_step(hp, baseline=baseline)
+    train_step_fn = make_train_step(hp, baseline=baseline, recall=recall)
 
     pcount = count_params(model)
     header = (
@@ -587,7 +844,7 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
 
     log_every  = 100
     plot_every = 2_000
-    ckpt_every = 10_000
+    ckpt_every = 2_000
     val_every  = 1_000   # validation on 1.txt every N steps
 
     # Load validation file (1.txt) — real Quran text, fixed across training
@@ -611,7 +868,7 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
     # only needs to encode which chain from the pool (much easier than full
     # in-context T_mat estimation from scratch every example).
     pool_size = hp.get('chain_pool_size', 64)
-    if pool_size > 0 and not baseline:
+    if pool_size > 0 and not baseline and not recall:
         chain_pool = make_chain_pool(rng, pool_size, V_chain, alpha)
         _log(f'  Chain pool: K={pool_size} chains (alpha={alpha})')
     else:
@@ -627,6 +884,10 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
         n   = N_set[0] if baseline else int(rng.choice(N_set))
         if baseline:
             arr = np_make_baseline_batch(rng, B, V_chain, L_S, lyr, alpha)
+        elif recall:
+            # Recall: Y = copy of x_S; L_y is always L_S
+            arr = np_make_recall_batch(rng, B, L_S, n)
+            lyr = L_S   # report L_y = L_S for display purposes
         else:
             arr = np_make_batch(rng, B, V_chain, L_S, lyr, n, alpha,
                                 chain_pool=chain_pool)
@@ -648,6 +909,8 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
         tokens = jnp.array(np_tokens)
         if baseline:
             mask = jnp.array(mask_cache[L_y])
+        elif recall:
+            mask = jnp.array(mask_cache[N])
         else:
             mask = jnp.array(mask_cache[(N, L_y)])
 
@@ -690,7 +953,31 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
             history['N'].append(N)
             history['val_match'].append(None)   # filled in at val_every
 
-        if step % val_every == 0 and chain_pool is not None and not baseline and not sanity:
+        if step % val_every == 0 and recall and not baseline:
+            # Recall AR eval: encode random x_S into KV, decode from 4-byte warmup
+            _N_ar = N_set[-1]
+            _ar_rng = np.random.default_rng(step)
+            _ar_correct = _ar_total = 0
+            _n_examples = 32
+
+            for _t in range(_n_examples):
+                # Generate random source bytes
+                _x_S = list(_ar_rng.integers(DATA_LO, 256, size=L_S).astype(int))
+                _warmup = _x_S[:4]   # first 4 bytes as warmup
+                _target = _x_S[4:]   # rest to predict (L_S - 4 bytes)
+
+                _gen_out = _decode(model, _x_S, _N_ar, _warmup,
+                                   max_len=L_S - 4, temperature=0.0,
+                                   seed=_t, stop_newline=False)
+                _gen_tail = _gen_out[4:]
+                _ar_correct += sum(a == b for a, b in zip(_gen_tail, _target))
+                _ar_total += len(_target)
+
+            ar_acc = 100 * _ar_correct / max(_ar_total, 1)
+            _log(f'  [ar]   step={step:5d}  recall AR acc={ar_acc:.1f}%  (N={_N_ar}  warmup=4B  target={L_S-4}B)')
+            _jlog(dict(step=step, ar_acc=ar_acc, ar_mode='recall'))
+
+        if step % val_every == 0 and chain_pool is not None and not baseline and not sanity and not recall:
             # AR eval on held-out Markov examples (unseen chains from pool).
             # Uses same pool so model has seen these chain statistics during training,
             # but the specific x_S and y sequences are fresh (different walks).
@@ -725,7 +1012,7 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
             val_rec_ar = dict(step=step, ar_acc=ar_acc, ar_random=ar_random)
             _jlog(val_rec_ar)
 
-        if step % val_every == 0 and val_lines and not baseline:
+        if step % val_every == 0 and val_lines and not baseline and not recall:
             # Validation: NLL on 1.txt using a single padded forward pass.
             # Avoids _decode's per-step mask retracing which causes JIT slowdowns.
             N_val = N_set[-1]
@@ -763,7 +1050,7 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False, log_base: str 
 
         if step % ckpt_every == 0 or step == n_steps:
             ckpt_path = os.path.join(ckpt_dir, f'{tag}_step{step}')
-            save_checkpoint(ckpt_path, model, step, hp)
+            save_checkpoint(ckpt_path, model, step, {**hp, 'recall': recall})
             _log(f'  [ckpt] {ckpt_path}')
 
     pbar.close()
@@ -1246,11 +1533,35 @@ def main():
     p_train.add_argument('--sanity',    action='store_true',
                          help='Sanity check: same layout as stage0 but Y sees S directly (no KV bottleneck). '
                               'Should learn fast; if stage0 fails but sanity succeeds, bottleneck is the constraint.')
+    p_train.add_argument('--recall',    action='store_true',
+                         help='Recall mode: Y = copy of x_S. Trains model for perfect KV memorization + recall. '
+                              'Goal: 100%% AR accuracy from 4-byte warmup.')
     p_train.add_argument('--optimizer', type=str,   default='adamw',
                          choices=['adamw', 'grokadamw'],
                          help='Optimizer: adamw (default) | grokadamw (SNR-gated, arXiv:2605.01172)')
     p_train.add_argument('--grok-rho',  type=float, default=0.9,
                          help='GrokAdamW: EMA decay for squared-deviation state (default 0.9)')
+
+    # --- recall-corpus ---
+    p_rc = sub.add_parser('recall-corpus',
+        help='Train on SYNTHETIC random bytes; eval recall on real text files (no data leak).')
+    p_rc.add_argument('--test-files', type=str, nargs='+',
+                      default=['datasets/1.txt', 'datasets/suratalfatihah.txt'],
+                      help='Real text files to eval recall on (never seen during training)')
+    p_rc.add_argument('--seg-len',   type=int,   default=64,
+                      help='Source segment length in bytes (default: 64)')
+    p_rc.add_argument('--N',         type=int,   default=32,
+                      help='KV memory slots (default: 32)')
+    p_rc.add_argument('--steps',     type=int,   default=None)
+    p_rc.add_argument('--log-dir',   type=str,   default='logs')
+    p_rc.add_argument('--seed',      type=int,   default=42)
+    p_rc.add_argument('--warmup',    type=int,   default=4,
+                      help='AR eval warmup bytes (default: 4)')
+    p_rc.add_argument('--optimizer', type=str,   default='grokadamw',
+                      choices=['adamw', 'grokadamw'])
+    p_rc.add_argument('--grok-rho',  type=float, default=0.95)
+    p_rc.add_argument('--wd',        type=float, default=None,
+                      help='Weight decay (default: 0.1 for grokking)')
 
     # --- eval ---
     p_eval = sub.add_parser('eval')
@@ -1291,6 +1602,21 @@ def main():
 
     args = parser.parse_args()
 
+    if args.cmd == 'recall-corpus':
+        hp = dict(RECALL_HPARAMS)
+        hp['seg_len']      = args.seg_len
+        hp['N']            = args.N
+        hp['seed']         = args.seed
+        hp['warmup_bytes'] = args.warmup
+        hp['optimizer']    = args.optimizer
+        hp['grok_rho']     = args.grok_rho
+        if args.wd is not None:
+            hp['wd'] = args.wd
+        if args.steps:
+            hp['n_steps'] = args.steps
+        train_recall(hp, test_files=args.test_files, log_base=args.log_dir)
+        return
+
     if args.cmd == 'train':
         hp = dict(DEFAULT_HPARAMS)
         hp['seed']      = args.seed
@@ -1300,9 +1626,10 @@ def main():
             hp['n_steps'] = args.steps
         model, run_dir = train(hp, baseline=args.baseline,
                                sanity=getattr(args, 'sanity', False),
+                               recall=getattr(args, 'recall', False),
                                log_base=args.log_dir)
         # Auto-test on suratalfatihah.txt after training completes
-        if not args.baseline and not getattr(args, 'sanity', False) and os.path.exists(FATIHAH_PATH):
+        if not args.baseline and not getattr(args, 'sanity', False) and not getattr(args, 'recall', False) and os.path.exists(FATIHAH_PATH):
             print('\n\n' + '═' * 62)
             print(f'AUTO-TEST  suratalfatihah.txt  [{args.optimizer}]')
             print('═' * 62)

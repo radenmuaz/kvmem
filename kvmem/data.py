@@ -505,6 +505,27 @@ def np_make_batch(rng: np.random.Generator, B: int, V_chain: int,
     return out
 
 
+def np_make_recall_batch(rng: np.random.Generator, B: int,
+                         L_S: int, N: int) -> np.ndarray:
+    """
+    Recall batch: Y = copy of x_S.
+    Sequence: [x_S | STX | NUL*N | ETX | x_S]
+    x_S is random bytes in [DATA_LO, 0xFF].
+    Shape: (B, L_S + 2 + N + L_S).
+    """
+    L_y = L_S   # Y is a copy of x_S
+    L   = L_S + 2 + N + L_y
+    out = np.empty((B, L), dtype=np.int32)
+    for i in range(B):
+        x_S = rng.integers(DATA_LO, 256, size=L_S).astype(np.int32)
+        out[i, :L_S]             = x_S
+        out[i, L_S]              = STX
+        out[i, L_S+1 : L_S+1+N] = NUL
+        out[i, L_S+1+N]         = ETX
+        out[i, L_S+2+N:]        = x_S   # Y = exact copy of x_S
+    return out
+
+
 def np_make_eval_batches(seed: int, B: int, V_chain: int,
                          L_S: int, L_y: int, N: int,
                          alpha: float = 0.5) -> dict:
