@@ -106,79 +106,57 @@ def make_test_sequences(seg_len: int) -> dict[str, list[int]]:
 
 
 # ---------------------------------------------------------------------------
-# Synthetic training data (structured patterns with random offsets/scales)
+# Synthetic training data — UNIFORM RANDOM BYTES ONLY
+# Training data must not contain or resemble the held-out test sequences.
+# The model must learn the general copy algorithm, not pattern-specific shortcuts.
 # ---------------------------------------------------------------------------
 
 def _make_synthetic_batch(rng: np.random.Generator, B: int,
                           seg_len: int, N: int) -> np.ndarray:
     """
-    Training batch: structured byte sequences (NOT uniform random).
-    Each example picks a random pattern type with random parameters.
+    Training batch: UNIFORM RANDOM bytes in [DATA_LO, 0xFF].
     Y = exact copy of x_S.
 
-    Pattern types:
-      0: arithmetic sequence (random start, step in [1..8])
-      1: geometric-ish sequence (random start, scale in [1.05..1.2])
-      2: sawtooth (random period in [2..seg_len//2], random amplitude)
-      3: palindrome (random base, step)
-      4: two interleaved arithmetic sequences
-      5: uniform random bytes (baseline)
+    No structured patterns — training uses purely random distributions.
+    Test sequences (up_counter, odd, geometric, etc.) are deterministic patterns
+    held out completely: they NEVER appear in training.
+
+    Each example independently draws from one of several random distributions:
+      0. Uniform over [DATA_LO..0xFF]            — pure iid
+      1. Dirichlet-skewed (alpha~Unif[0.05,1.0]) — skewed iid (like real text stats)
+      2. Uniform over random sub-range [a..b]    — restricted alphabet iid
+      3. Geometric distribution, clipped         — exponentially decaying iid
+
+    All distributions are purely mathematical (known closed-form), no real text.
     """
-    L   = seg_len + 2 + N + seg_len
-    out = np.empty((B, L), dtype=np.int32)
+    V_full   = 256 - DATA_LO  # 236 possible values
+    L        = seg_len + 2 + N + seg_len
+    out      = np.empty((B, L), dtype=np.int32)
     slot_ids = make_slot_ids(N)
 
     for i in range(B):
-        ptype = int(rng.integers(0, 6))
-
-        if ptype == 0:
-            # Arithmetic
-            start = int(rng.integers(DATA_LO, 200))
-            step  = int(rng.integers(1, 9))
-            seg   = np.array([(start + step * j) % 256 for j in range(seg_len)], dtype=np.int32)
-            seg   = np.clip(seg, DATA_LO, 255)
-        elif ptype == 1:
-            # Geometric-ish
-            start = int(rng.integers(DATA_LO, 150))
-            scale = float(rng.uniform(1.05, 1.2))
-            seg   = []
-            v = start
-            for _ in range(seg_len):
-                seg.append(max(DATA_LO, min(255, int(v))))
-                v = v * scale
-                if v >= 240:
-                    v = DATA_LO + float(rng.integers(0, 10))
-            seg = np.array(seg, dtype=np.int32)
-        elif ptype == 2:
-            # Sawtooth
-            period = int(rng.integers(2, max(3, seg_len // 2 + 1)))
-            amp    = int(rng.integers(8, 64))
-            start  = int(rng.integers(DATA_LO, 256 - amp))
-            seg    = np.array([start + (j % period) * (amp // period)
-                                for j in range(seg_len)], dtype=np.int32)
-            seg    = np.clip(seg, DATA_LO, 255)
-        elif ptype == 3:
-            # Palindrome
-            half  = seg_len // 2
-            start = int(rng.integers(DATA_LO, 200))
-            step  = int(rng.integers(1, 5))
-            fwd   = [(start + step * j) % 256 for j in range(half)]
-            fwd   = [max(DATA_LO, x) for x in fwd]
-            full  = fwd + list(reversed(fwd))
-            seg   = np.array((full + fwd)[:seg_len], dtype=np.int32)
-        elif ptype == 4:
-            # Two interleaved sequences
-            s1, s2 = int(rng.integers(DATA_LO, 150)), int(rng.integers(DATA_LO, 150))
-            d1, d2 = int(rng.integers(1, 5)), int(rng.integers(1, 5))
-            seg = np.array([(s1 + d1*(j//2)) % 256 if j%2==0 else (s2 + d2*(j//2)) % 256
-                             for j in range(seg_len)], dtype=np.int32)
-            seg = np.clip(seg, DATA_LO, 255)
-        else:
-            # Uniform random
+        dist_type = int(rng.integers(0, 4))
+        if dist_type == 0:
+            # Uniform over full range
             seg = rng.integers(DATA_LO, 256, size=seg_len).astype(np.int32)
+        elif dist_type == 1:
+            # Dirichlet-skewed: peaked random frequencies
+            alpha_dir = float(rng.uniform(0.05, 1.0))
+            p   = rng.dirichlet(np.ones(V_full) * alpha_dir)
+            seg = (rng.choice(V_full, size=seg_len, p=p) + DATA_LO).astype(np.int32)
+        elif dist_type == 2:
+            # Uniform over random contiguous sub-range
+            width = int(rng.integers(4, min(65, V_full + 1)))
+            lo    = int(rng.integers(0, V_full - width + 1)) + DATA_LO
+            seg   = rng.integers(lo, lo + width, size=seg_len).astype(np.int32)
+        else:
+            # Geometric distribution clipped to range
+            p_geom = float(rng.uniform(0.02, 0.3))
+            raw    = rng.geometric(p_geom, size=seg_len) - 1
+            seg    = (np.clip(raw, 0, V_full - 1) + DATA_LO).astype(np.int32)
 
-        out[i, :seg_len]             = seg
-        out[i, seg_len]              = STX
+        out[i, :seg_len]              = seg
+        out[i, seg_len]               = STX
         out[i, seg_len+1:seg_len+1+N] = slot_ids
         out[i, seg_len+1+N]           = ETX
         out[i, seg_len+2+N:]          = seg   # Y = exact copy
@@ -228,17 +206,12 @@ def ar_decode(model: KVMemModel, x_S: list[int], N: int,
     # Pre-build full-length mask once (causally correct for any prefix length)
     mask_full = jnp.array(make_mask_stage0(seg_len, N, len(warmup) + max_new))
 
-    # JIT single step
-    @jax.jit
-    def _step(tokens_padded):
-        return model(tokens_padded, mask_full)  # (L_full, V)
-
     for k in range(max_new):
         cur     = x_S + mem_block + generated
         pad_n   = L_full - len(cur)
         padded  = jnp.array(cur + [0] * pad_n, dtype=jnp.int32)
-        logits  = _step(padded)          # (L_full, V)
-        pos     = len(cur) - 1           # predict next from last actual token
+        logits  = model(padded, mask_full)   # (L_full, V)
+        pos     = len(cur) - 1              # predict next from last actual token
         nb      = int(jnp.argmax(logits[pos]))
         generated.append(nb)
 
@@ -307,7 +280,8 @@ def train_mini(hp: dict, log_base: str = 'logs'):
     _log(f'  Model: d={hp["d"]}  n_layers={hp["n_layers"]}  params={pcount["total"]:,}')
     _log(f'  seg_len={seg_len}  N={N}  warmup_n={warmup_n}')
     _log(f'  Steps={n_steps}  Batch={B}  lr={lr_max}  wd={wd}')
-    _log(f'  Test sequences: {list(test_seqs.keys())}')
+    _log(f'  Train: RANDOM bytes — uniform/Dirichlet/sub-range/geometric distributions')
+    _log(f'  Test (held out): {list(test_seqs.keys())}')
 
     rng = np.random.default_rng(hp['seed'] + 1)
     t0  = time.time()
@@ -402,19 +376,19 @@ def train_mini(hp: dict, log_base: str = 'logs'):
 
 MINI_HPARAMS = dict(
     V          = 256,
-    d          = 32,
-    n_layers   = 3,
+    d          = 64,
+    n_layers   = 4,
     n_heads    = 4,
-    d_ff       = 64,
+    d_ff       = 128,
     seg_len    = 8,
     N          = 4,
     B          = 64,
-    lr_max     = 3e-4,
-    wd         = 0.01,
+    lr_max     = 1e-3,
+    wd         = 0.0,
     grad_clip  = 1.0,
     warmup_steps = 200,
-    n_steps    = 10_000,
-    eval_every = 100,
+    n_steps    = 30_000,
+    eval_every = 2_000,
     warmup_n   = 1,    # AR eval: 1 byte warmup
     seed       = 42,
 )
@@ -442,7 +416,9 @@ def main():
     if args.N:         hp['N']          = args.N
     if args.steps:     hp['n_steps']    = args.steps
     if args.eval_every: hp['eval_every'] = args.eval_every
-    if args.d:         hp['d']          = args.d
+    if args.d:
+        hp['d']     = args.d
+        hp['d_ff']  = args.d * 2
     if args.n_layers:  hp['n_layers']   = args.n_layers
     if args.B:         hp['B']          = args.B
     if args.lr:        hp['lr_max']     = args.lr
