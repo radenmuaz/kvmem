@@ -357,6 +357,9 @@ def train_mini(hp: dict, log_base: str = 'logs'):
 
             if mean_cer == 0.0:
                 _log(f'\n★ PERFECT RECALL at step {step}! All test sequences 100% correct.')
+                ckpt_path = os.path.join(ckpt_dir, f'mini_step{step}')
+                save_checkpoint(ckpt_path, model, step, hp)
+                _log(f'  [ckpt] {ckpt_path}')
                 break
 
         if step % (eval_every * 10) == 0:
