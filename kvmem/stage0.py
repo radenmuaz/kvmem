@@ -31,7 +31,7 @@ import numpy as np
 from tqdm import tqdm
 
 from kvmem.data import (
-    DATA_LO, ETX, NUL, STX,
+    DATA_LO, ETX, NUL, STX, SLOT_BASE, make_slot_ids,
     BatchPrefetcher,
     build_mask_cache,
     chain_entropy_bits,
@@ -532,15 +532,15 @@ RECALL_HPARAMS = dict(
     n_heads       = 4,
     d_ff          = 128,
     N             = 32,
-    B             = 64,
+    B             = 128,     # bigger batch — more varied distributions per step
     lr_max        = 3e-4,
     lr_min        = 1e-6,    # very low — maintain training pressure for grokking
     warmup_steps  = 500,
-    n_steps       = 100_000, # long — grokking needs extended training
+    n_steps       = 50_000,
     grad_clip     = 1.0,
-    wd            = 0.1,     # strong weight decay — key for grokking generalization
+    wd            = 0.3,     # stronger weight decay — key for grokking generalization
     seed          = 42,
-    optimizer     = 'grokadamw',
+    optimizer     = 'adamw',
     grok_rho      = 0.95,
     seg_len       = 64,
     warmup_bytes  = 4,
@@ -550,20 +550,75 @@ RECALL_HPARAMS = dict(
 )
 
 
+def _sample_varied_seg(rng: np.random.Generator, seg_len: int) -> np.ndarray:
+    """
+    Sample one segment from a randomly chosen closed-form distribution.
+    NO real text or domain data — purely mathematical distributions over
+    the byte range [DATA_LO=0x20 .. 0xFF] (236 symbols).
+
+    Distribution is chosen uniformly among:
+      0. Uniform over full range [DATA_LO..0xFF]           — 236 symbols
+      1. Dirichlet-skewed (alpha~Unif[0.05,1.0]) over 236  — peaked, random freq
+      2. Uniform over random contiguous sub-range [a..b]    — b-a in [4,64]
+      3. Geometric with random p in [0.02,0.3], offset DATA_LO, clipped
+      4. Two-cluster mixture: 80% from one sub-range, 20% another
+    """
+    V_full  = 256 - DATA_LO   # 236 possible byte values
+    choice  = int(rng.integers(0, 5))
+
+    if choice == 0:
+        # Uniform over [DATA_LO..0xFF]
+        seg = rng.integers(DATA_LO, 256, size=seg_len)
+    elif choice == 1:
+        # Dirichlet-skewed: random concentration parameter
+        alpha_dir = float(rng.uniform(0.05, 1.0))
+        p = rng.dirichlet(np.ones(V_full) * alpha_dir)
+        seg = rng.choice(V_full, size=seg_len, p=p) + DATA_LO
+    elif choice == 2:
+        # Uniform over random contiguous sub-range
+        width = int(rng.integers(4, min(65, V_full + 1)))
+        lo    = int(rng.integers(0, V_full - width + 1)) + DATA_LO
+        seg   = rng.integers(lo, lo + width, size=seg_len)
+    elif choice == 3:
+        # Geometric distribution, clipped to [DATA_LO..0xFF]
+        p_geom = float(rng.uniform(0.02, 0.3))
+        raw    = rng.geometric(p_geom, size=seg_len) - 1   # starts at 0
+        seg    = np.clip(raw, 0, V_full - 1) + DATA_LO
+    else:
+        # Two-cluster mixture: 80% from one width-8 to 32 range, 20% another
+        w1  = int(rng.integers(8, min(33, V_full + 1)))
+        lo1 = int(rng.integers(0, V_full - w1 + 1)) + DATA_LO
+        w2  = int(rng.integers(8, min(33, V_full + 1)))
+        lo2 = int(rng.integers(0, V_full - w2 + 1)) + DATA_LO
+        mask = rng.random(seg_len) < 0.8
+        seg  = np.where(mask,
+                        rng.integers(lo1, lo1 + w1, size=seg_len),
+                        rng.integers(lo2, lo2 + w2, size=seg_len))
+
+    return seg.astype(np.int32)
+
+
 def _make_synthetic_recall_batch(rng: np.random.Generator, B: int,
                                  seg_len: int, N: int) -> np.ndarray:
     """
-    Training batch: random bytes in [DATA_LO, 0xFF], Y = exact copy of x_S.
+    Training batch: random bytes from varied closed-form distributions,
+    Y = exact copy of x_S.  No real text or domain-specific data.
+
     Sequence: [x_S | STX | NUL*N | ETX | x_S]
     Shape: (B, seg_len + 2 + N + seg_len)
+
+    Distribution is randomly selected per example from 5 purely mathematical
+    options (uniform, Dirichlet-skewed, sub-range uniform, geometric, mixture).
+    This exposes the model to byte frequency structures that resemble real text
+    without using any real text, aiming to break the generalization plateau.
     """
     L   = seg_len + 2 + N + seg_len
     out = np.empty((B, L), dtype=np.int32)
     for i in range(B):
-        seg = rng.integers(DATA_LO, 256, size=seg_len).astype(np.int32)
+        seg = _sample_varied_seg(rng, seg_len)
         out[i, :seg_len]                = seg
         out[i, seg_len]                 = STX
-        out[i, seg_len+1 : seg_len+1+N] = NUL
+        out[i, seg_len+1 : seg_len+1+N] = make_slot_ids(N)
         out[i, seg_len+1+N]             = ETX
         out[i, seg_len+2+N:]            = seg   # Y = exact copy
     return out
@@ -653,7 +708,8 @@ def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs'):
     ETX_pos  = seg_len + 1 + N
 
     _log(f'\n=== Recall training (synthetic→real) | run_dir={run_dir} ===')
-    _log(f'  Training: SYNTHETIC random bytes  [DATA_LO={DATA_LO:#x}..0xFF]')
+    _log(f'  Training: SYNTHETIC varied distributions (uniform/Dirichlet/sub-range/geometric/mixture)')
+    _log(f'            byte range [DATA_LO={DATA_LO:#x}..0xFF], NO real text')
     _log(f'  Test files: {test_files}')
     _log(f'  Params: {pcount["total"]:,}')
     _log(f'  seg_len={seg_len}  N={N}  KV_floats={2*hp["n_layers"]*N*hp["d"]:,}')
@@ -715,6 +771,23 @@ def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs'):
 
         if step % val_every == 0:
             eval_rng = np.random.default_rng(step)
+            # Eval on synthetic random bytes first (same distribution as training)
+            n_syn = 64
+            syn_correct = syn_total = 0
+            for ei in range(n_syn):
+                x_S_syn = list(_sample_varied_seg(eval_rng, seg_len))
+                warmup_syn = x_S_syn[:warmup_bytes]
+                target_syn = x_S_syn[warmup_bytes:]
+                gen_syn = _decode(model, x_S_syn, N, warmup_syn,
+                                  max_len=seg_len - warmup_bytes,
+                                  temperature=0.0, seed=ei, stop_newline=False)
+                syn_correct += sum(a == b for a, b in zip(gen_syn[warmup_bytes:], target_syn))
+                syn_total   += len(target_syn)
+            syn_acc = 100.0 * syn_correct / max(syn_total, 1)
+            _log(f'  [val]  step={step:5d}  synthetic  recall={syn_acc:.1f}%  '
+                 f'(warmup={warmup_bytes}B  tgt={seg_len-warmup_bytes}B  n={n_syn})')
+            _jlog(dict(step=step, file='synthetic', recall_pct=syn_acc))
+            # Eval on real text files
             for fpath in test_files:
                 if not os.path.exists(fpath):
                     continue
@@ -1023,7 +1096,7 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False,
                 x_S_v  = list(vline)
                 L_S_v  = len(x_S_v)
                 L_y_v  = min(16, len(x_S_v))
-                mem_v  = [STX] + [NUL] * N_val + [ETX]
+                mem_v  = [STX] + make_slot_ids(N_val) + [ETX]
                 # y = first L_y_v bytes of vline (reconstruction as proxy)
                 y_v    = list(vline[:L_y_v])
                 seq    = x_S_v + mem_v + y_v
@@ -1297,7 +1370,7 @@ def _decode(model: KVMemModel, x_S: list[int], N: int, prompt: list[int],
     Returns full generated list (including prompt).
     """
     L_S       = len(x_S)
-    mem_block = [STX] + [NUL] * N + [ETX]
+    mem_block = [STX] + make_slot_ids(N) + [ETX]
     # Max sequence length for mask pre-allocation
     L_max     = L_S + 2 + N + max_len + len(prompt)
     mask_full = jnp.array(make_mask_stage0(L_S, N, max_len + len(prompt)))

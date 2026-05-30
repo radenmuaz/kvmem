@@ -17,7 +17,7 @@ You are building three components, each independently useful, that compose into 
 - Encoder: **causal-over-bytes SSM** with fixed-$K$ latent emission (eliminates chunk-boundary artifacts; see §1.3)
 - Interface: Option A-grounded (latent autoregression with re-encoded feedback)
 - Mixer: hybrid stack — bulk of layers = vMF sphere mixer, 1–2 softmax attention layers for recall, optional 1 Dirichlet head for global concept tracking
-- Decoder: non-causal byte-level, MaskGIT-trained, 1-shot inference (or $T{=}2$ refinement passes if reconstruction degrades)
+- Decoder: **streaming SSM body + $K$-parallel emission block** (symmetric with encoder), MaskGIT-trained, 1-shot inference (or $T{=}2$ refinement passes when scaling $K$ higher)
 - Optional refinement: geometric residual stream matched to chosen family (see §3.8)
 
 **BPB reporting:** if using FSQ/BSQ with reconstruction $\ge 99.9\%$, BPB ≈ LM code-cross-entropy alone (no decoder needed at eval time — see §1.7). For continuous bottlenecks, IWAE with 16 samples per token.
@@ -250,64 +250,110 @@ The encoder sees all bytes up to position $tK$ when emitting $z_t$, so chunk bou
 
 ### 1.4 Decoder
 
-Non-causal, parallel over $K$ positions, conditioned on $z_t$. Critical: an AR decoder over the bytes destroys the $K$-fold latency advantage. Use one-shot or MaskGIT/diffusion refinement only.
+**Design rationale.** The decoder mirrors the encoder. The encoder is a causal-over-bytes SSM that accumulates byte-level context and projects to one latent every $K$ bytes (compression). The decoder is its mirror: a causal-over-bytes SSM that accumulates byte-level context and, every $K$ bytes, expands one latent + the current state into the next $K$ bytes via a parallel "burst" emission block (expansion). Within a chunk the emission is still parallel (one-shot or MaskGIT), so the $K$-fold latency advantage is preserved; across chunks the SSM provides byte-level context that a pure NAT decoder lacks.
 
-#### 1.4.1 Architecture
+The current literature alternative — a non-causal NAT block conditioned only on $z_t$ — is the simpler "memoryless" decoder. It's a valid fallback when $z_t$ is near-sufficient (small $K$, large codebook), but symmetric-streaming is strictly better when reconstruction quality matters or $K$ is pushed higher.
+
+#### 1.4.1 Streaming SSM decoder (recommended default)
+
+```
+prior bytes b_<tK     ->  causal SSM body (Mamba-style, 2 layers, d=256)
+                            running state h_{tK}^dec
+                            |
+receive z_t           ->  condition step:
+                            c_t = combine(h_{tK}^dec, z_t)   # FiLM or concat-project
+                            |
+                          broadcast c_t to K position slots + K learned pos embeds
+                            |
+                          K-parallel emission block:
+                            2-layer non-autoregressive transformer, d=256, heads=4
+                            cross-conditioning on c_t each layer (FiLM)
+                            |
+                          K parallel heads, 256-way (or 257-way with MASK)
+                            |
+emit b_{tK+1..(t+1)K}  ->  feed back into SSM body for next chunk's context
+```
+
+Symmetric with the encoder: same SSM body, same $K$-block boundary structure, same FiLM-style conditioning. Two components per chunk — the SSM body (running byte-level state) and the $K$-parallel emission block (within-chunk parallel generation).
+
+**Why SSM body over causal Transformer:** identical reasoning to the encoder (§1.3) — $O(N)$ cost, unlimited byte-level context, fast streaming inference, no KV cache to manage. Encoder and decoder can share architecture code and even weights if desired (tied tokenizer).
+
+**Size:** SSM body ~2M params, emission block ~3M params, ~5M total. Joint-trained with encoder + LM.
+
+#### 1.4.2 Alternative: pure NAT decoder (simpler ablation)
+
+The original memoryless design — drop the SSM body entirely, condition only on $z_t$:
 
 ```
 input:   z_t in R^{d_z}
 expand:  z_t -> K slot embeddings (broadcast + K learned pos embeddings)
 body:    2-layer non-autoregressive transformer, d=256, heads=4
-         OR 3-layer dilated TCN (faster, fine for K<=16)
-condition: FiLM(z_t) modulation each layer:  h <- gamma(z) * h + beta(z)
+condition: FiLM(z_t) each layer
 output:  K parallel heads, 256-way softmax each
 ```
 
-Vocab is 257 (256 bytes + MASK) when training with masked diffusion / MaskGIT.
+Use this as the Phase 1 baseline (validates the bottleneck without confounding the decoder design) and when $K$ is small enough that $z_t$ is near-sufficient ($K \le 8$ with $d_q \cdot \log_2 L \ge 24$). Switch to the streaming SSM decoder in Phase 2 when scaling $K$ or seeking better reconstruction.
 
-#### 1.4.2 Training — three options
+#### 1.4.3 Training — three options (apply to both decoder variants)
 
-**(a) One-shot factorized.** Train $p_\theta(x \mid z) = \prod_i p_\theta(b_i \mid z)$ directly:
+**(a) One-shot factorized.** Train $p_\theta(x \mid z, h^{\text{dec}}) = \prod_i p_\theta(b_i \mid z, h^{\text{dec}})$ directly:
 $$
-\mathcal{L}^{\text{rec}}_t = -\sum_{i=1}^K \log p_\theta(b_i \mid z_t)
+\mathcal{L}^{\text{rec}}_t = -\sum_{i=1}^K \log p_\theta(b_i \mid z_t, h^{\text{dec}}_{tK})
 $$
-Simple, but assumes byte-independence given $z$. Works when $z$ is near-sufficient.
+For the streaming SSM decoder, $h^{\text{dec}}_{tK}$ is the SSM state right before chunk $t$; for the pure NAT decoder it's dropped. Simple, assumes byte-independence within a chunk given $(z_t, h^{\text{dec}}_{tK})$. Works when conditioning is near-sufficient.
 
 **(b) MaskGIT.** Sample mask rate from cosine schedule, mask independently, predict masked positions:
 ```
-rate = cos_schedule(uniform(0,1))   # cosine bias toward higher rates
+rate = cos_schedule(uniform(0,1))
 mask = bernoulli(rate, K)
-x_t = where(mask, MASK, x)
-loss = cross_entropy(decoder(x_t, z)[mask], x[mask])
+x_t_masked = where(mask, MASK, x_t)
+loss = cross_entropy(emission_block(x_t_masked, c_t)[mask], x_t[mask])
 ```
-Unweighted masked CE; heuristic but strong empirically.
+For the streaming SSM decoder, $c_t = $ combine$(h^{\text{dec}}_{tK}, z_t)$; for the pure NAT decoder, $c_t = z_t$. Unweighted masked CE; heuristic but strong empirically.
 
-**(c) Time-free masked diffusion (MDLM/MD4-style).** Absorbing-state discrete diffusion with no timestep input. ELBO-weighted masked CE:
+**(c) Time-free masked diffusion (MDLM/MD4-style).** Absorbing-state discrete diffusion, no timestep input. ELBO-weighted masked CE:
 $$
-\mathcal{L} = \mathbb{E}_{t \sim U(0,1)} \mathbb{E}_{x_t}\left[ \frac{-\sigma'(t)}{\sigma(t)} \sum_{i \in M_t} -\log p_\theta(b_i \mid x_t, z) \right]
+\mathcal{L} = \mathbb{E}_{t \sim U(0,1)} \mathbb{E}_{x_t}\!\left[ \frac{-\sigma'(t)}{\sigma(t)} \sum_{i \in M_t} -\log p_\theta(b_i \mid x_t, c_t) \right]
 $$
-For linear schedule $\sigma(t)=t$: weight is $1/t$. This gives a proper ELBO → exact BPB. Same architecture as MaskGIT, just different loss weighting.
+For linear schedule $\sigma(t)=t$: weight is $1/t$. Gives a proper ELBO → exact BPB. Same architecture as MaskGIT, different loss weighting.
 
 **Recommendation:** train with (c) for proper BPB. Sample with the MaskGIT confidence scheduler regardless.
 
-#### 1.4.3 Inference samplers
+**Training parallelism:** the SSM body is teacher-forced over the full ground-truth byte stream during training, so the entire decoder runs in one parallel pass per batch element (parallel scan for the SSM, parallel NAT blocks across all chunks). Same training cost as the pure NAT decoder + the SSM body forward.
+
+#### 1.4.4 Inference samplers
 
 ```
-# One-shot (T=1)
-logits = decoder(MASK^K, z)
-bytes = argmax(logits) or sample(logits, temp=0)   # near-deterministic if z is sufficient
+# Streaming SSM decoder, one-shot (T=1)
+state h = init                              # SSM state, persistent across chunks
+for each step t:
+    c_t = combine(h, z_t)
+    logits = emission_block(MASK^K, c_t)    # K parallel byte predictions
+    bytes = argmax(logits)                  # or sample with low temp
+    h = ssm_ingest(h, bytes)                # advance state for next chunk
 
-# MaskGIT confidence sampler (T = 2..8)
-x = [MASK]*K
-for s in 1..T:
-    logits = decoder(x, z)
-    pred   = sample_or_argmax(logits)
-    conf   = prob(pred) + gumbel_noise(scale=0.01)
-    n_keep = ceil(K * (1 - cos_schedule(s/T)))
-    commit top-n_keep highest-conf positions; remask the rest
+# Streaming SSM decoder, MaskGIT (T = 2..4)
+state h = init
+for each step t:
+    c_t = combine(h, z_t)
+    x = [MASK]*K
+    for s in 1..T:
+        logits = emission_block(x, c_t)
+        pred = sample_or_argmax(logits)
+        conf = prob(pred) + gumbel_noise(scale=0.01)
+        n_keep = ceil(K * (1 - cos_schedule(s/T)))
+        commit top-n_keep highest-conf positions; remask the rest
+    bytes = x   # fully decoded
+    h = ssm_ingest(h, bytes)
 ```
 
-Use $T{=}1$ when $z$ is near-sufficient (>99% reconstruction); $T{=}2{-}4$ when scaling $K$ higher.
+Use $T{=}1$ when conditioning is near-sufficient (>99% reconstruction with the streaming SSM); $T{=}2{-}4$ when scaling $K$ higher or chasing the last percentage points of reconstruction quality.
+
+**Inference cost per chunk:** one SSM forward over $K$ bytes (cheap, $O(K)$) plus $T$ emission-block passes (one for $T{=}1$, $T$ for MaskGIT). The SSM state ingestion is sequential within a chunk's $K$ bytes but parallel across chunks if you're batching latents. Net: still much faster than a byte-level AR decoder.
+
+#### 1.4.5 Exposure-bias note
+
+The streaming SSM decoder's body is teacher-forced at training (sees ground-truth past bytes) but sees sampled bytes at inference — a mild exposure-bias source. Mitigation comes for free from the existing design: the latent $z_t$ dominates the conditioning signal at each chunk boundary, so SSM-state errors are bounded by the latent's information content. Add noise augmentation on the byte stream during training (drop or perturb a small fraction of input bytes) if drift is observed empirically.
 
 ### 1.5 Training pipeline (joint, recommended)
 
@@ -764,6 +810,153 @@ One line of code per residual connection, gives stability benefits (bounded magn
 
 **Net guidance:** don't nest bottlenecks (A) or pay for full BNN-style moment propagation (B); do use the geometric-mixer stack from §3.7 (C) with consistent geometry across components (D), and consider the geometric residual stream as a small additional refinement when the stack is committed to one family.
 
+### 3.9 Test-time training (TTT) as distributional layers
+
+The geometric mixers from §3.2–3.4 admit a second derivation: as **TTT layers with exponential-family inner likelihoods**. A TTT layer maintains state $W_t$ = parameters of an inner model $f_W$ trained online via $W_t = W_{t-1} - \eta \nabla_W \mathcal{L}_t(W_{t-1}; k_t, v_t)$, with output $o_t = f_{W_t}(q_t)$. When $\mathcal{L}_t$ is the NLL of an exponential-family likelihood $p_W(v|k)$ and the update is the conjugate posterior step, this recurrence becomes the §3.1 conjugate-filtering template exactly.
+
+#### 3.9.1 The mapping
+
+| inner likelihood | exact conjugate update | SGD-TTT analog in literature | layer name |
+|---|---|---|---|
+| $v \sim \mathcal{N}(Wk, \sigma^2 I)$ | precision-information form | TTT-Linear (MSE), DeltaNet | Gaussian-TTT (= V1/V2) |
+| $v \sim \text{vMF}(\hat\mu_W(k), \kappa)$ | resultant-matrix update | vMF-NLL gradient | **vMF-TTT (novel)** |
+| $\hat c_j \sim \text{Cat}_L(W_j k)$ per dim | per-dim Dirichlet | softmax-CE gradient | **FSQ-TTT (novel)** |
+| $b_j \sim \text{Bern}(\sigma(w_j^\top k))$ per bit | per-bit Beta | logistic-regression gradient | **BSQ-TTT (novel)** |
+| $c \sim \text{Dir}(\alpha_W(k))$ | digamma-form update | Dirichlet NLL gradient | Dirichlet-TTT |
+
+#### 3.9.2 Gaussian-TTT — V1/V2 viewed through TTT
+
+Inner: $v = Wk + \epsilon$, $\epsilon \sim \mathcal{N}(0, \sigma^2 I)$. Exact Bayesian update in information form:
+$$
+\Lambda_t = \Lambda_{t-1} + \tfrac{1}{\sigma^2} k_t k_t^\top, \quad H_t = H_{t-1} + \tfrac{1}{\sigma^2} v_t k_t^\top
+$$
+Predictive at query $q$: $p(v_* | q, \text{data}) = \mathcal{N}\!\left(\Lambda_t^{-1} H_t^\top q,\; \sigma^2 + q^\top \Lambda_t^{-1} q\right)$.
+
+The SGD-TTT update $W_t = W_{t-1} - \eta(W_{t-1}k_t - v_t)k_t^\top$ is a one-step approximation; the exact Bayesian form maintains a proper posterior precision $\Lambda_t$ and yields **calibrated query-conditioned predictive variance** — a quantity TTT-Linear silently discards. This is the cleanest link from V1/V2 to the existing TTT literature.
+
+#### 3.9.3 vMF-TTT
+
+Inner: $v \sim \text{vMF}(\hat\mu_W(k), \kappa)$, $\hat\mu_W(k) = \text{normalize}(Wk)$. Rank-1 resultant-matrix update:
+$$
+R_t = \gamma_t R_{t-1} + w_t\, v_t k_t^\top \in \mathbb{R}^{d \times d}
+$$
+Predictive at query $q$:
+$$
+\hat\mu_t(q) = \frac{R_t q}{\sqrt{\|R_t q\|^2 + \epsilon}}, \qquad \bar R_t(q) = \frac{\|R_t q\|}{n_t(q) + \epsilon} \in [0,1]
+$$
+**Strict generalization of the §3.2 fixed-state vMF mixer:** the fixed-state version keeps a single direction; vMF-TTT keeps a *query-conditioned* direction predictor via the matrix $R$. State $O(d^2)$, reducible to diag+low-rank as in V1. No published TTT variant uses vMF likelihood — this is genuinely new territory and the most extractable single contribution from this section (see §3.9.7).
+
+#### 3.9.4 FSQ-TTT and BSQ-TTT
+
+**FSQ-TTT** — $d_q$ parallel online categorical classifiers, one per code dim:
+$$
+W_{j,t} = W_{j,t-1} - \eta\,(\text{softmax}(W_{j,t-1}k_t) - \text{onehot}(\hat z_{t,j}))\, k_t^\top
+$$
+State per dim $W_j \in \mathbb{R}^{L \times d}$, total $d_q L d$. Predictive $\rho_t(c|q) = \prod_j \text{softmax}(W_{j,t} q)$.
+
+**BSQ-TTT** — $d_q$ parallel online logistic regressions:
+$$
+w_{j,t} = w_{j,t-1} - \eta\,(\sigma(w_{j,t-1}^\top k_t) - b_{t,j})\, k_t
+$$
+State per bit $w_j \in \mathbb{R}^d$, total $d_q \cdot d$ (smallest distributional TTT). Predictive $\prod_j \text{Bernoulli}(\sigma(w_{j,t}^\top q))$.
+
+Both have proper per-component Beta/Dirichlet posteriors when expressed in conjugate form.
+
+#### 3.9.5 What TTT adds beyond conjugate filtering
+
+- **Multi-step inner loops.** Multiple SGD steps per token (TTT-MLP-style). For nonlinear inner models this matters; for linear it's a damping choice on the conjugate update.
+- **Nonlinear inner models with distributional heads.** $f_W$ can be a small MLP with a vMF / FSQ / BSQ output head. The update is SGD on the distributional NLL; no closed posterior, but the readout retains its probabilistic structure. **Distributional-TTT-MLP** is the natural composition for nonlinear capacity with calibrated outputs.
+- **Self-supervised inner objectives.** Reconstruction, contrastive, or masked losses on the inner model — particularly useful with continuous-tokenizer latents as input.
+
+#### 3.9.6 Architecture impact — a new design axis
+
+The hybrid stack from §3.7 generalizes: each layer chooses among
+
+| layer type | state | query-conditioned? | inner model |
+|---|---|---|---|
+| Fixed-state mixer (§3.2–3.4) | $O(d)$–$O(C)$ | no | implicit (one direction/concept) |
+| Factor attention (§3.6) | $O(Td)$ growing | yes | content-addressed via $\alpha_{ts}$ |
+| TTT-Linear inner (§3.9.2–.4) | $O(d^2)$ or smaller | yes | online distributional regression |
+| TTT-MLP inner (§3.9.5) | inner params | yes | nonlinear, multi-step |
+
+All four variants can share the same geometric output family for stack consistency.
+
+#### 3.9.7 Standalone-paper observation
+
+The cleanest novel layer is **vMF-TTT**: same rank-1 update cost as TTT-Linear but sphere-projected output and a calibrated confidence signal $\bar R_t(q)$ that TTT-Linear discards. The pitch is parallel to vMF-factor attention vs softmax attention: a free probabilistic upgrade at negligible cost. *Resultant TTT: vMF Online Regression as a Recurrent Layer* would be the natural paper title.
+
+### 3.10 Bayesian uncertainty signals — what falls out for free
+
+Because the Bayesian-TTT layers maintain proper conjugate posteriors (Gaussian-TTT, FSQ-TTT, BSQ-TTT, Dirichlet-TTT) or close approximations (vMF-TTT), several Bayesian-ML capabilities become accessible from the architecture itself, with no additional ensembles, MC dropout, or Monte Carlo machinery.
+
+#### 3.10.1 What every Bayesian-TTT layer exposes
+
+For each layer, an in-line per-query uncertainty signal:
+
+| layer | uncertainty signal | proper posterior? |
+|---|---|---|
+| Gaussian-TTT (info form) | $\sigma^2 + q^\top \Lambda_t^{-1} q$ predictive variance | **exact** |
+| Gaussian-factor attention | $\text{tr}(\Lambda_t^{-1})$ or per-query Mahalanobis | **exact** (attention-weighted) |
+| vMF-TTT / vMF-factor | $\bar R_t(q) \in [0,1]$ | quasi-Bayesian (resultant ≈ posterior mean) |
+| vMF fixed-state | $\bar R_t$ (no query dep.) | quasi-Bayesian, global |
+| Dirichlet mixer / factor | $n_t = \mathbf{1}^\top \alpha_t$ effective evidence | **exact** Dirichlet posterior |
+| FSQ-TTT | predictive entropy $H(\rho_t(\cdot|q))$ | per-dim Dirichlet exact |
+| BSQ-TTT | per-bit Beta variance $\bar p(1-\bar p)/(a+b+1)$ | per-bit Beta exact |
+| Softmax attention | — (point estimate over values) | no |
+
+These quantities are computable from the layer state alone, no extra forward passes, no held-out data. They behave as in-line OOD scores: when a layer hasn't accumulated enough relevant evidence for its current query, its signal rises.
+
+#### 3.10.2 Bayesian capabilities you actually get
+
+**At training time:**
+- **Adaptive online learning rates** in TTT layers — scale $\eta_t$ by current predictive uncertainty. Update aggressively when uncertain, freeze when confident. Self-calibrating online learning, no scheduler tuning.
+- **Active / curriculum sampling** — upweight training examples where predictive uncertainty is highest. Frontier identification, label-free.
+- **Per-layer convergence monitoring** — track each layer's predictive entropy over training; layers that flatten first are saturating, those staying high are still useful.
+
+**At inference time:**
+- **Selective prediction.** Threshold the LM head's predictive entropy; abstain or back off to a retrieval/coarser prediction above threshold. Threshold can be set on training-time statistics — *no held-out set needed to define it*.
+- **Per-token OOD score.** Aggregate per-layer signals (e.g., max or geometric mean) as a per-token OOD score. Useful for filtering generations or flagging unreliable outputs.
+- **Confidence-aware decoding.** Use predictive variance to modulate sampling temperature (lower when confident, higher when uncertain) — model's uncertainty becomes the model's diversity knob.
+- **Calibrated next-token distributions.** Bayesian-TTT heads include posterior uncertainty in their predictive, giving sharper calibration than vanilla softmax (which collapses all uncertainty into the data term).
+
+**For development:**
+- **Continual / online learning without held-out probes.** New training data updates posteriors; no catastrophic forgetting in the well-specified case. Self-monitoring via predictive entropy on past examples (a "Bayesian regret" signal).
+- **Per-layer marginal likelihood** for architecture decisions: which mixer best explains the data in this layer position. Per-component Bayesian model selection, clean.
+
+#### 3.10.3 The "no val/test set" question — partial yes
+
+The classical Bayesian-ML promise: marginal likelihood and predictive entropy enable model selection and OOD detection *without held-out data*. This framework partially delivers:
+
+**Genuinely yes:**
+- Per-layer per-query uncertainty signals usable as OOD scores at inference.
+- Training-time adaptivity (learning rate, sampling) without val-set scheduling.
+- Inference-time confidence thresholding (selective prediction, abstain).
+
+**Not quite:**
+- **A clean end-to-end OOD score for the LM's next-token prediction.** Composition through non-Bayesian outer layers (softmax attention, layer norm, MLPs) breaks the posterior story. Per-layer signals are useful proxies, not a rigorous global marginal predictive.
+- **Eliminating held-out data entirely.** Bayesian uncertainty is calibrated *under correct prior and likelihood*; deep-net priors are arbitrary defaults. Spot-checking calibration on held-out data is still recommended — you can defensibly *shrink* the val set, not eliminate it.
+- **Full-model marginal likelihood for hyperparameter selection.** Intractable for the LM as a whole; clean only per Bayesian component.
+
+#### 3.10.4 Honest caveats — when the Bayesian story breaks
+
+- **Priors matter.** Gaussian-TTT's predictive variance is exact only under the assumed prior $W \sim \mathcal{N}(0, \Lambda_0^{-1})$ and noise level $\sigma^2$. Defaults ($\Lambda_0 = I$, $\sigma^2 = 1$) are wrong for most data. If ECE on held-out data is bad, the OOD signal is also unreliable.
+- **OOD ≠ high predictive uncertainty in general.** A model can be confidently wrong on OOD data (prior puts no weight on a relevant region of input space → posterior misleadingly tight). Predictive variance is necessary, not sufficient, for OOD — the classic Bayesian-NN failure mode.
+- **Composition is non-Bayesian.** Outer LM stack uses point-estimated weights. Whole-model predictive isn't a true posterior even when individual layers are. Per-layer signals are local.
+- **Deep Bayesian NNs have a poor practical track record.** Last-layer Laplace, deep ensembles, and evidential deep learning are the workhorses for OOD detection. Conjugate-TTT layers are more principled (exact local Bayesian updates) but the whole-model story isn't fundamentally different from those baselines.
+
+#### 3.10.5 What to actually report in a paper
+
+Defensible Bayesian claims to make:
+1. **Per-token confidence signals as a free byproduct of the architecture** — no extra ensembles or MC machinery. Selective prediction, active sampling, online adaptation.
+2. **Calibration on held-out data competitive with or better than deep ensembles** — at the inference cost of one forward pass instead of many.
+3. **OOD detection AUROC** against held-out OOD — competitive with last-layer Laplace at lower compute.
+
+What *not* to claim:
+- "No held-out data needed." The theoretical Bayesian story doesn't survive contact with deep nets; held-out calibration is recommended.
+- "Calibrated uncertainty everywhere." Only the Bayesian-TTT layers; the outer stack still needs verification.
+
+The honest pitch: **the architecture provides uncertainty signals as a byproduct of the geometric framework, free of ensemble cost, useful for selective prediction and adaptive training, with held-out calibration checks recommended for publication numbers.**
+
 ---
 
 ## 4. Convergence analysis
@@ -805,10 +998,19 @@ Steps to a target loss, relative to softmax + cross-entropy baseline:
 | Cont-Bern-factor | 1.0–1.1× | smooth writes, Beta readout |
 | Dirichlet-factor attention | 1.0–1.2× | concept softmax curvature |
 | Gaussian-factor (V2) | 1.2–1.5× | Woodbury readout per query |
+| **TTT layers (distributional)** | | |
+| Gaussian-TTT (info-form Bayesian) | 1.1–1.3× | rank-1 precision update + matrix inv |
+| TTT-Linear (SGD-MSE, ≈DeltaNet) | 1.1–1.3× | rank-1 SGD step |
+| vMF-TTT | 1.2–1.4× | rank-1 resultant matrix + normalize |
+| FSQ-TTT (per-dim categorical) | 1.1–1.3× | $d_q$ parallel online classifiers |
+| BSQ-TTT (per-bit logistic) | 1.0–1.2× | $d_q$ parallel logistic regressions; cheapest TTT |
+| Distributional-TTT-MLP | 1.3–1.6× | multi-step nonlinear inner, distributional head |
 | **Decoders** | | |
-| One-shot factorized | 1.0× | trivial |
-| MaskGIT-trained | 1.1–1.2× | extra mask sampling |
-| Time-free diffusion | 1.2–1.3× | $1/t$ weighting noise |
+| One-shot factorized (pure NAT) | 1.0× | trivial; no byte-context |
+| MaskGIT-trained (pure NAT) | 1.1–1.2× | extra mask sampling |
+| Time-free diffusion (pure NAT) | 1.2–1.3× | $1/t$ weighting noise |
+| Streaming SSM + one-shot emission | 1.0–1.2× | SSM body + parallel emit; byte-context |
+| Streaming SSM + MaskGIT emission | 1.2–1.4× | best quality; $T$-pass refinement per chunk |
 
 ### 4.3 Caveats
 
@@ -894,14 +1096,17 @@ encoder:
   params: ~3M
 
 decoder:
-  type: nat        # non-autoregressive transformer
-  layers: 2
-  d_model: 256
-  heads: 4
-  vocab: 257       # 256 + MASK
-  conditioning: film
+  type: streaming_ssm     # SSM body + K-parallel emission block (symmetric with encoder)
+  ssm_layers: 2
+  ssm_d_model: 256
+  emission_layers: 2
+  emission_d_model: 256
+  emission_heads: 4
+  conditioning: film_combine    # combine(h_dec, z_t) -> FiLM in emission block
+  vocab: 257                    # 256 bytes + MASK
   training: maskgit_diffusion
-  inference_T: 1   # one-shot at inference
+  inference_T: 1                # one-shot per chunk; raise to 2-4 for higher K
+  # Fallback option: type: nat (pure NAT decoder without SSM body)
 
 # LM
 lm:
@@ -1183,6 +1388,10 @@ Q: Interpretable internals?                              -> add Dirichlet head p
 Q: Push K high (16+)?                                    -> MaskGIT decoder with T=2-3 refinement, not one-shot
 Q: Minimal upgrade to standard softmax attention?        -> vMF-factor attention (same compute, free confidence signal)
 Q: Cache memory dominates inference cost?                -> BSQ-factor attention (1-bit per-position writes)
+Q: Query-conditioned distributional prediction at fixed state cost? -> TTT-Linear layer (Gaussian-TTT or vMF-TTT)
+Q: Calibrated predictive variance from the architecture? -> Gaussian-TTT (info form) in at least one layer
+Q: Free per-token confidence / OOD score?                -> any Bayesian-TTT layer; aggregate per-layer signals
+Q: Online/continual learning without catastrophic forgetting? -> stack of Bayesian-TTT layers with conjugate updates
 ```
 
 ## Appendix B — what NOT to build first

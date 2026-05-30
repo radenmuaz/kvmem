@@ -5,13 +5,14 @@ Vocab: V=256 bytes. Data bytes constrained to [0x20, 0xFF] so they never
 collide with protocol bytes 0x00-0x1F (STX, ETX, NUL, etc.).
 
 Sequence layout (stage 0):
-    [ x_S (L_S) | STX | NUL*N | ETX | y (L_y) ]
+    [ x_S (L_S) | STX | SLOT_ID*N | ETX | y (L_y) ]
     S = [0, L_S)
     M = [L_S+1, L_S+1+N)    <- inner KV slots
     Y = [L_S+2+N, L_S+2+N+L_y)
 
-Memory tokens are always NUL (0x00). Token *identity* in M does not matter —
-the model reads region M by position (timestep), not by token value.
+Memory tokens are SLOT_BASE+i for slot i (bytes 0x04..0x04+N-1).
+Each slot has a unique token → unique embedding from init → no slot collapse.
+The model can differentiate slot 5 from slot 15 by token identity.
 """
 
 import os
@@ -25,12 +26,23 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Protocol bytes (never appear in data)
 # ---------------------------------------------------------------------------
-STX = 0x02   # open memory segment
-ETX = 0x03   # close memory segment
-NUL = 0x00   # inner memory slot filler
+STX = 0x02        # open memory segment
+ETX = 0x03        # close memory segment
+NUL = 0x00        # (kept for compatibility; no longer used in memory slots)
+SLOT_BASE = 0x04  # slot IDs: slot i uses byte 0x04+i (supports up to N=28 slots before 0x20)
+                  # For N>28, slot IDs wrap around — still unique per position mod 28.
+                  # In practice N<=32, so use 0x04..0x23 (some overlap with DATA_LO=0x20).
+                  # Use SLOT_BASE + (i % 28) to stay below DATA_LO.
 
 # Data bytes are in [DATA_LO, 256)
 DATA_LO = 0x20
+
+
+def make_slot_ids(N: int) -> list[int]:
+    """Return list of N unique slot ID tokens in range [0x04, 0x20).
+    For N>28, IDs wrap modulo 28 (still differentiable by position mod 28).
+    """
+    return [(SLOT_BASE + (i % (DATA_LO - SLOT_BASE))) for i in range(N)]
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +134,7 @@ def _make_example(key: jax.Array, V_chain: int, L_S: int, L_y: int,
     x_S = _remap(x_S_raw, V_chain)
     y   = _remap(y_raw,   V_chain)
 
-    mem = jnp.full((N,), NUL, dtype=jnp.int32)
+    mem = jnp.array(make_slot_ids(N), dtype=jnp.int32)
     stx = jnp.array([STX], dtype=jnp.int32)
     etx = jnp.array([ETX], dtype=jnp.int32)
 
@@ -149,7 +161,7 @@ def _make_example_cross(key: jax.Array, V_chain: int, L_S: int, L_y: int,
     x_S = _remap(x_S_raw, V_chain)
     y   = _remap(y_raw,   V_chain)
 
-    mem = jnp.full((N,), NUL, dtype=jnp.int32)
+    mem = jnp.array(make_slot_ids(N), dtype=jnp.int32)
     stx = jnp.array([STX], dtype=jnp.int32)
     etx = jnp.array([ETX], dtype=jnp.int32)
 
@@ -172,7 +184,7 @@ def _make_example_uniform(key: jax.Array, V_chain: int, L_S: int, L_y: int,
     y_raw = walk_chain(k3, T_y, start_y, L_y)
     y = _remap(y_raw, V_chain)
 
-    mem = jnp.full((N,), NUL, dtype=jnp.int32)
+    mem = jnp.array(make_slot_ids(N), dtype=jnp.int32)
     stx = jnp.array([STX], dtype=jnp.int32)
     etx = jnp.array([ETX], dtype=jnp.int32)
 
@@ -238,7 +250,7 @@ def make_batch_stage1(key: jax.Array, B: int, T: int, L_S: int, L_y: int,
         terminal = x_S_raw[-1]
         x_S = _remap(x_S_raw, V_chain)
 
-        mem = jnp.full((N,), NUL, dtype=jnp.int32)
+        mem = jnp.array(make_slot_ids(N), dtype=jnp.int32)
         stx = jnp.array([STX], dtype=jnp.int32)
         etx = jnp.array([ETX], dtype=jnp.int32)
 
@@ -414,7 +426,7 @@ def np_make_one(rng: np.random.Generator, V_chain: int, L_S: int,
     seq = np.empty(L_S + 2 + N + L_y, dtype=np.int32)
     seq[:L_S]                    = x_S
     seq[L_S]                     = STX
-    seq[L_S+1 : L_S+1+N]        = NUL
+    seq[L_S+1 : L_S+1+N]        = make_slot_ids(N)
     seq[L_S+1+N]                 = ETX
     seq[L_S+2+N:]                = y
     return seq
@@ -434,7 +446,7 @@ def np_make_one_cross(rng: np.random.Generator, V_chain: int, L_S: int,
     seq = np.empty(L_S + 2 + N + L_y, dtype=np.int32)
     seq[:L_S]             = (x_S_raw + DATA_LO).astype(np.int32)
     seq[L_S]              = STX
-    seq[L_S+1:L_S+1+N]   = NUL
+    seq[L_S+1:L_S+1+N]   = make_slot_ids(N)
     seq[L_S+1+N]          = ETX
     seq[L_S+2+N:]         = (y_raw + DATA_LO).astype(np.int32)
     return seq
@@ -451,7 +463,7 @@ def np_make_one_uniform(rng: np.random.Generator, V_chain: int, L_S: int,
     seq = np.empty(L_S + 2 + N + L_y, dtype=np.int32)
     seq[:L_S]           = x_S
     seq[L_S]            = STX
-    seq[L_S+1:L_S+1+N] = NUL
+    seq[L_S+1:L_S+1+N] = make_slot_ids(N)
     seq[L_S+1+N]        = ETX
     seq[L_S+2+N:]       = (y_raw + DATA_LO).astype(np.int32)
     return seq
@@ -496,7 +508,7 @@ def np_make_batch(rng: np.random.Generator, B: int, V_chain: int,
             seq = np.empty(L, dtype=np.int32)
             seq[:L_S]             = (x_S_raw + DATA_LO).astype(np.int32)
             seq[L_S]              = STX
-            seq[L_S+1:L_S+1+N]   = NUL
+            seq[L_S+1:L_S+1+N]   = make_slot_ids(N)
             seq[L_S+1+N]         = ETX
             seq[L_S+2+N:]        = (y_raw + DATA_LO).astype(np.int32)
             out[i] = seq
@@ -520,7 +532,7 @@ def np_make_recall_batch(rng: np.random.Generator, B: int,
         x_S = rng.integers(DATA_LO, 256, size=L_S).astype(np.int32)
         out[i, :L_S]             = x_S
         out[i, L_S]              = STX
-        out[i, L_S+1 : L_S+1+N] = NUL
+        out[i, L_S+1 : L_S+1+N] = make_slot_ids(N)
         out[i, L_S+1+N]         = ETX
         out[i, L_S+2+N:]        = x_S   # Y = exact copy of x_S
     return out
