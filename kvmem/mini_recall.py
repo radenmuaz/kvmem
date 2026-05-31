@@ -317,6 +317,7 @@ def train_mini(hp: dict, log_base: str = 'logs', device: str = 'cpu'):
         frac = min((step - w) / max(n_steps - w, 1), 1.0)
         return 1e-6 + 0.5 * (lr_max - 1e-6) * (1 + math.cos(math.pi * frac))
 
+    log_every = hp.get('log_every', 500)   # cheap loss-only log, no AR eval
     pbar = tqdm(range(1, n_steps + 1), desc='mini_recall', dynamic_ncols=True)
 
     for step in pbar:
@@ -326,6 +327,12 @@ def train_mini(hp: dict, log_base: str = 'logs', device: str = 'cpu'):
         model, opt_state, loss = _step(model, opt_state, tokens_b, step, lr)
         loss_f = float(loss)
         pbar.set_postfix(loss=f'{loss_f:.4f}', lr=f'{lr:.1e}', refresh=False)
+
+        # Cheap loss log (no AR eval) — always write to file for progress visibility
+        if step % log_every == 0:
+            elapsed = time.time() - t0
+            _log(f'  step={step}/{n_steps}  loss={loss_f:.4f}  lr={lr:.2e}  {elapsed:.0f}s')
+            _jlog(dict(step=step, loss=loss_f, lr=lr, elapsed=elapsed))
 
         if step % eval_every == 0 or step == 1:
             elapsed = time.time() - t0
@@ -343,8 +350,9 @@ def train_mini(hp: dict, log_base: str = 'logs', device: str = 'cpu'):
                 all_cer.append(c)
                 match_pct = 100 * (1 - c)
                 exact = '✓' if c == 0.0 else '✗'
-                _log(f'  {exact} {name:15s}  match={match_pct:5.1f}%  CER={c:.3f}  '
-                     f'gen={bytes(gen_tail).hex()}  ref={bytes(target).hex()}')
+                _log(f'  {exact} {name:15s}  match={match_pct:5.1f}%  CER={c:.3f}')
+                _log(f'    gen={bytes(gen_tail).hex()}')
+                _log(f'    ref={bytes(target).hex()}')
                 _jlog(dict(step=step, seq=name, cer=c, match_pct=match_pct,
                            gen=gen_tail, ref=target))
 
@@ -389,12 +397,13 @@ MINI_HPARAMS = dict(
     grad_clip  = 1.0,
     warmup_steps = 200,
     n_steps    = 30_000,
-    eval_every = 2_000,
+    eval_every = 1_000,
     warmup_n   = 1,    # AR eval: 1 byte warmup
     seed       = 42,
     rope       = False,
     yarn       = False,
     slot_style = 'seq',   # 'zeros' or 'seq'
+    log_every  = 500,     # cheap loss log every N steps (no AR eval)
 )
 
 
@@ -404,6 +413,8 @@ def main():
     parser.add_argument('--N',          type=int,   default=None)
     parser.add_argument('--steps',      type=int,   default=None)
     parser.add_argument('--eval-every', type=int,   default=None)
+    parser.add_argument('--log-every',  type=int,   default=None,
+                        help='Steps between cheap loss-only log writes (default 500)')
     parser.add_argument('--d',          type=int,   default=None)
     parser.add_argument('--n-layers',   type=int,   default=None)
     parser.add_argument('--B',          type=int,   default=None)
@@ -429,6 +440,7 @@ def main():
     if args.N:          hp['N']          = args.N
     if args.steps:      hp['n_steps']    = args.steps
     if args.eval_every: hp['eval_every'] = args.eval_every
+    if args.log_every:  hp['log_every']  = args.log_every
     if args.d:
         hp['d']     = args.d
         hp['d_ff']  = args.d * 2
