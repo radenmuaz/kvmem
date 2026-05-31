@@ -61,43 +61,45 @@ from kvmem.stage0 import (
 def make_test_sequences(seg_len: int) -> dict[str, list[int]]:
     """
     Generate deterministic test sequences of length seg_len.
-    All bytes in [DATA_LO=0x20, 0xFF].
+    All bytes strictly in [DATA_LO=0x20, 0xFF] — wraps within this range,
+    never into protocol byte territory [0x00, 0x1F].
     """
+    V  = 256 - DATA_LO   # 236 usable values
     seqs = {}
 
-    # Up counter: DATA_LO, DATA_LO+1, DATA_LO+2, ...
-    seqs['up_counter']   = [(DATA_LO + i) % 256 for i in range(seg_len)]
+    # Up counter: wraps within [DATA_LO, 0xFF]
+    seqs['up_counter']   = [DATA_LO + (i % V) for i in range(seg_len)]
 
-    # Down counter: DATA_LO+seg_len-1, ..., DATA_LO
-    seqs['down_counter'] = [(DATA_LO + seg_len - 1 - i) % 256 for i in range(seg_len)]
+    # Down counter: wraps within [DATA_LO, 0xFF]
+    seqs['down_counter'] = [DATA_LO + (V - 1 - i % V) for i in range(seg_len)]
 
-    # Odd bytes starting from DATA_LO+1
-    base_odd = DATA_LO + (1 if DATA_LO % 2 == 0 else 0)
-    seqs['odd']          = [(base_odd + 2*i) % 256 for i in range(seg_len)]
+    # Odd: step=2, wraps within V
+    base_odd = 1 if V % 2 == 0 else 0   # start at offset 1 for odd
+    seqs['odd']          = [DATA_LO + (base_odd + 2*i) % V for i in range(seg_len)]
 
-    # Even bytes starting from DATA_LO
-    base_even = DATA_LO + (0 if DATA_LO % 2 == 0 else 1)
-    seqs['even']         = [(base_even + 2*i) % 256 for i in range(seg_len)]
+    # Even: step=2, wraps within V
+    seqs['even']         = [DATA_LO + (2*i) % V for i in range(seg_len)]
 
-    # Linear step=4
-    seqs['linear']       = [(DATA_LO + 4*i) % 256 for i in range(seg_len)]
+    # Linear step=4, wraps within V
+    seqs['linear']       = [DATA_LO + (4*i) % V for i in range(seg_len)]
 
-    # Sawtooth: repeating pattern of length 4
-    period = max(4, seg_len // 2)
-    seqs['sawtooth']     = [(DATA_LO + (i % period) * (256 // period)) % 256
-                            for i in range(seg_len)]
+    # Sawtooth: period = min(seg_len//2, V//4) to keep steps in range
+    period = max(4, min(seg_len // 2, V // 4))
+    step   = V // period
+    seqs['sawtooth']     = [DATA_LO + (i % period) * step for i in range(seg_len)]
 
-    # Palindrome: first half counts up, second half mirrors
+    # Palindrome: first half counts up by 2 (mod V), second half mirrors
     half = seg_len // 2
-    first_half = [(DATA_LO + i * 2) % 256 for i in range(half)]
+    first_half  = [DATA_LO + (2*i) % V for i in range(half)]
     second_half = list(reversed(first_half))
-    seqs['palindrome']   = (first_half + second_half)[:seg_len]
+    extra = [DATA_LO + (2*half) % V] if seg_len % 2 == 1 else []
+    seqs['palindrome']   = first_half + extra + second_half
 
-    # Geometric: multiply by ~1.1 per step, stay in range
+    # Geometric: multiply by ~1.1, wrap within [DATA_LO, 0xFF] on overflow
     geo = [DATA_LO]
     for _ in range(seg_len - 1):
         nxt = int(geo[-1] * 1.1)
-        if nxt >= 256:
+        if nxt > 255:
             nxt = DATA_LO
         geo.append(nxt)
     seqs['geometric']    = geo
