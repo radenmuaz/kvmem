@@ -93,6 +93,83 @@ def test_extrapolation(model, train_seg_len: int, N: int,
 # Real-text (surah) test
 # ---------------------------------------------------------------------------
 
+def test_surah_full(model, seg_len: int, N: int, chunk_len: int, text_path: str):
+    """
+    Full-source recall: encode the entire file (up to seg_len bytes) into N KV slots,
+    then AR-decode in chunk_len segments using warmup chaining.
+
+    Protocol bytes (< DATA_LO=0x20) are replaced with 0x20 (space).
+    """
+    import math
+    with open(text_path, 'rb') as f:
+        raw = bytearray(f.read())
+
+    # Replace protocol bytes with space
+    n_replaced = 0
+    for i, b in enumerate(raw):
+        if b < DATA_LO:
+            raw[i] = DATA_LO
+            n_replaced += 1
+
+    raw = list(raw[:seg_len])  # truncate to seg_len
+    if len(raw) < seg_len:
+        raw += [DATA_LO] * (seg_len - len(raw))  # pad with space
+
+    print(f"\n=== Full-source Surah Recall ({text_path}) ===")
+    print(f"  seg_len={seg_len}  N={N}  chunk_len={chunk_len}  "
+          f"n_chunks={math.ceil(seg_len/chunk_len)}")
+    print(f"  Protocol bytes replaced: {n_replaced}  (→ 0x20/space)")
+
+    x_S      = raw
+    slot_ids = make_slot_ids(N)
+    mem_blk  = [STX] + slot_ids + [ETX]
+    n_chunks = math.ceil(seg_len / chunk_len)
+
+    L_full   = seg_len + 2 + N + chunk_len + 1  # +1 for warmup
+    mask_jnp = jnp.array(make_mask_stage0(seg_len, N, chunk_len + 1))
+
+    recalled = []
+    warmup   = x_S[0]
+    total_cer = 0.0
+
+    for chunk_idx in range(n_chunks):
+        y_start = chunk_idx * chunk_len
+        y_end   = min(y_start + chunk_len, seg_len)
+        n_gen   = y_end - y_start
+        target  = x_S[y_start:y_end]
+
+        generated = [warmup]
+        for _ in range(n_gen):
+            cur    = x_S + mem_blk + generated
+            pad_n  = L_full - len(cur)
+            padded = jnp.array(cur + [0] * pad_n, dtype=jnp.int32)
+            logits = model(padded, mask_jnp)
+            nb     = int(jnp.argmax(logits[len(cur) - 1]))
+            generated.append(nb)
+
+        chunk_out = generated[1:]   # skip warmup
+        recalled.extend(chunk_out)
+        warmup = generated[-1]
+
+        c     = cer(chunk_out, target)
+        match = 100 * (1 - c)
+        ok    = '✓' if c == 0.0 else '✗'
+        ref_str = bytes(target).decode('utf-8', errors='replace')
+        gen_str = bytes(chunk_out).decode('utf-8', errors='replace')
+        print(f"  {ok} chunk {chunk_idx}  [{y_start}:{y_end}]  "
+              f"match={match:5.1f}%  CER={c:.3f}")
+        print(f"       ref: {ref_str!r}")
+        print(f"       gen: {gen_str!r}")
+        total_cer += c
+
+    mean_cer   = total_cer / n_chunks
+    mean_match = 100 * (1 - mean_cer)
+    full_cer   = cer(recalled, x_S)
+    print(f"\n  → mean chunk CER={mean_cer:.3f}  match={mean_match:.1f}%")
+    print(f"  → full sequence CER={full_cer:.3f}  match={100*(1-full_cer):.1f}%")
+    return full_cer
+
+
 def test_surah(model, seg_len: int, N: int, text_path: str):
     """
     Load a text file as raw bytes, split into seg_len chunks,
@@ -168,35 +245,46 @@ def test_surah(model, seg_len: int, N: int, text_path: str):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt',     required=True, help='Path to equinox checkpoint')
-    p.add_argument('--seg-len',  type=int, required=True)
-    p.add_argument('--N',        type=int, required=True)
-    p.add_argument('--d',        type=int, default=64)
-    p.add_argument('--n-layers', type=int, default=4)
-    p.add_argument('--d-ff',     type=int, default=None, help='FFN dim (default: d*2)')
-    p.add_argument('--test',     choices=['extrap', 'surah', 'both'], default='both')
-    p.add_argument('--text',     default='datasets/suratalfatihah.txt')
-    p.add_argument('--extrap-lengths', type=int, nargs='+', default=None,
-                   help='Test lengths for extrapolation (default: 2x, 4x, 8x train)')
+    p.add_argument('--ckpt',      required=True, help='Path to equinox checkpoint')
+    p.add_argument('--seg-len',   type=int, required=True)
+    p.add_argument('--N',         type=int, required=True)
+    p.add_argument('--d',         type=int, default=64)
+    p.add_argument('--n-layers',  type=int, default=4)
+    p.add_argument('--d-ff',      type=int, default=None)
+    p.add_argument('--rope',      action='store_true')
+    p.add_argument('--yarn',      action='store_true')
+    p.add_argument('--test',      choices=['extrap', 'surah', 'surah-full', 'all'],
+                   default='surah-full')
+    p.add_argument('--text',      default='datasets/suratalfatihah.txt')
+    p.add_argument('--chunk',     type=int, default=128,
+                   help='Decode chunk size for surah-full (default: 128)')
+    p.add_argument('--extrap-lengths', type=int, nargs='+', default=None)
     args = p.parse_args()
 
     d_ff = args.d_ff if args.d_ff is not None else args.d * 2
     hp = dict(V=256, d=args.d, n_layers=args.n_layers, n_heads=4,
-              d_ff=d_ff, seg_len=args.seg_len, N=args.N)
+              d_ff=d_ff, seg_len=args.seg_len, N=args.N,
+              rope=args.rope, yarn=args.yarn,
+              L_train=args.seg_len + 2 + args.N + args.seg_len)
 
     print(f"Loading checkpoint: {args.ckpt}")
     model = load_checkpoint(args.ckpt, hp)
     pcount = count_params(model)
-    print(f"Model: d={args.d}  n_layers={args.n_layers}  params={pcount['total']:,}")
+    print(f"Model: d={args.d}  n_layers={args.n_layers}  params={pcount['total']:,}"
+          f"  rope={args.rope}  yarn={args.yarn}")
 
-    if args.test in ('extrap', 'both'):
+    if args.test in ('extrap', 'all'):
         test_extrapolation(model, args.seg_len, args.N, args.extrap_lengths)
 
-    if args.test in ('surah', 'both'):
+    if args.test in ('surah', 'all'):
+        if os.path.exists(args.text):
+            test_surah(model, args.seg_len, args.N, args.text)
+
+    if args.test in ('surah-full', 'all'):
         if not os.path.exists(args.text):
             print(f"Text file not found: {args.text}")
         else:
-            test_surah(model, args.seg_len, args.N, args.text)
+            test_surah_full(model, args.seg_len, args.N, args.chunk, args.text)
 
 
 if __name__ == '__main__':

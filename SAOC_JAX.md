@@ -19,13 +19,14 @@ rules over an operator algebra, built on top of JAX.**
    2. [The abstract domain $\mathcal{G}$](#22-the-abstract-domain-mathcalg)
    3. [The operator algebra](#23-the-operator-algebra)
    4. [Discovery by equality saturation](#24-discovery-by-equality-saturation)
-   5. [The generalization axes](#25-the-generalization-axes)
+   5. [Generalization: the axis taxonomy](#25-generalization-the-axis-taxonomy)
 3. [System architecture on JAX](#3-system-architecture-on-jax)
+   - [Quickstart, onboarding, and the 80/20 knobs](#37-quickstart-onboarding-and-the-8020-knobs)
 4. [Transfer functions](#4-transfer-functions)
 5. [Worked derivation: 2-layer ReLU MLP](#5-worked-derivation-2-layer-relu-mlp)
 6. [Testing plan and toy examples](#6-testing-plan-and-toy-examples)
-7. [Architecture coverage](#7-architecture-coverage)
-8. [Extension catalog (the axes as an API)](#8-extension-catalog-the-axes-as-an-api)
+7. [Architecture and problem coverage](#7-architecture-and-problem-coverage)
+8. [Taxonomy: problem vs method](#8-taxonomy-problem-vs-method)
 9. [Implementation roadmap](#9-implementation-roadmap)
 10. [Open problems and honest limitations](#10-open-problems-and-honest-limitations)
 11. [References](#11-references)
@@ -80,19 +81,49 @@ $g_x = T_{\mathrm{op}}(g_y)$ such that concrete chain-rule composition correspon
 ### 2.2 The abstract domain $\mathcal{G}$
 
 A reduced product (à la Cousot) of factors, each a lattice; $\top$ means "know
-nothing, fall back to AdamW".
+nothing, fall back to AdamW". The certificate has **two tiers**: a *problem class*
+(global facts about what kind of optimization this even is) and *local structure*
+(per-block geometry). The taxonomy in §8 organizes the whole system around exactly
+this split — the certificate detects the **problem**, the operator algebra searches the
+**method**.
+
+**Tier 1 — problem class** (detected once; governs which methods are admissible):
+
+| Fact | Meaning | Values |
+|---|---|---|
+| $\textsf{Op}$ | operator class — is there a curvature at all? | $\textsf{potential}\mid\textsf{fixed-point}\mid\textsf{saddle}\mid\textsf{VI/monotone}\mid\textsf{root}$ |
+| $\textsf{Dom}$ | variable / domain geometry | $\mathbb R^n\mid\textsf{manifold}\mid\textsf{simplex}\mid\textsf{lattice}\mid\textsf{function}\mid\textsf{measure}$ |
+| $\textsf{Evo}$ | problem evolution | $\textsf{static}\mid\textsf{streaming}\mid\textsf{incremental}\mid\textsf{non-stationary}$ |
+
+A non-conservative field ($\textsf{Op}\ne\textsf{potential}$) means $F$ is **not** a PSD
+curvature — Newton is the wrong move and the relevant object is the (possibly
+non-symmetric) operator Jacobian, calling for extragradient/fixed-point combinators.
+$\textsf{Dom}\ne\mathbb R^n$ redefines what "gradient/curvature" means (Riemannian,
+natural/Fisher–Rao, Wasserstein).
+
+**Tier 2 — local structure** (per parameter block):
 
 $$
-\mathcal{G} \;=\; \mathcal{C} \times \mathcal{S} \times \mathcal{P} \times (\mathcal{L},\mu) \times \mathcal{I}
+\mathcal{G}_{\text{local}} \;=\; \mathcal{C} \times \mathcal{S} \times \mathcal{P} \times (\mathcal{L},\mu) \times \mathcal{I}
 $$
 
 | Factor | Meaning | Lattice (informal) |
 |---|---|---|
 | $\mathcal{C}$ | curvature / smoothness class | $\textsf{LINEAR}\sqsubseteq\textsf{QUADRATIC}\sqsubseteq\textsf{CONVEX}\sqsubseteq\textsf{L-SMOOTH}\sqsubseteq\top$ |
-| $\mathcal{S}$ | structure of the Jacobian-to-loss (carries **axis roles**) | $\textsf{DIAG}\sqsubseteq\{\textsf{KRON},\textsf{LOWRANK},\textsf{DIAG{-}RANK1}\}\sqsubseteq\textsf{DENSE}\sqsubseteq\top$ |
+| $\mathcal{S}$ | structure of the Jacobian/curvature (carries **axis roles**) | $\textsf{DIAG}\sqsubseteq\{\textsf{KRON},\textsf{LOWRANK},\textsf{DIAG{-}RANK1},$ $\textsf{BANDED},\textsf{SCHUR},\textsf{CIRCULANT},\textsf{HIERARCHICAL},\textsf{MULTISCALE}\}\sqsubseteq\textsf{DENSE}\sqsubseteq\top$ |
 | $\mathcal{P}$ | separability / coupling | $\textsf{SEP}\sqsubseteq\textsf{BLOCK{-}SEP}\sqsubseteq\textsf{COUPLED}\sqsubseteq\top$ |
 | $(\mathcal{L},\mu)$ | Lipschitz $L$, strong-convexity $\mu$ | quantitative; $\mu=0$ if not provable |
-| $\mathcal{I}$ | symmetry / invariance / flat directions | set of subspaces (e.g. $\langle\mathbf 1\rangle$, radial) |
+| $\mathcal{I}$ | symmetry / invariance / **conserved quantities** | subspaces ($\langle\mathbf 1\rangle$, radial) and invariants (energy, symplectic, divergence-free) |
+
+The $\mathcal{S}$ lattice is **enriched** beyond the deep-learning core
+(diag/kron/lowrank) with the structures that scientific computing, control, vision, and
+signals expose: $\textsf{BANDED}$ (control → Riccati), $\textsf{SCHUR}$/arrow (bundle
+adjustment, factor graphs), $\textsf{CIRCULANT}$/Toeplitz → FFT-diagonalizable (audio,
+stationary signals), $\textsf{HIERARCHICAL}$/$\mathcal H$-matrix (N-body, kernels),
+$\textsf{MULTISCALE}$/elliptic (PDE). Each licenses a structured solve (see the
+preconditioner family in §8, stage **Direct**). $\mathcal{I}$ now also carries conserved
+quantities (Noether ties these to the symmetries it already tracked), licensing
+structure-preserving / symplectic updates.
 
 Soundness of heterogeneous per-block rules rests on $\mathcal{P}$: distinct rules on
 distinct blocks are valid only up to certified separability; otherwise blocks are
@@ -165,22 +196,24 @@ This discovery is **amortized**: run it once per architecture as an *optimizer
 compilation* pass (analogous to Ansor/Felix compiling a kernel); the extracted program
 runs every step.
 
-### 2.5 The generalization axes
+### 2.5 Generalization: the axis taxonomy
 
-The static algebra acts on primitives $\{g, Fv, Tv\}$ at one instant. Families beyond
-Newton/NGD are reached by extending along orthogonal axes (full catalog in §8). The
-first four:
+The static algebra acts on primitives $\{g, Fv, Tv\}$ at one instant. Every other
+optimizer family is reached by extending **vocabulary**, never the selector. The
+extension space is not a flat list of axes but a clean two-level taxonomy that mirrors
+this system's own architecture:
 
-1. **Source** — exact-AD $\mid$ temporal-EMA estimate $\mid$ finite-difference probe
-   (covers zeroth-order, empirical Fisher).
-2. **Time** — delay $z^{-1}$, EMA, rational filters
-   (momentum $m=(1-\beta z^{-1})^{-1}g$; Adam = temporal diagonal whitening).
-3. **Order** — iterate AD $k$ times for $k$-th order operators.
-4. **Meta** — combinators $\textsf{Update}\to\textsf{Update}$, incl. AD-through-update
-   (lookahead, hypergradients, iterate averaging).
+- **PROBLEM** (detected by the certificate, §2.2): *operator class · domain · evolution ·
+  local structure* — read-only facts that say what kind of problem this is and which
+  methods are admissible.
+- **METHOD** (chosen combinators, searched by the e-graph): a six-stage pipeline of one
+  update — *Reframe → Sense → Model → Direct → Pace → Compose*.
 
-Each axis is *vocabulary*; the extractor/cost/soundness machinery never changes. The
-zoo is the **product** of the axes.
+Each METHOD combinator carries a **guard** that is a predicate over PROBLEM facts; that
+guard *is* the link between the certificate (abstract interpretation) and the algebra
+(equality saturation). The full taxonomy, the named-method decomposition, and the
+per-combinator guards are in §8. An optimizer is a point in the METHOD product space,
+admissible for a region of the PROBLEM space.
 
 ---
 
@@ -251,6 +284,7 @@ soco/                              # "structure-aware optimizer compiler"
     state.py                       # per-block factor buffers, refresh schedule (K-FAC-style)
   dsl/
     register.py                    # user-facing combinator registration (op, cost, guard, rewrites)
+    inputs.py                      # CompileInput / Constraints / CompileConfig; ModuleAdapter (Flax/Equinox/Haiku)
   tests/                           # see §6
 ```
 
@@ -321,6 +355,352 @@ The runtime target is an `optax.GradientTransformation`: `init` allocates the pe
 factor/state buffers, `update` applies the lowered, jitted term and refreshes dynamic
 factors on a schedule (static $\mathcal C/\mathcal S/\mathcal P/\mathcal I$ are computed
 once; only numeric factors — $rr^\top$, $\mathrm{diag}(s)-ss^\top$, $L$ — refresh).
+
+### 3.5 Compiler input contract
+
+The compiler consumes a **traceable JAX program + examples**, not a hand-built graph.
+Everything else is metadata that *improves precision* but is optional — the compiler
+degrades gracefully to jaxpr inference when it is absent.
+
+```python
+# dsl/inputs.py
+@dataclass
+class CompileInput:
+    model:          Callable        # f(params, batch) -> output   (pure, jit-traceable)
+    loss:           Callable        # loss(output, batch) -> scalar
+    params_example: PyTree          # for tracing AND block structure
+    batch_example:  PyTree          # for tracing (shapes/dtypes)
+    loss_atom:      str | None      # "mse" | "softmax_ce" | ... | None  -> infer / HVP fallback
+    module_adapter: ModuleAdapter | None   # Flax/Equinox/Haiku -> blocks + atom labels + domains
+    constraints:    Constraints
+    config:         CompileConfig
+
+@dataclass
+class Constraints:
+    domains:      dict[BlockId, Domain]   # Euclidean | Stiefel | Simplex | Box(lo,hi) | ...  (sets P2)
+    equalities:   list[Callable]          # c(params) == 0   (dynamics, KKT)
+    inequalities: list[Callable]          # c(params) <= 0
+    invariants:   list[Callable]          # quantities to preserve (energy/symplectic -> I factor)
+
+@dataclass
+class CompileConfig:
+    flop_budget:    float = 1.5           # multiple of AdamW cost the step may use
+    mem_budget:     float = 2.0           # multiple of AdamW optimizer-state memory
+    precision:      str   = "fp32"        # "fp32"|"bf16"|"fp8"; non-fp32 implies error-feedback
+    error_tol:      float = 1e-2          # max approximation error a lossy rewrite may add
+    second_order:   bool  = True          # if False, Model is pinned to diag/identity
+    enabled_stages: set   = frozenset()   # restrict METHOD combinators (default: all)
+    target_hw:      str   = "a100"        # cost-model target
+    refresh_every:  int   = 10            # dynamic-factor refresh schedule
+    overrides:      dict   = field(default_factory=dict)  # {BlockPattern: RuleId} escape hatch
+    fallback:       str   = "adamw"       # rule for TOP / over-budget / pinned-off regions
+```
+
+**Granularity / levels — the DAG is read at several resolutions, and blocks snap to the
+finest separable grain:**
+
+1. *array level* — pytree leaves (a kernel, a bias). Always available.
+2. *layer level* — a leaf plus its immediate companions (kernel+bias+norm-scale).
+3. *module-subtree level* — an attention block, an MLP block. From `module_adapter`.
+4. *model level* — one global rule (rare; only when nothing is separable).
+
+The block partition is the **finest grouping that $\mathcal P$ certifies as independently
+updatable**, *snapped to module boundaries when a `module_adapter` is present* (modules
+are strong separability priors). Where coupling is detected, blocks are merged and their
+certificates `meet`-joined (§2.2).
+
+**Loss curvature input.** Tag the loss when possible (`loss_atom="softmax_ce"`) so the
+head $H=\mathrm{diag}(s)-ss^\top$ is known *symbolically* and the exact-NG head fires
+unconditionally. Untagged losses fall back to a matrix-free HVP
+($\textsf{jvp}\circ\textsf{grad}$) — still usable via CG, but the head $\mathcal S$
+degrades to dense (no Woodbury/Kronecker exactness).
+
+### 3.5.1 Selection policy — when SGD- vs Adam- vs NGD-like, and where "nothing"
+
+The user does **not** specify per-region rules — that is the compiler's job. The user
+sets *budget and tolerance* (`CompileConfig`); the per-region rule is the **extraction
+output**, decided mechanically per block from `(cert, config)`:
+
+```python
+def select_rule(block, cert, config):
+    if block matches config.overrides:            # escape hatch
+        return config.overrides[block]
+    if cert is TOP or not config.second_order:    # no provable structure -> plain rule
+        return config.fallback                    #   ("adamw" or "sgd")
+    if block.num_params < SIZE_THRESHOLD:         # overhead not worth it on tiny blocks
+        return config.fallback
+    rule, err, cost = egraph_extract(cert, config) # cheapest SOUND term under the budget
+    if cost > config.flop_budget * adamw_cost(block) or err > config.error_tol:
+        return degrade(rule, config)              # step down the lattice toward fallback
+    return rule
+```
+
+The resulting map onto familiar rules (all *derived*, not named):
+
+| Region | Certificate | Extracted rule |
+|---|---|---|
+| softmax-CE / regression head | CONVEX, exact $H$, DIAG-RANK1/KRON | **NGD / Newton** (exact, Woodbury) |
+| dense / matmul layer | KRON (or DENSE-MATRIX) | **K-FAC** or **Muon/spectral** (cost decides) |
+| conv layer | structured KRON (KFC) | **K-FAC-conv** |
+| embedding | row-sparse, separable rows | **sparse row-wise** (NG or Adam) |
+| activation / elementwise | DIAG | **Adam-like / diagonal** |
+| norm scale/bias, small vectors | CONVEX, low-rank | small **Newton** or scaled GD |
+| coupled nonlinear core | $\top$ | **SGD / AdamW** (the "nothing special" case) |
+| tiny block / over-budget / user-pinned-off | any | **fallback** (SGD/AdamW) |
+
+So "which part gets plain SGD and which does not" is exactly: $\top$-regions,
+sub-threshold blocks, over-budget blocks, and user-pinned ones get the fallback;
+everything with provable, affordable structure gets its derived structured rule.
+Changing `flop_budget`/`error_tol` slides the whole network between "mostly SGD/Adam"
+(tight budget) and "mostly NGD/K-FAC where provable" (loose budget) — one knob, global
+effect, no per-region authoring.
+
+### 3.6 Output: building the optimizer
+
+**Primary output is a programmatically-constructed `optax.GradientTransformation`, not
+raw jaxpr and not string-generated Python.** It jits, composes with the optax ecosystem,
+and carries per-block state as a PyTree matching `params`. Raw jaxpr is rejected as the
+*artifact* (internal, opaque, unstable); hand-written-template Python is rejected as
+*brittle codegen*. The transform is assembled from the extracted operator-IR term by the
+`lower.py` interpreter (one JAX implementation per algebra node) and made heterogeneous
+per region via `optax.multi_transform`:
+
+```python
+# runtime/optimizer.py
+def build_optimizer(compiled) -> optax.GradientTransformation:
+    rule_table   = {label: lower_to_optax(term)   # operator-IR term -> GradientTransformation
+                    for label, term in compiled.terms.items()}
+    param_labels = compiled.param_labels           # PyTree mirroring params; leaf -> rule label
+    return optax.multi_transform(rule_table, param_labels)
+
+@dataclass
+class CompiledOptimizer:
+    tx:           optax.GradientTransformation   # the runnable optimizer (jits)
+    param_labels: PyTree                         # leaf/block -> rule label
+    terms:        dict[str, Op]                  # label -> extracted operator-IR term
+    source:       str                            # secondary: readable Python rendering (audit)
+    report:       dict                           # per block: rule, cert, cost, error, why
+
+    def emit_source(self, path: str) -> None: ...  # write a standalone, editable JAX/optax module
+```
+
+The output is therefore **structure-aware by construction**: heterogeneous per-region
+rules are applied through a `param_labels` PyTree (the JAX-idiomatic
+`multi_transform`/`masked` pattern), with labels coming from the block partition (§3.5).
+A *secondary*, optional artifact is a **readable Python rendering** of each term — the
+operator IR is a small typed AST, so pretty-printing it to an inspectable `optax.chain`
+is straightforward and is the human-facing/audit form. The artifact is deterministic in
+`(model, config, example)`, so cache it as a compile product.
+
+#### 3.6.1 Two output modes: live object (default) vs emitted source
+
+The same extracted IR can be rendered to **standalone, human-readable JAX/optax source**
+and used *instead of* the live object. The operator-IR term is a small typed AST, so
+AST → source is a direct codegen pass (the same traversal as `lower_to_optax`, printing
+instead of building). Two modes, one compile:
+
+```python
+compiled = soco.compile(...)
+
+tx = compiled.tx                       # MODE 1 (default): live object — robust, guarded, re-derivable
+
+compiled.emit_source("my_opt.py")      # MODE 2: write an editable module, then use that instead
+# from my_opt import make_optimizer
+# tx = make_optimizer()
+```
+
+The generated module is self-contained and *is* the audit — every rule carries its block,
+its certificate, and the math as comments:
+
+```python
+# my_opt.py  — AUTOGENERATED by soco for MLP-regression @ flop_budget=1.5, fp32
+# FROZEN SNAPSHOT: shapes + config + architecture baked in. Recompile if any change.
+import jax, jax.numpy as jnp, optax
+
+def _exact_gn_output(eps=1e-6):
+    # block w3 : H=I (MSE) -> ΔW = -G (rrᵀ)⁻¹     [cert: CONVEX, KRON exact]
+    def init(p): ...
+    def update(grads, state, params=None): ...
+    return optax.GradientTransformation(init, update)
+
+def _kfac_layer(eps=1e-6, refresh=10):
+    # blocks w1,w2 : GN-Kron  (rrᵀ)⁻¹ ⊗ (DWᵀHWD)⁻¹   [cert: L-SMOOTH, KRON approx]
+    ...
+    return optax.GradientTransformation(init, update)
+
+def _small_newton(): ...    # biases  [cert: CONVEX, LOWRANK]
+
+def make_optimizer():
+    labels = {"w1": "kfac", "w2": "kfac", "w3": "gn_out", "b1": "newton", ...}
+    return optax.multi_transform(
+        {"gn_out": _exact_gn_output(), "kfac": _kfac_layer(), "newton": _small_newton()},
+        labels)
+```
+
+**It is brittle — use it knowing exactly why:**
+
+- *Pinned snapshot.* Specialized to the traced shapes, the chosen budget/config, and the
+  architecture at compile time. Change vocab/width/batch structure, or want a different
+  budget → it is stale; recompile.
+- *Guards dropped.* The certificate soundness conditions that *licensed* each
+  approximation are not re-checked at runtime — the file is the conclusion, not the proof.
+  You can hand-edit freely, but a manual change (e.g. forcing Kron on a block that was not
+  certified separable) silently voids soundness.
+- *Data-dependent structure frozen.* The emitter keeps the dynamic-factor refresh code (so
+  K-FAC factors still update each `refresh` steps), but the *structural* decisions — which
+  rule per block, gate-dependent $\mathcal S$ — are frozen to compile-time assumptions. If
+  the activation regime shifts, the live object re-derives; the source does not.
+- *One-shot.* No re-extraction; the live object can be recompiled with a new config, the
+  source cannot.
+
+**When to prefer source:** auditing or teaching what was derived; debugging a suspicious
+update; forking into a hand-maintained custom optimizer; shipping to an environment that
+should not carry the compiler (and its e-graph) as a runtime dependency. The live object
+is for everything else.
+
+**Equivalence guarantee.** The emitted source must numerically equal `compiled.tx` on the
+traced shapes — this is the lowering-equivalence property test (§6.4), and CI should diff
+the two. The moment you hand-edit the file, that guarantee is void by construction and the
+file is yours to maintain.
+
+**Framework awareness — Flax/Equinox make both ends easier.** Provide a `ModuleAdapter`:
+
+| Framework | Block tree / labels | Domains | Output keying |
+|---|---|---|---|
+| **Flax** | module paths via `flax.traverse_util`; class names (`nn.Dense`, `nn.LayerNorm`, `nn.MultiHeadDotProductAttention`) give atom labels directly | from module config | `multi_transform` keyed by module path |
+| **Equinox** | the module *is* the params PyTree; block boundaries = module boundaries; `eqx.partition`/`eqx.filter` select leaves | dataclass field tags | filtered `multi_transform` over the module tree |
+| **Haiku / raw** | pytree key paths (`jax.tree_util.keystr`) as weak priors | explicit `Constraints.domains` | path-prefix labels |
+
+With Flax/Equinox the certificate's **atom-matching is trivial** (read the module class
+instead of inferring softmax/LayerNorm from the jaxpr) and the **block partition is
+given** (module subtree = block), so steps 3 (lift+certify) and the output keying both
+shortcut. Absent an adapter, the compiler infers block structure from pytree paths +
+jaxpr pattern-matching — same result, more work, lower precision on atoms.
+
+### 3.7 Quickstart, onboarding, and the 80/20 knobs
+
+**Mental model: you write a model and a loss; you do not write an optimizer.** You hand
+the compiler a normal JAX/Flax/Equinox `model` + `loss` + example pytrees, and it returns
+an `optax.GradientTransformation` you drop into a standard training loop. It *derives* a
+per-region rule (NGD on the head, K-FAC/Muon on matmuls, Adam on the rest) and tells you
+what it did in a `report`.
+
+The 30-second version:
+
+```python
+import soco, optax
+
+compiled = soco.compile(model, loss, params, batch, loss_atom="softmax_ce")
+tx = compiled.tx                       # a normal optax optimizer; jits and composes
+state = tx.init(params)
+# standard loop:
+grads = jax.grad(lambda p: loss(model(p, batch), batch))(params)
+updates, state = tx.update(grads, state, params)
+params = optax.apply_updates(params, updates)
+
+print(compiled.report)                 # what it derived per block, and why
+```
+
+**The 20% of knobs that cover 80% of usage** (everything else has good defaults):
+
+| Knob | What it does | Default | Touch when |
+|---|---|---|---|
+| `loss_atom` | tags the loss so head curvature is exact (the head-NG win) | `None` → infer/HVP | **always** — set `"mse"` / `"softmax_ce"`; biggest single win, free |
+| `module_adapter` | hands over your block tree + atom labels | `None` → infer | **always if Flax/Equinox** — precision + zero inference |
+| `flop_budget` | master dial: tight → SGD/Adam-like, loose → NGD/K-FAC where provable | `1.5×` | first thing to sweep; raise to admit more structure |
+| `second_order` | global on/off | `True` | set `False` for a safe well-scaled-AdamW baseline first |
+| `fallback` | rule for $\top$/over-budget regions | `"adamw"` | `"sgd"` for a leaner baseline |
+| `precision` | optimizer-state dtype + error-feedback | `"fp32"` | `"bf16"`/`"fp8"` when memory-bound (large LMs) |
+| `refresh_every` | curvature-factor refresh cadence | `10` | raise to cut overhead, lower for fast-moving curvature |
+| `overrides` | pin a region to a rule | `{}` | rarely — debugging or hard domain knowledge |
+
+**Reading the report** is the core onboarding skill: each block shows `(rule, certificate,
+cost, error, why)`, e.g. `head Dense → exact-NGD (CONVEX, DIAG-RANK1)`,
+`block3.conv → KFC`, `mlp.glue → AdamW (S=⊤)`. That last line is how you see *which parts
+got "nothing special"* and why.
+
+#### Example A — MLP regression (the §5 case, runnable)
+
+```python
+def model(p, b):
+    h = jnp.tanh(b["x"] @ p["w1"] + p["b1"])
+    h = jnp.tanh(h     @ p["w2"] + p["b2"])
+    return h @ p["w3"] + p["b3"]
+def loss(pred, b): return 0.5 * jnp.mean((pred - b["y"]) ** 2)
+
+compiled = soco.compile(model, loss, params, batch, loss_atom="mse")   # that's it
+```
+Derived report:
+```
+w3 (output)  -> exact Gauss-Newton   # H=I  -> whiten grad by activation Gram (rrᵀ)⁻¹
+w1, w2       -> K-FAC (approx)
+b1..b3       -> small Newton
+```
+What to tune: usually nothing. If steps feel expensive, `refresh_every=25`; for more
+aggressive curvature use, `flop_budget=3.0`.
+
+#### Example B — ResNet on CIFAR (Flax)
+
+```python
+net = ResNet18(num_classes=10)                      # flax.linen module
+params = net.init(key, x)["params"]
+fwd  = lambda p, b: net.apply({"params": p}, b["x"])
+loss = lambda logits, b: optax.softmax_cross_entropy_with_integer_labels(logits, b["y"]).mean()
+
+compiled = soco.compile(
+    fwd, loss, params, batch,
+    loss_atom="softmax_ce",
+    module_adapter=soco.flax(net),                  # ResNet blocks + conv/bn/dense labels for free
+    config=soco.Config(flop_budget=2.0, precision="bf16"),
+)
+```
+Derived report:
+```
+head Dense        -> exact NGD (Woodbury on diag(s)-ssᵀ)
+conv blocks       -> K-FAC-conv (KFC); im2col layout tracked
+BatchNorm scales  -> symmetry projection + scaled GD
+residual glue     -> AdamW (S=⊤)
+```
+What to tune: `flop_budget` is the lever — convs hold most FLOPs, so `2.0` lets them get
+KFC while `1.2` pushes them to Adam; `precision="bf16"` for memory.
+
+#### Example C — Transformer LM (Equinox or Flax)
+
+```python
+compiled = soco.compile(
+    fwd, loss, params, batch,
+    loss_atom="softmax_ce",
+    module_adapter=soco.equinox(model),
+    config=soco.Config(flop_budget=1.3, precision="bf16", refresh_every=20),
+)
+```
+Derived report:
+```
+LM head            -> exact NGD (Woodbury; cheap even at large vocab)
+Q/K/V/O, FFN       -> Muon / spectral   # cost picks spectral over Kron at this width
+token embeddings   -> sparse row-wise
+LayerNorm/RMSNorm  -> symmetry projection
+RoPE               -> transparent (isometry; no params)
+```
+What to tune: at scale keep `flop_budget` tight (≈1.2–1.3) so matmuls get cheap spectral
+and only the head gets exact NG (the scale caveat, §7/§10); raise `refresh_every` to
+amortize factor cost; `precision="fp8"` states if memory-bound.
+
+#### Recommended onboarding loop
+
+1. **Start safe.** `Config(second_order=False, fallback="adamw")` → a well-scaled AdamW
+   (per-block $\eta=1/L$ + symmetry projection). Confirms plumbing; gives a baseline.
+2. **Turn on the cheap wins.** `second_order=True`, set `loss_atom`, pass
+   `module_adapter`. The exact-NG head and symmetry projections come first — cheapest and
+   safest gains.
+3. **Sweep `flop_budget` upward**, watching the `report` and a val curve; stop where the
+   cost/benefit flattens.
+4. **Only then** reach for `overrides` (debugging) and `precision` (memory).
+
+Two expectations from §6.4: on a *homogeneous* net (e.g. matmul-only) the compiler should
+**match** the best single rule, not beat it — gains appear on *heterogeneous* graphs
+(everything above). And compilation is amortized: it runs once per architecture, so cache
+`compiled` and reuse across runs.
 
 ---
 
@@ -547,7 +927,7 @@ On a small Transformer, compare against tuned AdamW / Muon / SOAP.
 
 ---
 
-## 7. Architecture coverage
+## 7. Architecture and problem coverage
 
 Relevance $\propto$ exploitable provable structure. Two kinds: **outer-loop** (train
 the weights — does the certificate find structure?) and **inner-loop** (the layer's
@@ -578,32 +958,97 @@ cores need new combinators (`scan`, gated-linear-recurrence, low-rank-state) and
 curvature-through-unroll is the least-developed analysis; outer-loop accelerator value
 compresses at the very largest LLM scale where Muon/SOAP already capture the structure.
 
+### 7.3 Problem classes beyond weight-training
+
+The deep-learning core assumes a static, differentiable, scalar loss over Euclidean
+parameters. Other domains break that (see PROBLEM tier in §2.2 / §8). Each row gives the
+PROBLEM coordinates, what existing METHOD stages already cover, and what must be added.
+
+| Domain | PROBLEM coordinates | Covered by | Needs |
+|---|---|---|---|
+| **RL** | $\textsf{Op}=\textsf{fixed-point}$ (TD), $\textsf{Evo}=\textsf{non-stationary}$ | Sense (score vs pathwise), variance reduction (baselines/GAE), Direct (PPO/TRPO KL trust) | operator-class combinators (fixed-point/damped), drift-aware Compose |
+| **Robot / optimal control** | $\textsf{Op}=\textsf{potential}$ + dynamics constraints, $\mathcal S=\textsf{BANDED}$, $\textsf{Evo}=\textsf{incremental}$ (MPC) | Direct (constraint/prox), Pace (LM damping) | Riccati preconditioner, warm-start/incremental Compose |
+| **Computer vision (deep)** | standard | §7.1 ConvNet | — |
+| **Geometric vision / bundle adjustment** | $\textsf{Op}=\textsf{root}$ (NLS), $\mathcal S=\textsf{SCHUR}$ | Model (GN), Pace (LM) | Schur-complement preconditioner |
+| **SLAM** | $\textsf{Dom}=SE(3)$ manifold, $\mathcal S=\textsf{SCHUR}$, $\textsf{Evo}=\textsf{incremental}$ | Model (GN) | manifold retraction (Dom), sparse-Cholesky precond, incremental factor update |
+| **Spatial / speech audio** | $\mathcal S=\textsf{CIRCULANT}$; sequence structure | Model (GN), scan | FFT/spectral preconditioner (basis-aware $\mathcal S$) |
+| **Scientific computing / physics / ODE / PDE** | $\textsf{Dom}=\textsf{function}$, $\mathcal S=\textsf{MULTISCALE}$, conserved $\mathcal I$ | Sense (adjoint = pullback), Reframe (implicit for stiffness), Direct (PDE-constrained) | multigrid/spectral/domain-decomposition preconditioners; symplectic/structure-preserving Compose |
+| **Biology** | mix: physics-energy; ODE fitting; $\textsf{Dom}=\textsf{lattice}$ (trees/alignment) | physics rows above, inverse/GN | combinatorial-domain combinators (DP, tree search) |
+| **Discrete / distribution optimization** | $\textsf{Dom}=\textsf{lattice}$ or $\textsf{measure}$; $\textsf{Op}=\textsf{saddle}$ (adversarial) | Reframe/Sense (relaxation, score), Direct (mirror/simplex; Wasserstein), Sense (particles/SVGD) | domain-geometry combinators (lattice, measure); saddle/extragradient |
+
+**Honest value.** Many of these fields already have mature, near-optimal hand-built
+structure exploiters — multigrid, iLQR/DDP, sparse bundle adjustment, symplectic
+integrators, ADMM, extragradient. There the system mostly *re-derives* known solvers (a
+good correctness test, like re-deriving K-FAC). The marginal value is highest where
+structure exists but is not routinely exploited — the learning-heavy interiors:
+RL optimizers, neural PDE solvers / operators, differentiable SLAM and control, learned
+samplers — i.e. precisely where these classical domains are now being fused with deep
+learning and nobody has hand-tuned the structure-aware optimizer yet.
+
 ---
 
-## 8. Extension catalog (the axes as an API)
+## 8. Taxonomy: problem vs method
 
-Each axis is registered vocabulary (op, cost, guard, rewrites); extractor/cost/soundness
-machinery is untouched. Optimizers are **points in the product space**.
+The flat list of axes collapses under one observation: some dimensions describe the
+**problem** (you detect them, you do not choose them) and the rest describe the
+**method** (you choose them, guarded by the problem). This is exactly the system's own
+architecture — the certificate detects PROBLEM, the e-graph searches METHOD, and each
+combinator's guard is a predicate over PROBLEM facts. Every previously-listed axis folds
+into one of these.
 
-| # | Axis | What varies | Named instances | Guard source |
+### 8.1 PROBLEM — four detected facts (the certificate)
+
+| # | Dimension | Values | Detected fact / guard it supplies |
+|---|---|---|---|
+| **P1** | Operator class | potential $\mid$ fixed-point $\mid$ saddle $\mid$ VI/monotone $\mid$ root | conservative? contractive? monotone? — decides whether a PSD curvature exists |
+| **P2** | Domain geometry | $\mathbb R^n\mid$ manifold $\mid$ simplex $\mid$ lattice $\mid$ function $\mid$ measure | which gradient/curvature/metric is even meaningful |
+| **P3** | Evolution | static $\mid$ streaming $\mid$ incremental $\mid$ non-stationary | drift bound; whether to reuse work |
+| **P4** | Local structure | $\mathcal C,\mathcal S$ (enriched), $\mathcal P,(\mathcal L,\mu),\mathcal I$ | per-block curvature/structure/separability/conditioning/symmetry |
+
+### 8.2 METHOD — a six-stage pipeline (the combinators)
+
+The data flow of one update. Each stage is registered vocabulary `(op, cost, guard,
+rewrites)`; the extractor/cost/soundness machinery never changes. Stages are *mostly*
+independent → the method space is a product the e-graph searches.
+
+| Stage | Question | Folded axes | Named instances | Guard from |
 |---|---|---|---|---|
-| 1 | Source | how $g,Fv$ are obtained | exact-AD, empirical-Fisher (EMA), probe (SPSA/ES) | — |
-| 2 | Time | filtering across steps | momentum, heavy-ball, Nesterov, Adam moments | — |
-| 3 | Order | iterate AD $k\times$ | Newton, Halley, cubic-regularized | $\mathcal C$ |
-| 4 | Meta | $\textsf{Update}\to\textsf{Update}$ | lookahead, hypergradient, iterate averaging | — |
-| 5 | Geometry | norm / LMO / Bregman | SGD ($\ell_2$), Muon (spectral), Lion/signSGD ($\ell_\infty$), mirror/EG | $\mathcal S$ |
-| 6 | Constraint | projection / prox / manifold | ISTA/FISTA, Frank–Wolfe, Riemannian (Stiefel), ADMM | $\mathcal C,\mathcal I$ |
-| 7 | Curvature identity | which $H$ | Hessian, GN, Fisher, empirical-F, generalized-GN | $\mathcal C,\mathcal S$ |
-| 8 | Variance reduction | control variates / snapshots | SVRG, SAGA, SARAH | unbiasedness |
-| 9 | Adaptivity | scalars from measurements | line search, trust region, Polyak, LM damping | descent cond. |
-| 10 | Granularity | grain + schedule | per-param/layer/global; Jacobi vs Gauss–Seidel | $\mathcal P$ |
-| 11 | Objective | what is differentiated | SAM, entropy-SGD, proximal-point/implicit, teacher | — |
-| 12 | Trajectory | multi-point relationships | L-BFGS (secant), Anderson, CMA-ES, SVGD | — |
-| 13 | Representation | bits + compression | 8-bit states, error-feedback, top-k, GaLore | error-feedback |
-| 14 | Aggregation | combine estimates | clip, LARS/LAMB, median/Krum, DP | robustness/privacy |
+| **M1 Reframe** | what objective/operator do I actually attack? | Objective | SAM/sharpness, smoothing/entropy-SGD, proximal-point/implicit, teacher/distillation | P1, $\mathcal C$ |
+| **M2 Sense** | how do I obtain & clean the primitives $g,Fv,Tv$? | Source, Order, Variance-reduction, Trajectory, Representation, Aggregation | AD / EMA-estimate / probe (SPSA, ES) / secant (L-BFGS) / population (CMA-ES); $k$-th order; SVRG/SAGA; 8-bit + error-feedback; median/Krum/clip | unbiasedness, error-feedback, P2 |
+| **M3 Model** | which curvature, which approximation? | Curvature-identity + the curvature-approx grid | Hessian / GN / Fisher / empirical-F; exact / Kron / diag / spectral-2nd-moment / low-rank / sparse | $\mathcal C,\mathcal S$, P1 |
+| **M4 Direct** | turn signal+model into a direction under what geometry & constraints? | Geometry, Constraint + preconditioner family | $\ell_2$/spectral/sign/mirror; prox/projection/Frank–Wolfe/retraction; Kron-inv / Newton–Schulz / pth-root / **multigrid / spectral(FFT) / Schur / Riccati** | $\mathcal S,\mathcal I$, P2 |
+| **M5 Pace** | magnitude and temporal dynamics? | Time, Adaptivity | momentum/heavy-ball/Nesterov/Adam-EMA; line search / trust region / Polyak / LM damping; extragradient/optimistic | $\mathcal L,\mu$, P1 |
+| **M6 Compose** | where, when, wrapped, reused? | Granularity, Meta, Online-reuse | per-param/layer/global; Jacobi vs Gauss–Seidel; lookahead/hypergradient/averaging; warm-start/incremental factor update | $\mathcal P$, P3 |
 
-Orthogonality is approximate (quasi-Newton straddles 3/12; AdaGrad straddles 1/9;
-clipping straddles 6/14). A method on a seam just means two combinators co-fire.
+Mnemonic: **Reframe → Sense → Model → Direct → Pace → Compose**, admissible for a region
+of (P1, P2, P3, P4).
+
+### 8.3 Named methods as coordinates
+
+The taxonomy organizes the zoo: each method is a point.
+
+| Method | PROBLEM | Reframe | Sense | Model | Direct | Pace | Compose |
+|---|---|---|---|---|---|---|---|
+| **SGD** | pot, $\mathbb R^n$, static | — | AD $g$ | $F\!\approx\!I$ | $\ell_2$ | fixed $\eta$ | global |
+| **Adam** | pot, $\mathbb R^n$, static | — | AD $g$ | $\mathrm{diag}$(temporal $g^2$) | elementwise isqrt | EMA momentum | per-param |
+| **Muon** | pot, $\mathbb R^n$, static | — | AD $g$ | spectral 2nd-moment | Newton–Schulz (spectral) | momentum | per-matrix |
+| **K-FAC** | pot, $\mathbb R^n$, static | — | AD $g$ | GN, Kron | Kron-inverse | — | per-layer |
+| **L-BFGS** | pot, $\mathbb R^n$, static | — | secant history | quasi-Newton | 2-loop recursion | line search | global |
+| **SAM** | pot, $\mathbb R^n$, static | sharpness | AD $g$ at perturbed pt | $F\!\approx\!I$ | $\ell_2$ | momentum | global |
+| **PPO** | pot, $\mathbb R^n$, **non-stat** | clipped surrogate | AD policy grad | — | KL trust region | adaptive | online |
+| **TD learning** | **fixed-point**, $\mathbb R^n$, non-stat | — | bootstrap target | none (no curvature) | contraction | damped | per-value |
+| **GAN / extragradient** | **saddle**, $\mathbb R^n$ | — | AD both players | game Jacobian | extragradient/optimistic | — | alternating |
+| **iLQR / DDP** | pot, $\mathbb R^n$, $\mathcal S=$ banded | — | AD $g$ | GN | **Riccati** | LM damping | block (time) |
+| **SVGD** | pot, **measure** | — | population particles | — | kernel / Wasserstein | — | per-particle |
+| **Multigrid–Newton (PDE)** | pot, **function**, multiscale | — | adjoint $g$ | GN | **multigrid** | — | global |
+
+### 8.4 Invariant and seams
+
+Adding a family = adding combinators under a METHOD stage (or a detected fact under
+PROBLEM); the selector is never edited. Orthogonality is approximate: quasi-Newton
+straddles Sense/Model/Pace; AdaGrad straddles Sense/Pace; clipping straddles
+Direct/Sense. A method on a seam just means two combinators co-fire — the stages are a
+*generating* vocabulary, not a partition.
 
 ---
 
@@ -615,16 +1060,21 @@ clipping straddles 6/14). A method on a seam just means two combinators co-fire.
 - **v1 — atoms + exact e-graph.** Add the atom library (softmax-CE, LayerNorm, linear,
   conv), the operator IR, exact rewrites only (Kron-inverse, transpose, fusion), cost
   extraction. Reproduce §5 derivations and §6.2 exactly. K-FAC/NGD emerge.
-- **v2 — approximate e-graph + axes 1–4.** Lossy rewrites with certificate-supplied
-  error bounds; Source/Time/Order/Meta combinators. Adam, momentum, hypergradients,
-  zeroth-order patches become reachable. Add the validation loop (meta-eval or online
-  curvature residual).
+- **v2 — approximate e-graph + METHOD Sense/Model/Pace/Compose.** Lossy rewrites with
+  certificate-supplied error bounds; the Sense (source/order/VR), Pace (time/adaptivity),
+  and Compose (meta) combinators. Adam, momentum, hypergradients, zeroth-order patches
+  become reachable. Add the validation loop (meta-eval or online curvature residual).
 - **v3 — recurrent/scan + inner-loop.** `scan`/gated-linear-recurrence/low-rank-state
   combinators (SSM, RNN). Inner-loop synthesis for DeltaNet/gated DeltaNet/TTT:
   derive/precondition the fast-weight update on its local regression loss.
-- **v4 — full axis catalog + hardware cost.** Geometry/Constraint/VR/Adaptivity/etc.;
-  hardware-aware cost model (flops/mem/**bits**), closing the loop with §7's
-  representation axis.
+- **v4 — full METHOD vocabulary + hardware cost.** Direct (geometry/constraint +
+  multigrid/spectral/Schur preconditioners), enriched $\mathcal S$ lattice, Reframe
+  (surrogates); hardware-aware cost model (flops/mem/**bits**), closing the loop with the
+  Representation combinators in Sense.
+- **v5 — new PROBLEM dimensions.** Operator class (extragradient/fixed-point for
+  RL/saddles), domain geometry (Riemannian/mirror/Wasserstein for SLAM/control/discrete/
+  distribution), evolution (warm-start/incremental, change-trust-region). This is where
+  coverage extends past weight-training (§7.3).
 
 ---
 
@@ -654,6 +1104,18 @@ clipping straddles 6/14). A method on a seam just means two combinators co-fire.
   so they structurally cannot discover K-FAC/NGD/Muon. The new content is making the
   propagated pushforward/pullback/curvature first-class IR so second-order rules become
   *reachable* in the search.
+- **Non-conservative fields (P1).** When the field is not the gradient of a potential
+  (RL/TD, saddles, VIs), there is no PSD curvature; the certificate must detect
+  monotonicity/contraction and the algebra needs extragradient/fixed-point combinators
+  with their own convergence guards. The "$F=$ curvature" assumption of §2.3 is
+  potential-only.
+- **Non-Euclidean domains (P2).** Manifolds, simplices, lattices, and measure spaces need
+  a Riemannian/mirror/Wasserstein layer (retraction, exp-map, transport, mirror map, LP
+  oracle, particle discretization). The operator algebra and its rewrites are currently
+  written for $\mathbb R^n$; lifting them to these domains soundly is open.
+- **Problem evolution (P3).** Drift bounds (how fast the objective/data moves per update)
+  are needed to license warm-start/incremental reuse and change-trust-regions; estimating
+  them online is unsolved in general.
 
 ---
 
@@ -705,6 +1167,20 @@ Optimizers (the targets the system should derive):
 Optimizer program search (prior art and its gap):
 - Real et al. *AutoML-Zero.* ICML 2020.
 - Chen et al. *Symbolic Discovery of Optimization Algorithms* (Lion). 2023.
+
+Problem classes beyond weight-training (the new PROBLEM dimensions):
+- Schulman et al. *Trust Region Policy Optimization* (TRPO) 2015; *Proximal Policy
+  Optimization* (PPO) 2017 — change-trust-region under non-stationarity.
+- Korpelevich. *The extragradient method* 1976; Mertikopoulos et al. *Optimistic
+  gradient / mirror descent for saddles.* — operator-class (saddle/VI).
+- Absil, Mahony, Sepulchre. *Optimization Algorithms on Matrix Manifolds.* 2008 —
+  domain = manifold (retraction, transport).
+- Liu, Wang. *Stein Variational Gradient Descent.* NeurIPS 2016 — domain = measure.
+- Kaess, Ranganathan, Dellaert. *iSAM / iSAM2* — incremental factor-graph optimization.
+- Tassa, Erez, Todorov. *iLQR / DDP* — banded/Riccati structure in control.
+- Briggs, Henson, McCormick. *A Multigrid Tutorial.* 2000 — multiscale preconditioning.
+- Hairer, Lubich, Wanner. *Geometric Numerical Integration* — symplectic /
+  structure-preserving updates.
 
 Modern architectures (inner-loop relevance):
 - Sun et al. *Learning to (Learn at Test Time): RNNs with Expressive Hidden States*

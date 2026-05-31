@@ -24,25 +24,206 @@ import jax.numpy as jnp
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Protocol bytes (never appear in data)
+# Legacy v1 single-byte protocol tokens (kept for backward compat)
 # ---------------------------------------------------------------------------
-STX = 0x02        # open memory segment
-ETX = 0x03        # close memory segment
-NUL = 0x00        # (kept for compatibility; no longer used in memory slots)
-SLOT_BASE = 0x04  # slot IDs: slot i uses byte 0x04+i (supports up to N=28 slots before 0x20)
-                  # For N>28, slot IDs wrap around — still unique per position mod 28.
-                  # In practice N<=32, so use 0x04..0x23 (some overlap with DATA_LO=0x20).
-                  # Use SLOT_BASE + (i % 28) to stay below DATA_LO.
-
-# Data bytes are in [DATA_LO, 256)
-DATA_LO = 0x20
+STX = 0x02
+ETX = 0x03
+NUL = 0x00
+SLOT_BASE = 0x04
+DATA_LO   = 0x20   # legacy: data restricted to [0x20, 0xFF]
 
 
 def make_slot_ids(N: int) -> list[int]:
-    """Return list of N unique slot ID tokens in range [0x04, 0x20).
-    For N>28, IDs wrap modulo 28 (still differentiable by position mod 28).
-    """
+    """Legacy v1 slot IDs in [0x04, 0x20). Wraps mod 28 for N>28."""
     return [(SLOT_BASE + (i % (DATA_LO - SLOT_BASE))) for i in range(N)]
+
+
+# ---------------------------------------------------------------------------
+# Tag-based scheme: multi-byte markers, NO data byte restrictions
+# ---------------------------------------------------------------------------
+# Data range: ALL 256 bytes [0x00, 0xFF]. The model distinguishes protocol
+# from data purely via position (YaRN) and context — not by byte value.
+#
+# Tags use printable ASCII bytes from the existing 256-token vocab:
+#   MEM_OPEN  = '<m>'  = [0x3C, 0x6D, 0x3E]          (3 bytes)
+#   MEM_CLOSE = '</m>' = [0x3C, 0x2F, 0x6D, 0x3E]    (4 bytes)
+#
+# Sequence format:
+#   [x_S (L_S) | '<m>' (3) | slot_tokens (N) | '</m>' (4) | Y (L_y)]
+#   L = L_S + 3 + N + 4 + L_y = L_S + N + L_y + 7
+#
+# Slot styles (ablation):
+#   'zeros': all N slot tokens = 0x00  → YaRN position alone routes
+#   'seq':   slot i = i % 256          → position + token identity route
+# ---------------------------------------------------------------------------
+
+MEM_OPEN  = [0x3C, 0x6D, 0x3E]           # '<m>'
+MEM_CLOSE = [0x3C, 0x2F, 0x6D, 0x3E]    # '</m>'
+MEM_OPEN_LEN  = len(MEM_OPEN)            # 3
+MEM_CLOSE_LEN = len(MEM_CLOSE)           # 4
+MEM_OVERHEAD  = MEM_OPEN_LEN + MEM_CLOSE_LEN  # 7
+
+
+def make_slot_ids_tag(N: int, style: str = 'seq') -> list[int]:
+    """
+    Return N slot tokens for tag-based scheme.
+
+    style='zeros': all tokens are 0x00 — positional encoding (YaRN) alone must route.
+    style='seq':   token i = i % 256   — position + token identity both available.
+    """
+    if style == 'zeros':
+        return [0x00] * N
+    elif style == 'seq':
+        return [i % 256 for i in range(N)]
+    else:
+        raise ValueError(f"slot style must be 'zeros' or 'seq', got {style!r}")
+
+
+def make_mask_tag(L_S: int, N: int, L_y: int) -> np.ndarray:
+    """
+    Attention mask for the tag-based scheme.
+
+    Layout:
+      src       [0,         L_S)
+      MEM_OPEN  [L_S,       L_S+3)
+      slots     [L_S+3,     L_S+3+N)
+      MEM_CLOSE [L_S+3+N,   L_S+7+N)
+      Y         [L_S+7+N,   L_S+7+N+L_y)
+
+    Rules (same semantics as make_mask_stage0):
+      1. Y is write-only from outside Y.
+      2. Y cannot attend to src or MEM_OPEN — reads only through slots + MEM_CLOSE.
+    """
+    L        = L_S + MEM_OVERHEAD + N + L_y
+    M_start  = L_S + MEM_OPEN_LEN          # first slot token
+    Y_start  = L_S + MEM_OPEN_LEN + N + MEM_CLOSE_LEN  # first Y token
+
+    rows = np.arange(L)[:, None]
+    cols = np.arange(L)[None, :]
+
+    causal             = cols <= rows
+    is_src_or_open     = cols < M_start    # src + MEM_OPEN tokens
+    is_Y_col           = cols >= Y_start
+    is_Y_row           = rows >= Y_start
+
+    blocked = (is_Y_col & ~is_Y_row) | (is_Y_row & is_src_or_open)
+    visible = causal & ~blocked
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# V2 marker scheme — 2-byte protocol tokens, no data restrictions except 0x00
+# ---------------------------------------------------------------------------
+# Reserves only 0x00 (MARK) as the protocol prefix byte.
+# Data range: [0x01, 0xFF] — all bytes except 0x00.
+# Literal 0x00 in data must be escaped as [MARK, MARK] = [0x00, 0x00].
+#
+# Protocol sequences (2 bytes each, like XML open/close):
+#   [0x00, 0x01]     = <MEM>   open memory block
+#   [0x00, 0x02]     = </MEM>  close memory block
+#   [0x00, 0x03+i]   = slot i  (up to 252 slots for i in 0..251)
+#   [0x00, 0x00]     = escaped literal 0x00 in data
+#
+# Sequence format:
+#   [x_S_encoded | 0x00 0x01 | [0x00 0x03]..[0x00 0x03+N-1] | 0x00 0x02 | Y_encoded]
+#   L = len(x_S_encoded) + 2 + 2N + 2 + len(Y_encoded)
+#   For data with no 0x00 bytes: len(x_S_encoded) = seg_len, L = seg_len + 2N + seg_len + 4
+# ---------------------------------------------------------------------------
+
+MARK_V2      = 0x00   # sole reserved prefix byte
+MEM_OPEN_V2  = 0x01   # [MARK_V2, MEM_OPEN_V2]  = open
+MEM_CLOSE_V2 = 0x02   # [MARK_V2, MEM_CLOSE_V2] = close
+SLOT_BASE_V2 = 0x03   # slot i: [MARK_V2, SLOT_BASE_V2 + i]
+DATA_LO_V2   = 0x01   # valid data bytes are [0x01, 0xFF]; 0x00 must be escaped
+
+MAX_SLOTS_V2 = 252    # 0x03..0xFE (0xFF reserved for future use)
+
+
+def encode_v2(data: bytes | list[int]) -> list[int]:
+    """Encode raw bytes into V2 format: escape 0x00 → [0x00, 0x00]."""
+    out = []
+    for b in data:
+        if b == MARK_V2:
+            out.append(MARK_V2)
+            out.append(MARK_V2)
+        else:
+            out.append(b)
+    return out
+
+
+def decode_v2(tokens: list[int]) -> bytes:
+    """Decode V2-encoded token stream back to original bytes."""
+    out = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i] == MARK_V2 and i + 1 < len(tokens) and tokens[i+1] == MARK_V2:
+            out.append(0x00)
+            i += 2
+        else:
+            out.append(tokens[i])
+            i += 1
+    return bytes(out)
+
+
+def make_slot_ids_v2(N: int) -> list[int]:
+    """
+    Return flat token list for N slots in V2 format.
+    Each slot i is 2 tokens: [MARK_V2, SLOT_BASE_V2 + i].
+    Total length: 2*N tokens.
+    """
+    assert N <= MAX_SLOTS_V2, f"V2 scheme supports up to {MAX_SLOTS_V2} slots, got {N}"
+    tokens = []
+    for i in range(N):
+        tokens.append(MARK_V2)
+        tokens.append(SLOT_BASE_V2 + i)
+    return tokens
+
+
+def make_mem_open_v2() -> list[int]:
+    return [MARK_V2, MEM_OPEN_V2]
+
+
+def make_mem_close_v2() -> list[int]:
+    return [MARK_V2, MEM_CLOSE_V2]
+
+
+def make_mask_stage0_v2(L_S: int, N: int, L_y: int) -> np.ndarray:
+    """
+    Attention mask for V2 (2-byte marker) scheme.
+
+    Sequence layout:
+      [x_S (L_S) | 0x00 0x01 | slots (2N) | 0x00 0x02 | Y (L_y)]
+       src         MEM_OPEN    slot_tokens   MEM_CLOSE    output
+
+    Positions:
+      src:       [0,        L_S)
+      MEM_OPEN:  [L_S,      L_S+2)
+      slots:     [L_S+2,    L_S+2+2N)
+      MEM_CLOSE: [L_S+2+2N, L_S+4+2N)
+      Y:         [L_S+4+2N, L_S+4+2N+L_y)
+
+    Rules (same semantics as v1):
+      1. Y is write-only from outside Y.
+      2. Y cannot see src or MEM_OPEN.
+    """
+    L        = L_S + 4 + 2 * N + L_y
+    M_start  = L_S + 2            # start of slot tokens
+    Y_start  = L_S + 4 + 2 * N   # start of Y tokens
+
+    rows = np.arange(L)[:, None]
+    cols = np.arange(L)[None, :]
+
+    causal           = cols <= rows
+    is_src_or_open   = cols < M_start       # src + MEM_OPEN
+    is_Y_col         = cols >= Y_start
+    is_Y_row         = rows >= Y_start
+
+    block_y_sink     = is_Y_col & ~is_Y_row    # rule 1
+    block_y_sees_src = is_Y_row & is_src_or_open  # rule 2
+
+    blocked = block_y_sink | block_y_sees_src
+    visible = causal & ~blocked
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

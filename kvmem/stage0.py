@@ -103,6 +103,68 @@ def get_L_y(step: int, schedule: list) -> int:
 
 
 # ---------------------------------------------------------------------------
+# RoPE / YaRN positional encoding
+# ---------------------------------------------------------------------------
+
+def _rope_freqs(d_head: int, base: float = 10000.0) -> jax.Array:
+    """Standard RoPE inverse frequencies: (d_head/2,)"""
+    i = jnp.arange(0, d_head, 2, dtype=jnp.float32)
+    return 1.0 / (base ** (i / d_head))
+
+
+def _yarn_freqs(d_head: int, L_train: int, L_max: int,
+                base: float = 10000.0, beta_fast: int = 32,
+                beta_slow: int = 1) -> jax.Array:
+    """
+    YaRN NTK-aware scaled RoPE frequencies (arXiv:2309.00071).
+
+    For each frequency dimension i:
+      - high-freq (wavelength << L_train): keep original (no scaling)
+      - low-freq  (wavelength >> L_train): interpolate by scale factor s = L_max/L_train
+      - mid-freq: linear ramp between the two
+
+    beta_fast: dim threshold for 'high freq' boundary (default 32)
+    beta_slow: dim threshold for 'low freq'  boundary (default 1)
+    """
+    s      = L_max / L_train          # context extension scale
+    i      = jnp.arange(0, d_head, 2, dtype=jnp.float32)
+    inv_f  = 1.0 / (base ** (i / d_head))   # standard RoPE freqs
+
+    # Wavelength of each frequency at training length
+    wavelength = 2 * math.pi / inv_f
+
+    # Ramp: 0 at high-freq boundary, 1 at low-freq boundary
+    lo = 2 * math.pi * beta_slow
+    hi = 2 * math.pi * beta_fast
+    ramp = jnp.clip((wavelength - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+
+    # Blend: high-freq keeps inv_f, low-freq divides by s (interpolation)
+    inv_f_yarn = (1 - ramp) * inv_f + ramp * (inv_f / s)
+    return inv_f_yarn
+
+
+def _apply_rope(x: jax.Array, freqs: jax.Array) -> jax.Array:
+    """
+    Apply rotary embeddings to x: (L, d_head).
+    freqs: (d_head/2,) — per-dimension inverse frequencies.
+    """
+    L, dh = x.shape
+    pos   = jnp.arange(L, dtype=jnp.float32)
+    # angles: (L, d_head/2)
+    angles = pos[:, None] * freqs[None, :]
+    cos_a  = jnp.cos(angles)  # (L, dh/2)
+    sin_a  = jnp.sin(angles)
+
+    x1 = x[:, 0::2]   # even dims
+    x2 = x[:, 1::2]   # odd dims
+    rx1 = x1 * cos_a - x2 * sin_a
+    rx2 = x1 * sin_a + x2 * cos_a
+
+    # Interleave back: (L, dh)
+    return jnp.stack([rx1, rx2], axis=-1).reshape(L, dh)
+
+
+# ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
@@ -111,13 +173,19 @@ class MHAttention(eqx.Module):
     W_K: jax.Array
     W_V: jax.Array
     W_O: jax.Array
-    n_heads: int = eqx.field(static=True)
-    d_head:  int = eqx.field(static=True)
+    n_heads:  int        = eqx.field(static=True)
+    d_head:   int        = eqx.field(static=True)
+    rope:     bool       = eqx.field(static=True)
+    # RoPE frequencies stored as static (not a learned parameter)
+    rope_freqs: jax.Array | None = eqx.field(static=True)
 
-    def __init__(self, d: int, n_heads: int, key: jax.Array):
-        self.n_heads = n_heads
-        self.d_head  = d // n_heads
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+    def __init__(self, d: int, n_heads: int, key: jax.Array,
+                 rope: bool = False, rope_freqs: jax.Array | None = None):
+        self.n_heads     = n_heads
+        self.d_head      = d // n_heads
+        self.rope        = rope
+        self.rope_freqs  = rope_freqs
+        k1, k2, k3, k4  = jax.random.split(key, 4)
         scale = math.sqrt(2.0 / d)
         self.W_Q = jax.random.normal(k1, (d, d)) * scale
         self.W_K = jax.random.normal(k2, (d, d)) * scale
@@ -132,6 +200,12 @@ class MHAttention(eqx.Module):
         Q = (x @ self.W_Q.T).reshape(L, H, dh).transpose(1, 0, 2)  # (H, L, dh)
         K = (x @ self.W_K.T).reshape(L, H, dh).transpose(1, 0, 2)
         V = (x @ self.W_V.T).reshape(L, H, dh).transpose(1, 0, 2)
+
+        if self.rope and self.rope_freqs is not None:
+            # Apply RoPE to each head independently: vmap over H dim
+            apply = lambda q, k: (_apply_rope(q, self.rope_freqs),
+                                   _apply_rope(k, self.rope_freqs))
+            Q, K = jax.vmap(apply)(Q, K)
 
         attn = (Q @ K.transpose(0, 2, 1)) * (dh ** -0.5) + mask[None]  # (H, L, L)
         attn = jax.nn.softmax(attn, axis=-1)
@@ -151,7 +225,10 @@ class FFN(eqx.Module):
         self.W2 = jax.random.normal(k2, (d, d_ff)) * scale2
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        return jax.nn.gelu(x @ self.W1.T) @ self.W2.T
+        h = x @ self.W1.T
+        # tanh-GELU approximation — avoids jax.nn.gelu which lacks MPS vmap support
+        h = 0.5 * h * (1.0 + jnp.tanh(0.7978845608028654 * (h + 0.044715 * h ** 3)))
+        return h @ self.W2.T
 
 
 class TransformerBlock(eqx.Module):
@@ -160,10 +237,11 @@ class TransformerBlock(eqx.Module):
     norm2: eqx.nn.LayerNorm
     ffn:   FFN
 
-    def __init__(self, d: int, n_heads: int, d_ff: int, key: jax.Array):
+    def __init__(self, d: int, n_heads: int, d_ff: int, key: jax.Array,
+                 rope: bool = False, rope_freqs: jax.Array | None = None):
         k1, k2 = jax.random.split(key)
         self.norm1 = eqx.nn.LayerNorm(d)
-        self.attn  = MHAttention(d, n_heads, k1)
+        self.attn  = MHAttention(d, n_heads, k1, rope=rope, rope_freqs=rope_freqs)
         self.norm2 = eqx.nn.LayerNorm(d)
         self.ffn   = FFN(d, d_ff, k2)
 
@@ -180,18 +258,39 @@ class KVMemModel(eqx.Module):
     W_out:    jax.Array          # (V, d) untied
 
     def __init__(self, V: int, d: int, n_layers: int, n_heads: int,
-                 d_ff: int, key: jax.Array):
+                 d_ff: int, key: jax.Array,
+                 rope: bool = False, yarn: bool = False,
+                 L_train: int = 512, L_max: int = 4096):
+        """
+        rope: enable RoPE positional encoding
+        yarn: use YaRN frequency scaling instead of standard RoPE
+              (only applies when rope=True)
+        L_train: context length the model is trained at (for YaRN scaling)
+        L_max:   maximum context length at inference (for YaRN scaling)
+        """
         keys = jax.random.split(key, n_layers + 2)
         self.embed    = eqx.nn.Embedding(V, d, key=keys[0])
-        self.blocks   = [TransformerBlock(d, n_heads, d_ff, keys[1 + i])
-                         for i in range(n_layers)]
         self.norm_out = eqx.nn.LayerNorm(d)
         scale         = math.sqrt(2.0 / d)
         self.W_out    = jax.random.normal(keys[-1], (V, d)) * scale
 
+        # Build RoPE / YaRN frequencies (static, shared across all layers)
+        d_head    = d // n_heads
+        if rope:
+            if yarn:
+                rope_freqs = _yarn_freqs(d_head, L_train=L_train, L_max=L_max)
+            else:
+                rope_freqs = _rope_freqs(d_head)
+        else:
+            rope_freqs = None
+
+        self.blocks = [TransformerBlock(d, n_heads, d_ff, keys[1 + i],
+                                        rope=rope, rope_freqs=rope_freqs)
+                       for i in range(n_layers)]
+
     def __call__(self, tokens: jax.Array, mask: jax.Array) -> jax.Array:
         """tokens: (L,) int32, mask: (L, L) -> logits (L, V)"""
-        x = jax.vmap(self.embed)(tokens)   # embed each token scalar separately
+        x = jax.vmap(self.embed)(tokens)
         for block in self.blocks:
             x = block(x, mask)
         x = jax.vmap(self.norm_out)(x)
@@ -209,6 +308,10 @@ def build_model(hp: dict, key: jax.Array) -> KVMemModel:
     return KVMemModel(
         V=hp['V'], d=hp['d'], n_layers=hp['n_layers'],
         n_heads=hp['n_heads'], d_ff=hp['d_ff'], key=key,
+        rope=hp.get('rope', False),
+        yarn=hp.get('yarn', False),
+        L_train=hp.get('L_train', hp.get('seg_len', 512)),
+        L_max=hp.get('L_max', hp.get('seg_len', 512) * 8),
     )
 
 
@@ -656,7 +759,7 @@ def _eval_recall_on_file(model, corpus_path: str, seg_len: int, N: int,
     return 100.0 * correct / max(total, 1)
 
 
-def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs'):
+def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs', device: str = 'cpu'):
     """
     Train model for general copy/recall using SYNTHETIC RANDOM BYTES only.
     No real text seen during training.
@@ -677,11 +780,17 @@ def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs'):
     ckpt_every   = hp['ckpt_every']
     log_every    = hp['log_every']
 
-    key = jax.random.PRNGKey(hp['seed'])
-    key, mkey = jax.random.split(key)
-    model     = build_model(hp, mkey)
+    _cpu = jax.devices('cpu')[0]
+    _dev = jax.devices('mps')[0] if device == 'mps' else _cpu
     optimizer = hp.get('optimizer', 'adamw')
-    opt_state = init_opt_state(model, optimizer=optimizer)
+    with jax.default_device(_cpu):
+        key = jax.random.PRNGKey(hp['seed'])
+        key, mkey = jax.random.split(key)
+        model     = build_model(hp, mkey)
+        opt_state = init_opt_state(model, optimizer=optimizer)
+    if _dev != _cpu:
+        model     = jax.device_put(model, _dev)
+        opt_state = jax.device_put(opt_state, _dev)
 
     run_dir  = setup_run_dir(log_base, 'recall')
     ckpt_dir = os.path.join(run_dir, 'checkpoints')
@@ -703,7 +812,7 @@ def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs'):
         json.dump({**hp, 'test_files': test_files}, f, indent=2)
 
     pcount   = count_params(model)
-    mask_jnp = jnp.array(make_mask_stage0(seg_len, N, seg_len))
+    mask_jnp = jax.device_put(jnp.array(make_mask_stage0(seg_len, N, seg_len)), _dev)
     L_seq    = seg_len + 2 + N + seg_len
     ETX_pos  = seg_len + 1 + N
 
@@ -713,7 +822,7 @@ def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs'):
     _log(f'  Test files: {test_files}')
     _log(f'  Params: {pcount["total"]:,}')
     _log(f'  seg_len={seg_len}  N={N}  KV_floats={2*hp["n_layers"]*N*hp["d"]:,}')
-    _log(f'  Steps={n_steps}  Batch={B}  Optimizer={hp.get("optimizer","adamw")}')
+    _log(f'  Steps={n_steps}  Batch={B}  Optimizer={hp.get("optimizer","adamw")}  Device={_dev}')
 
     rng = np.random.default_rng(hp['seed'] + 1)
     t0  = time.time()
@@ -757,7 +866,7 @@ def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs'):
 
     for step in pbar:
         np_tokens = _make_synthetic_recall_batch(rng, B, seg_len, N)
-        tokens    = jnp.array(np_tokens)
+        tokens    = jax.device_put(jnp.array(np_tokens), _dev)
         lr        = lr_schedule(step, hp)
         model, opt_state, loss = _step_jit(model, opt_state, tokens, step, lr)
 
@@ -817,12 +926,17 @@ def train_recall(hp: dict, test_files: list[str], log_base: str = 'logs'):
 
 
 def train(hp: dict, baseline: bool = False, sanity: bool = False,
-          recall: bool = False, log_base: str = 'logs'):
-    key = jax.random.PRNGKey(hp['seed'])
-    key, mkey = jax.random.split(key)
-
-    model     = build_model(hp, mkey)
-    opt_state = init_opt_state(model, optimizer=hp.get('optimizer', 'adamw'))
+          recall: bool = False, log_base: str = 'logs', device: str = 'cpu'):
+    _cpu = jax.devices('cpu')[0]
+    _dev = jax.devices('mps')[0] if device == 'mps' else _cpu
+    with jax.default_device(_cpu):
+        key = jax.random.PRNGKey(hp['seed'])
+        key, mkey = jax.random.split(key)
+        model     = build_model(hp, mkey)
+        opt_state = init_opt_state(model, optimizer=hp.get('optimizer', 'adamw'))
+    if _dev != _cpu:
+        model     = jax.device_put(model, _dev)
+        opt_state = jax.device_put(opt_state, _dev)
 
     L_S          = hp['L_S']
     N_set        = hp['N_set']
@@ -910,7 +1024,7 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False,
             for N in N_set) + '\n'
     optimizer_name = hp.get('optimizer', 'adamw')
     header += f'  Steps: {n_steps:,}  Batch: {B}  L_y curriculum: {L_y_schedule}\n'
-    header += f'  Optimizer: {optimizer_name}\n'
+    header += f'  Optimizer: {optimizer_name}  Device: {_dev}\n'
     header += f'  Logs  -> {run_dir}/train.log\n'
     header += f'  JSONL -> {run_dir}/train.jsonl  (tail -f to follow)\n'
     _log(header)
@@ -979,13 +1093,13 @@ def train(hp: dict, baseline: bool = False, sanity: bool = False,
         if L_cur < L_max:
             pad = np.zeros((B, L_max - L_cur), dtype=np.int32)  # NUL padding
             np_tokens = np.concatenate([np_tokens, pad], axis=1)
-        tokens = jnp.array(np_tokens)
+        tokens = jax.device_put(jnp.array(np_tokens), _dev)
         if baseline:
-            mask = jnp.array(mask_cache[L_y])
+            mask = jax.device_put(jnp.array(mask_cache[L_y]), _dev)
         elif recall:
-            mask = jnp.array(mask_cache[N])
+            mask = jax.device_put(jnp.array(mask_cache[N]), _dev)
         else:
-            mask = jnp.array(mask_cache[(N, L_y)])
+            mask = jax.device_put(jnp.array(mask_cache[(N, L_y)]), _dev)
 
         lr = lr_schedule(step, hp)
         model, opt_state, loss, (l_src, l_cont) = train_step_fn(
@@ -1614,6 +1728,8 @@ def main():
                          help='Optimizer: adamw (default) | grokadamw (SNR-gated, arXiv:2605.01172)')
     p_train.add_argument('--grok-rho',  type=float, default=0.9,
                          help='GrokAdamW: EMA decay for squared-deviation state (default 0.9)')
+    p_train.add_argument('--device',    type=str,   default='cpu', choices=['cpu', 'mps'],
+                         help='Device to train on (default: cpu)')
 
     # --- recall-corpus ---
     p_rc = sub.add_parser('recall-corpus',
@@ -1635,6 +1751,8 @@ def main():
     p_rc.add_argument('--grok-rho',  type=float, default=0.95)
     p_rc.add_argument('--wd',        type=float, default=None,
                       help='Weight decay (default: 0.1 for grokking)')
+    p_rc.add_argument('--device',   type=str,   default='cpu', choices=['cpu', 'mps'],
+                      help='Device to train on (default: cpu)')
 
     # --- eval ---
     p_eval = sub.add_parser('eval')
@@ -1687,7 +1805,8 @@ def main():
             hp['wd'] = args.wd
         if args.steps:
             hp['n_steps'] = args.steps
-        train_recall(hp, test_files=args.test_files, log_base=args.log_dir)
+        train_recall(hp, test_files=args.test_files, log_base=args.log_dir,
+                     device=args.device)
         return
 
     if args.cmd == 'train':
@@ -1700,7 +1819,8 @@ def main():
         model, run_dir = train(hp, baseline=args.baseline,
                                sanity=getattr(args, 'sanity', False),
                                recall=getattr(args, 'recall', False),
-                               log_base=args.log_dir)
+                               log_base=args.log_dir,
+                               device=getattr(args, 'device', 'cpu'))
         # Auto-test on suratalfatihah.txt after training completes
         if not args.baseline and not getattr(args, 'sanity', False) and not getattr(args, 'recall', False) and os.path.exists(FATIHAH_PATH):
             print('\n\n' + '═' * 62)
