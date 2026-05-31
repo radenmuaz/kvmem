@@ -19,13 +19,9 @@ Usage:
 JAX note: set JAX_PLATFORMS=cpu before import (MPS has no PRNG support).
 """
 
-import os
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-
 import argparse
 import json
 import math
-import time
 from pathlib import Path
 from typing import Tuple
 
@@ -34,6 +30,7 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax
 import numpy as np
+from tqdm import tqdm
 
 from data import ByteDataset
 from codec import ByteEncoder, ByteDecoder
@@ -158,45 +155,35 @@ def compute_loss(
 
 
 # ---------------------------------------------------------------------------
-# BPB computation
+# Val eval on a raw text file (suratalfatihah.txt)
 # ---------------------------------------------------------------------------
 
-def compute_bpb(
+def eval_on_file(
     system: LatentARSystem,
-    val_dataset: ByteDataset,
+    path: str,
     T: int,
-    n_batches: int = 32,
-    rng: np.random.Generator = None,
+    compute_device,
 ) -> dict:
     """
-    Compute bits-per-byte on val set.
-    BPB = total_loss / ln(2)  (both rec and pred contribute).
-    Also report them separately.
+    Load a raw text file, chunk into (B, T, K) and compute loss on the full file.
+    Returns BPB (total, rec, pred) and nats.
     """
-    if rng is None:
-        rng = np.random.default_rng(0)
-
     K = system.K
-    total_loss_acc = rec_acc = pred_acc = 0.0
+    raw = np.frombuffer(Path(path).read_bytes(), dtype=np.uint8).astype(np.int32)
+    n_chunks = len(raw) // K
+    T_use = min(T, max(2, n_chunks - 1))        # at least 2 chunks for pred shift
+    n_seqs = max(1, n_chunks // T_use)
+    arr = raw[: n_seqs * T_use * K].reshape(n_seqs, T_use, K)
 
-    for _ in range(n_batches):
-        raw = val_dataset.random_batch(8, rng)           # (8, T*K+1)
-        chunks_flat = raw[:, : T * K].astype(np.int32)
-        chunks = chunks_flat.reshape(8, T, K)
-        jchunks = jnp.array(chunks)
-        total, (rec, pred) = compute_loss(system, jchunks)
-        total_loss_acc += float(total)
-        rec_acc += float(rec)
-        pred_acc += float(pred)
+    with jax.default_device(compute_device):
+        batch = jax.device_put(jnp.array(arr), compute_device)
+        total, (rec, pred) = compute_loss(system, batch)
 
-    n = n_batches
     return {
-        "bpb_total": total_loss_acc / n / math.log(2),
-        "bpb_rec":   rec_acc / n / math.log(2),
-        "bpb_pred":  pred_acc / n / math.log(2),
-        "nats_total": total_loss_acc / n,
-        "nats_rec":   rec_acc / n,
-        "nats_pred":  pred_acc / n,
+        "bpb":      float(total) / math.log(2),
+        "bpb_rec":  float(rec)   / math.log(2),
+        "bpb_pred": float(pred)  / math.log(2),
+        "nats":     float(total),
     }
 
 
@@ -297,9 +284,10 @@ def generate_grounded(
 
 def train(
     data_dir: str,
+    val_file: str = "../datasets/suratalfatihah.txt",
     bottleneck: str = "bsq",
     K: int = 8,
-    T: int = 64,                # latent sequence length (= T*K bytes context)
+    T: int = 64,
     batch_size: int = 32,
     d_q: int = 18,
     d_model: int = 128,
@@ -309,78 +297,88 @@ def train(
     total_steps: int = 5000,
     warmup_steps: int = 200,
     grad_clip: float = 1.0,
-    log_every: int = 100,
     eval_every: int = 500,
     seed: int = 0,
 ):
+    # --- Devices: random always on CPU, compute on MPS if available ---
+    cpu = jax.devices("cpu")[0]
+    try:
+        compute_device = jax.devices("mps")[0]
+        print(f"Compute device: {compute_device}")
+    except Exception:
+        compute_device = cpu
+        print("MPS not available, using CPU")
+
     rng = np.random.default_rng(seed)
-    key = jax.random.PRNGKey(seed)
 
-    # Load dataset
+    # --- Dataset ---
     train_ds = ByteDataset(str(Path(data_dir) / "train.npy"), seq_len=T * K)
-    val_ds   = ByteDataset(str(Path(data_dir) / "val.npy"),   seq_len=T * K)
-
     with open(Path(data_dir) / "meta.json") as f:
         meta = json.load(f)
-    print(f"Dataset: {meta['train_bytes']:,} train bytes, {meta['val_bytes']:,} val bytes")
+    print(f"Train: {meta['train_bytes']:,} bytes  |  Val: {val_file}")
 
-    # Build system
+    # --- Build system on CPU (uses random) ---
     L = {"bsq": 2, "fsq2": 2, "fsq8": 8}[bottleneck]
-    system = LatentARSystem(
-        K=K, d_byte=16, d_enc=128, enc_hidden=(256,),
-        d_q=d_q, bottleneck=bottleneck if bottleneck != "fsq2" else "fsq",
-        L=L,
-        d_model=d_model, n_layers=n_layers, n_heads=n_heads,
-        dec_hidden=(256,),
-        key=key,
-    )
-    print(f"System params: {system.param_count():,}")
-    print(f"Bottleneck: {bottleneck}  d_q={d_q}  codebook=2^{d_q if bottleneck in ('bsq','fsq2') else d_q * int(math.log2(L))}")
+    bn = "bsq" if bottleneck == "bsq" else "fsq"
+    codebook_bits = d_q if bottleneck in ("bsq", "fsq2") else d_q * int(math.log2(L))
 
-    # Optimizer: AdamW with cosine LR + warmup
+    with jax.default_device(cpu):
+        key = jax.random.PRNGKey(seed)
+        system = LatentARSystem(
+            K=K, d_byte=16, d_enc=128, enc_hidden=(256,),
+            d_q=d_q, bottleneck=bn, L=L,
+            d_model=d_model, n_layers=n_layers, n_heads=n_heads,
+            dec_hidden=(256,),
+            key=key,
+        )
+    print(f"Params: {system.param_count():,}  |  {bottleneck} d_q={d_q} codebook=2^{codebook_bits}")
+
+    # --- Optimizer (init on CPU, transfer to compute device with model) ---
     schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=lr,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
-        end_value=lr * 0.1,
+        init_value=0.0, peak_value=lr,
+        warmup_steps=warmup_steps, decay_steps=total_steps, end_value=lr * 0.1,
     )
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(grad_clip),
-        optax.adamw(schedule, weight_decay=0.1),
-    )
+    optimizer = optax.chain(optax.clip_by_global_norm(grad_clip), optax.adamw(schedule, weight_decay=0.1))
     opt_state = optimizer.init(eqx.filter(system, eqx.is_array))
 
-    # Training
-    t0 = time.time()
-    for step in range(1, total_steps + 1):
-        raw = train_ds.random_batch(batch_size, rng)           # (B, T*K+1)
-        chunks = raw[:, : T * K].reshape(batch_size, T, K).astype(np.int32)
-        jchunks = jnp.array(chunks)
+    # Transfer model and optimizer state to compute device
+    system   = jax.device_put(system,    compute_device)
+    opt_state = jax.device_put(opt_state, compute_device)
 
-        system, opt_state, total, rec, pred = train_step(
-            system, opt_state, optimizer, jchunks
-        )
-        total, rec, pred = float(total), float(rec), float(pred)
+    # --- Training loop ---
+    with tqdm(total=total_steps, desc=bottleneck, unit="step") as pbar:
+        for step in range(1, total_steps + 1):
+            # Build batch on CPU, transfer to compute device
+            raw = train_ds.random_batch(batch_size, rng)
+            chunks_np = raw[:, : T * K].reshape(batch_size, T, K).astype(np.int32)
 
-        if step % log_every == 0:
-            elapsed = time.time() - t0
-            lr_now = float(schedule(step))
-            print(
-                f"step {step:5d}  "
-                f"loss={float(total):.4f}  rec={float(rec):.4f}  pred={float(pred):.4f}  "
-                f"bpb≈{float(total)/math.log(2):.3f}  "
-                f"lr={lr_now:.2e}  {elapsed:.1f}s"
+            with jax.default_device(compute_device):
+                chunks = jax.device_put(jnp.array(chunks_np), compute_device)
+                system, opt_state, total, rec, pred = train_step(
+                    system, opt_state, optimizer, chunks
+                )
+
+            total, rec, pred = float(total), float(rec), float(pred)
+            bpb = total / math.log(2)
+
+            pbar.set_postfix(
+                loss=f"{total:.4f}",
+                bpb=f"{bpb:.3f}",
+                rec=f"{rec:.4f}",
+                pred=f"{pred:.4f}",
+                refresh=False,
             )
+            pbar.update(1)
 
-        if step % eval_every == 0:
-            metrics = compute_bpb(system, val_ds, T, n_batches=16, rng=rng)
-            print(
-                f"  [val]  bpb={metrics['bpb_total']:.4f}  "
-                f"bpb_rec={metrics['bpb_rec']:.4f}  bpb_pred={metrics['bpb_pred']:.4f}"
-            )
+            if step % eval_every == 0:
+                m = eval_on_file(system, val_file, T, compute_device)
+                tqdm.write(
+                    f"  [val step {step}]"
+                    f"  bpb={m['bpb']:.4f}"
+                    f"  rec={m['bpb_rec']:.4f}"
+                    f"  pred={m['bpb_pred']:.4f}"
+                )
 
-    print(f"\nTraining done in {time.time()-t0:.1f}s")
     return system
 
 
@@ -390,25 +388,26 @@ def train(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data",        default="data/quran", help="data dir from data.py")
-    parser.add_argument("--bottleneck",  default="bsq",        choices=["bsq", "fsq2", "fsq8"])
-    parser.add_argument("--K",           type=int, default=8,   help="bytes per latent chunk")
-    parser.add_argument("--T",           type=int, default=64,  help="latent sequence length")
-    parser.add_argument("--batch_size",  type=int, default=32)
-    parser.add_argument("--d_q",         type=int, default=18)
-    parser.add_argument("--d_model",     type=int, default=128)
-    parser.add_argument("--n_layers",    type=int, default=4)
-    parser.add_argument("--n_heads",     type=int, default=4)
-    parser.add_argument("--lr",          type=float, default=3e-4)
-    parser.add_argument("--steps",       type=int, default=5000)
-    parser.add_argument("--warmup",      type=int, default=200)
-    parser.add_argument("--log_every",   type=int, default=100)
-    parser.add_argument("--eval_every",  type=int, default=500)
-    parser.add_argument("--seed",        type=int, default=0)
+    parser.add_argument("--data",       default="data/quran",                     help="data dir from data.py")
+    parser.add_argument("--val_file",   default="../datasets/suratalfatihah.txt",  help="raw text file for val eval")
+    parser.add_argument("--bottleneck", default="bsq", choices=["bsq", "fsq2", "fsq8"])
+    parser.add_argument("--K",          type=int,   default=8)
+    parser.add_argument("--T",          type=int,   default=64)
+    parser.add_argument("--batch_size", type=int,   default=32)
+    parser.add_argument("--d_q",        type=int,   default=18)
+    parser.add_argument("--d_model",    type=int,   default=128)
+    parser.add_argument("--n_layers",   type=int,   default=4)
+    parser.add_argument("--n_heads",    type=int,   default=4)
+    parser.add_argument("--lr",         type=float, default=3e-4)
+    parser.add_argument("--steps",      type=int,   default=5000)
+    parser.add_argument("--warmup",     type=int,   default=200)
+    parser.add_argument("--eval_every", type=int,   default=500)
+    parser.add_argument("--seed",       type=int,   default=0)
     args = parser.parse_args()
 
     train(
         data_dir=args.data,
+        val_file=args.val_file,
         bottleneck=args.bottleneck,
         K=args.K,
         T=args.T,
@@ -420,7 +419,6 @@ if __name__ == "__main__":
         lr=args.lr,
         total_steps=args.steps,
         warmup_steps=args.warmup,
-        log_every=args.log_every,
         eval_every=args.eval_every,
         seed=args.seed,
     )
