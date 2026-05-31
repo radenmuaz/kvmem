@@ -119,49 +119,71 @@ def make_test_sequences(seg_len: int) -> dict[str, list[int]]:
 # The model must learn the general copy algorithm, not pattern-specific shortcuts.
 # ---------------------------------------------------------------------------
 
+def _sample_seg(rng: np.random.Generator, seg_len: int) -> np.ndarray:
+    """Sample one random source sequence of length seg_len, full [0x00, 0xFF]."""
+    dist_type = int(rng.integers(0, 4))
+    if dist_type == 0:
+        return rng.integers(0, 256, size=seg_len).astype(np.int32)
+    elif dist_type == 1:
+        alpha = float(rng.uniform(0.05, 1.0))
+        p     = rng.dirichlet(np.ones(256) * alpha)
+        return rng.choice(256, size=seg_len, p=p).astype(np.int32)
+    elif dist_type == 2:
+        width = int(rng.integers(4, 129))
+        lo    = int(rng.integers(0, 256 - width + 1))
+        return rng.integers(lo, lo + width, size=seg_len).astype(np.int32)
+    else:
+        p_g = float(rng.uniform(0.01, 0.3))
+        return np.clip(rng.geometric(p_g, size=seg_len) - 1, 0, 255).astype(np.int32)
+
+
 def _make_synthetic_batch(rng: np.random.Generator, B: int,
                           seg_len: int, N: int,
-                          slot_style: str = 'seq') -> np.ndarray:
+                          slot_style: str = 'seq',
+                          chunk_len: int = 0) -> np.ndarray:
     """
-    Tag-based training batch. Full byte range [0x00, 0xFF]. Y = exact copy of x_S.
+    Tag-based training batch. Full byte range [0x00, 0xFF].
 
-    Format: [x_S | '<m>' | slot_tokens (N) | '</m>' | Y]
-    L = seg_len + 3 + N + 4 + seg_len = 2*seg_len + N + 7
+    chunk_len=0 (default): full-sequence recall.
+      Format: [x_S | <m> | slots | </m> | x_S]
+      L = 2*seg_len + N + 7
 
-    slot_style='zeros': all slot tokens = 0x00 (YaRN position alone routes)
-    slot_style='seq':   slot i = i % 256 (position + token identity routes)
-
-    Training data: uniform random bytes over full [0x00, 0xFF]. No restrictions.
-    4 distributions: uniform, Dirichlet-skewed, sub-range, geometric.
+    chunk_len>0: random-window recall.
+      Pick random y_start, warmup = x_S[y_start-1] (or x_S[0] at start).
+      Format: [x_S | <m> | slots | </m> | warmup | x_S[y_start:y_start+chunk_len]]
+      L = seg_len + N + 7 + 1 + chunk_len
+      Supervise: chunk_len tokens after warmup (not the warmup itself).
     """
     slot_ids = make_slot_ids_tag(N, slot_style)
-    L        = seg_len + MEM_OVERHEAD + N + seg_len
     M_start  = seg_len + MEM_OPEN_LEN
     Y_start  = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN
-    out      = np.empty((B, L), dtype=np.int32)
 
-    for i in range(B):
-        dist_type = int(rng.integers(0, 4))
-        if dist_type == 0:
-            seg = rng.integers(0, 256, size=seg_len).astype(np.int32)
-        elif dist_type == 1:
-            alpha = float(rng.uniform(0.05, 1.0))
-            p     = rng.dirichlet(np.ones(256) * alpha)
-            seg   = rng.choice(256, size=seg_len, p=p).astype(np.int32)
-        elif dist_type == 2:
-            width = int(rng.integers(4, 129))
-            lo    = int(rng.integers(0, 256 - width + 1))
-            seg   = rng.integers(lo, lo + width, size=seg_len).astype(np.int32)
-        else:
-            p_g = float(rng.uniform(0.01, 0.3))
-            raw = rng.geometric(p_g, size=seg_len) - 1
-            seg = np.clip(raw, 0, 255).astype(np.int32)
-
-        out[i, :seg_len]                = seg
-        out[i, seg_len:M_start]         = MEM_OPEN
-        out[i, M_start:M_start+N]       = slot_ids
-        out[i, M_start+N:Y_start]       = MEM_CLOSE
-        out[i, Y_start:]                = seg
+    if chunk_len == 0:
+        L   = seg_len + MEM_OVERHEAD + N + seg_len
+        out = np.empty((B, L), dtype=np.int32)
+        for i in range(B):
+            seg = _sample_seg(rng, seg_len)
+            out[i, :seg_len]          = seg
+            out[i, seg_len:M_start]   = MEM_OPEN
+            out[i, M_start:M_start+N] = slot_ids
+            out[i, M_start+N:Y_start] = MEM_CLOSE
+            out[i, Y_start:]          = seg
+    else:
+        # Random window: [x_S | <m> | slots | </m> | warmup(1) | window(chunk_len)]
+        L   = seg_len + MEM_OVERHEAD + N + 1 + chunk_len
+        out = np.zeros((B, L), dtype=np.int32)
+        n_windows = seg_len - chunk_len   # y_start in [0, seg_len-chunk_len]
+        for i in range(B):
+            seg     = _sample_seg(rng, seg_len)
+            y_start = int(rng.integers(0, max(1, n_windows + 1)))
+            y_end   = min(y_start + chunk_len, seg_len)
+            warmup  = seg[y_start - 1] if y_start > 0 else seg[0]
+            out[i, :seg_len]               = seg
+            out[i, seg_len:M_start]        = MEM_OPEN
+            out[i, M_start:M_start+N]      = slot_ids
+            out[i, M_start+N:Y_start]      = MEM_CLOSE
+            out[i, Y_start]                = warmup
+            out[i, Y_start+1:Y_start+1+(y_end-y_start)] = seg[y_start:y_end]
 
     return out
 
@@ -170,9 +192,15 @@ def _make_synthetic_batch(rng: np.random.Generator, B: int,
 # Mask
 # ---------------------------------------------------------------------------
 
-def make_recall_mask(seg_len: int, N: int, slot_style: str = 'seq') -> np.ndarray:
-    """Tag-based causal mask: [x_S | <m> | slots | </m> | Y]."""
-    return make_mask_tag(seg_len, N, seg_len)
+def make_recall_mask(seg_len: int, N: int,
+                     slot_style: str = 'seq', chunk_len: int = 0) -> np.ndarray:
+    """
+    Tag-based causal mask.
+    chunk_len=0: full Y = seg_len
+    chunk_len>0: Y = 1 (warmup) + chunk_len
+    """
+    L_y = seg_len if chunk_len == 0 else 1 + chunk_len
+    return make_mask_tag(seg_len, N, L_y)
 
 
 # ---------------------------------------------------------------------------
@@ -264,10 +292,19 @@ def train_mini(hp: dict, log_base: str = 'logs', device: str = 'cpu'):
         json.dump(hp, f, indent=2)
 
     slot_style = hp.get('slot_style', 'seq')
+    chunk_len  = hp.get('chunk_len', 0)   # 0 = full-sequence, >0 = random-window
     pcount   = count_params(model)
-    mask_jnp = jax.device_put(jnp.array(make_recall_mask(seg_len, N, slot_style)), _dev)
-    L_total  = seg_len + MEM_OVERHEAD + N + seg_len
-    Y_start  = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN  # first Y token
+    mask_jnp = jax.device_put(jnp.array(make_recall_mask(seg_len, N, slot_style, chunk_len)), _dev)
+    if chunk_len == 0:
+        L_total = seg_len + MEM_OVERHEAD + N + seg_len
+        Y_start = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN
+        # Supervise all Y positions
+        Y_sup_len = seg_len
+    else:
+        L_total   = seg_len + MEM_OVERHEAD + N + 1 + chunk_len
+        Y_start   = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN
+        # Supervise chunk_len positions after warmup (not warmup itself)
+        Y_sup_len = chunk_len
 
     test_seqs = make_test_sequences(seg_len)
 
@@ -276,7 +313,8 @@ def train_mini(hp: dict, log_base: str = 'logs', device: str = 'cpu'):
     _log(f'  cmd: {" ".join(sys.argv)}')
     _log(f'  Model: d={hp["d"]}  n_layers={hp["n_layers"]}  params={pcount["total"]:,}')
     _log(f'  seg_len={seg_len}  N={N}  warmup_n={warmup_n}')
-    _log(f'  slot_style={slot_style}  format: <m> + slots + </m>  L_total={L_total}')
+    mode_str = f'random-window chunk={chunk_len}' if chunk_len > 0 else 'full-sequence'
+    _log(f'  slot_style={slot_style}  mode={mode_str}  L_total={L_total}')
     _log(f'  Steps={n_steps}  Batch={B}  lr={lr_max}  wd={wd}  device={_dev}')
     _log(f'  Train: RANDOM bytes [0x00..0xFF] — uniform/Dirichlet/sub-range/geometric')
     _log(f'  Test (held out): {list(test_seqs.keys())}')
@@ -296,8 +334,10 @@ def train_mini(hp: dict, log_base: str = 'logs', device: str = 'cpu'):
             tgts   = tokens[:, 1:]
             nll    = -lp[jnp.arange(B_loc)[:, None], jnp.arange(L-1)[None, :], tgts]
             pos       = jnp.arange(L - 1)
-            Y_end     = Y_start + seg_len
-            mask_cont = ((pos >= Y_start) & (pos < Y_end)).astype(jnp.float32)
+            # chunk_len=0: supervise all Y; chunk_len>0: supervise only after warmup
+            Y_sup_start = Y_start + (1 if chunk_len > 0 else 0)
+            Y_end       = Y_sup_start + Y_sup_len
+            mask_cont = ((pos >= Y_sup_start) & (pos < Y_end)).astype(jnp.float32)
             return jnp.sum(nll * mask_cont[None, :]) / (mask_cont.sum() * B_loc + 1e-8)
 
         loss, grads = jax.value_and_grad(_loss)(model)
@@ -318,10 +358,52 @@ def train_mini(hp: dict, log_base: str = 'logs', device: str = 'cpu'):
         return 1e-6 + 0.5 * (lr_max - 1e-6) * (1 + math.cos(math.pi * frac))
 
     log_every = hp.get('log_every', 500)   # cheap loss-only log, no AR eval
+
+    # Pre-generated curriculum dataset (optional)
+    # If hp['dataset_dir'] is set, load .npy files per stage and sample from them.
+    dataset_dir   = hp.get('dataset_dir', None)
+    curriculum    = None   # list of (stage_data, chunk_len_for_stage)
+    curr_stage_idx = 0
+    steps_per_stage = 0
+
+    if dataset_dir:
+        import json
+        meta_path = os.path.join(dataset_dir, 'meta.json')
+        with open(meta_path) as f:
+            meta = json.load(f)
+        stages = meta['stages']
+        steps_per_stage = n_steps // len(stages)
+        curriculum = []
+        for s_chunk in stages:
+            path = os.path.join(dataset_dir, f'stage_chunk{s_chunk}.npy')
+            data = np.load(path)
+            curriculum.append((data, s_chunk))
+            _log(f'  [curriculum] loaded stage chunk={s_chunk}  '
+                 f'n={len(data)}  L={data.shape[1]}')
+        _log(f'  [curriculum] {len(stages)} stages × ~{steps_per_stage} steps each')
+
     pbar = tqdm(range(1, n_steps + 1), desc='mini_recall', dynamic_ncols=True)
 
     for step in pbar:
-        np_tokens = _make_synthetic_batch(rng, B, seg_len, N, slot_style)
+        # Curriculum: switch dataset stage at stage boundaries
+        if curriculum is not None:
+            stage_i = min(step // steps_per_stage, len(curriculum) - 1)
+            if stage_i != curr_stage_idx:
+                curr_stage_idx = stage_i
+                stage_data, stage_chunk = curriculum[curr_stage_idx]
+                _log(f'\n  [curriculum] step={step} → stage {curr_stage_idx} chunk_len={stage_chunk}')
+                # Rebuild mask for new chunk length
+                stage_chunk_len = stage_chunk if stage_chunk < seg_len else 0
+                new_L_y = seg_len if stage_chunk_len == 0 else 1 + stage_chunk_len
+                mask_jnp = jax.device_put(
+                    jnp.array(make_mask_tag(seg_len, N, new_L_y)), _dev)
+
+            # Sample batch from pre-generated data
+            stage_data, _ = curriculum[curr_stage_idx]
+            idx = rng.integers(0, len(stage_data), size=B)
+            np_tokens = stage_data[idx]
+        else:
+            np_tokens = _make_synthetic_batch(rng, B, seg_len, N, slot_style, chunk_len)
         tokens_b  = jax.device_put(jnp.array(np_tokens), _dev)
         lr        = _lr(step)
         model, opt_state, loss = _step(model, opt_state, tokens_b, step, lr)
@@ -425,6 +507,10 @@ def main():
     parser.add_argument('--rope',       action='store_true')
     parser.add_argument('--yarn',       action='store_true',
                         help='YaRN scaled RoPE (requires --rope)')
+    parser.add_argument('--dataset-dir', type=str,  default=None,
+                        help='Pre-generated curriculum dataset dir (from gen_dataset.py)')
+    parser.add_argument('--chunk-len',  type=int,   default=None,
+                        help='Random-window training chunk size (0=full-sequence, default)')
     parser.add_argument('--slot-style', type=str, default=None,
                         choices=['zeros', 'seq'],
                         help='zeros: all-zero slot tokens (YaRN-only routing); '
@@ -454,6 +540,8 @@ def main():
     hp['seed']  = args.seed
     if args.slot_style is not None:
         hp['slot_style'] = args.slot_style
+    if args.chunk_len  is not None: hp['chunk_len']   = args.chunk_len
+    if args.dataset_dir is not None: hp['dataset_dir'] = args.dataset_dir
     # YaRN L_train = full tag sequence length
     seg = hp['seg_len']; N = hp.get('N', seg)
     hp['L_train'] = seg + MEM_OVERHEAD + N + seg

@@ -1,0 +1,12 @@
+{
+  "seg_len": 128,
+  "N": 128,
+  "slot_style": "seq",
+  "stages": [
+    128,
+    64,
+    32
+  ],
+  "n_examples": 50000,
+  "seed": 42
+}

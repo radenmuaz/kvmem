@@ -2,267 +2,221 @@
 
 Experimental workbench for the continuous tokenizer design from `research/LM.md`.
 
-This folder focuses on **Phase 0 and baseline experiments**: a clean byte-level LM with a causal Transformer backbone (RoPE), compared against BPE and raw-byte softmax baselines, before layering in the continuous bottleneck.
+Phase 0 and baseline experiments: byte-level LM and BPE LM with a shared causal Transformer + RoPE backbone, before layering in the continuous bottleneck (BSQ / FSQ).
 
 ---
 
-## Goals
+## Quick start
 
-1. Validate the eval harness (nats / BPB) on two clean baselines.
-2. Find good hyperparameters at 1MB scale before scaling up.
-3. Build reusable dataset and training infrastructure in JAX + Equinox.
+```bash
+# 1. Prepare data (train only)
+python data.py --src ../datasets/quran_uthmani.txt --out data/quran
+
+# 2a. Latent AR baseline (BSQ)
+python lm_train.py --data data/quran --bottleneck bsq
+
+# 2b. BPE baseline (SentencePiece trained on corpus)
+python bpe_train.py --src ../datasets/quran_uthmani.txt --out data/quran
+
+# Override log folder
+python lm_train.py --data data/quran --log_dir logs --run_name my_run --no_date
+```
 
 ---
 
-## Baselines
+## Files
 
-### Baseline A — BPE + softmax (standard LM)
-
-- Tokenize with byte-level BPE (tiktoken `cl100k_base` or train a small vocab on the corpus).
-- Standard causal Transformer, predict next token with cross-entropy.
-- Nats: `mean(-log p(token))` in natural log.
-- BPB: multiply nats per token by `1 / (ln 2 * avg_bytes_per_token)`.
-  `avg_bytes_per_token = total_bytes / total_tokens` on the validation set.
-
-### Baseline B — byte-level softmax (256-way)
-
-- No tokenization; the model predicts the next byte, vocab size 256.
-- Nats: `mean(-log p(byte))`.
-- BPB: `nats / ln(2)`.  Exact, no correction needed.
-
-### Target — continuous tokenizer (cqtok, later phases)
-
-- FSQ bottleneck, chunk K=8 bytes → 1 latent.
-- BPB ≈ LM code cross-entropy when reconstruction ≥ 99.9% (see `research/LM.md §1.7`).
+```
+cqtok/
+  data.py        dataset: load any text/binary file, split, save .npy
+  model.py       causal Transformer + RoPE backbone (shared by all scripts)
+  bsq.py         Binary Spherical Quantization encoder + LM head
+  fsq.py         Finite Scalar Quantization (L=2 and L=8) encoder + LM head
+  codec.py       MLP byte encoder / decoder + ByteAutoencoder
+  lm_train.py    latent autoregression with re-encoded grounding (A-grounded)
+  bpe_train.py   BPE baseline: SentencePiece + causal Transformer
+```
 
 ---
 
-## Backbone: Causal Transformer with RoPE
+## data.py
 
-Both baselines and the cqtok LM share the same backbone to isolate the tokenizer effect.
+Converts any text or binary file to memory-mappable `uint8` `.npy` splits.
 
+### Split modes
+
+| Command | Outputs |
+|---|---|
+| `--src f --out d` | `train.npy` only |
+| `--src f --out d --val N` | `train.npy` + `val.npy` (split at byte N) |
+| `--src f --out d --val N --test M` | `train.npy` + `val.npy` + `test.npy` |
+
+`N` and `M` are byte indices (negative values count from end).  
+`--test` requires `--val`; error raised if `M ≤ N`.
+
+```bash
+# train only
+python data.py --src ../datasets/quran_uthmani.txt --out data/quran
+
+# train + val at byte 1,100,000
+python data.py --src ../datasets/quran_uthmani.txt --out data/quran --val 1100000
+
+# train + val + test
+python data.py --src ../datasets/quran_uthmani.txt --out data/quran \
+    --val 1100000 --test 1300000
+
+# binary file
+python data.py --src myfile.bin --out data/myfile --mode binary --val 900000
 ```
-input tokens  →  embedding  →  [TransformerBlock × L]  →  LM head
-```
 
-Each `TransformerBlock`:
-- Pre-norm (RMSNorm)
-- Causal self-attention with RoPE
-- Pre-norm
-- FFN (gated SwiGLU, expansion 4×)
+`meta.json` always contains `train_bytes`, `val_bytes`, `test_bytes` (0 if not split), plus the raw `val_start`/`test_start` indices.
 
-RoPE replaces learned positional embeddings. For byte-level sequences (long), RoPE's interpolation properties are important; set `theta=10000` initially, raise to `theta=500000` if sequence length > 4096.
+The `.npy` files are memory-mappable — `ByteDataset` slices them without loading into RAM.
 
 ---
 
-## Hyperparameters — 1MB scale
+## Bottlenecks
 
-Dataset: `datasets/quran_uthmani.txt` ≈ 1.36 MB ≈ 1.36M bytes.
-Split: 90% train (≈ 1.22M bytes), 10% val (≈ 137K bytes).
+Both BSQ and FSQ target the same codebook size (2^18 ≈ 262K) for K=8 byte chunks.
 
-### Byte-level baseline (Baseline B)
+| variant | d_q | L | codebook | head |
+|---|---|---|---|---|
+| BSQ | 18 | — | 2^18 | per-bit BCE |
+| FSQ L=2 | 18 | 2 | 2^18 | per-bit BCE |
+| FSQ L=8 | 6 | 8 | 2^18 | per-dim 8-way CE |
+| BSQ balanced | 24 | — | 2^24 | per-bit BCE |
+| FSQ L=8 bal. | 8 | 8 | 2^24 | per-dim 8-way CE |
 
-```yaml
-# Model
-d_model: 128
-n_layers: 4
-n_heads: 4          # head_dim = 32
-ffn_mult: 4         # hidden = 4 * d_model = 512
-vocab: 256
-rope_theta: 10000
+**Codebook sizing for K=8 (256-way each):**
+Full space = 256^8 = 2^64.
+Arabic/English text has ~1–3 bits/byte effective entropy → K=8 → ~8–24 bits needed.
+`d_q=18` covers the Quran corpus (~170K chunks) with headroom (2^18 = 262K).
 
-# Sequence
-seq_len: 512        # bytes per example
+---
 
-# Training
-batch_size: 32      # 32 * 512 = 16384 bytes/batch
-lr: 3e-4
-optimizer: adamw
-betas: [0.9, 0.95]
-weight_decay: 0.1
-warmup_steps: 200
-total_steps: 5000
-grad_clip: 1.0
+## lm_train.py — latent autoregression
 
-# Params estimate: ~1.5M
+**Training (Option A-grounded, `research/LM.md §2.2`):**
+
+```
+byte_chunks [B, T, K]
+  → ByteEncoder (MLP)           teacher-forced: always sees ground-truth bytes
+  → BSQ / FSQ quantizer         → z_hat [B, T, d_q],  codes [B, T, d_q]
+  → LatentLM (causal Transformer, RoPE)
+  → LM head                     pred_loss: h[:,:-1] predicts codes[:,1:]
+  → ByteDecoder (MLP)           rec_loss: z_hat → byte logits vs byte_chunks
+total_loss = rec_loss + pred_loss
 ```
 
-### BPE baseline (Baseline A)
+**Inference (A-grounded):**  
+Sample z_next from LM → decode to bytes → re-encode → append z_grounded (not raw z_next).
 
-Same architecture. Swap vocab to BPE vocab size (256–4096 for small corpus).
-On a 1.4MB corpus, a vocab of 512–1024 is reasonable (many BPE merges will be Arabic digraphs).
-
-```yaml
-vocab: 1024        # train BPE on the corpus; 1024 merges over 256 bytes
-seq_len: 256       # shorter in tokens, same byte coverage
-# otherwise identical to byte baseline
+```bash
+python lm_train.py --data data/quran --bottleneck bsq
+python lm_train.py --data data/quran --bottleneck fsq8 --d_q 6
+python lm_train.py --data data/quran --bottleneck fsq2 --d_q 18
 ```
 
-### cqtok LM (later)
+Key flags: `--K 8`, `--T 64`, `--d_model 128`, `--n_layers 4`, `--n_heads 4`, `--steps 5000`.
 
-```yaml
-# Tokenizer
-chunk_size_K: 8
-bottleneck: fsq
-fsq_dims_dq: 6     # codebook 8^6 = 262144
-fsq_levels_L: 8
-encoder_layers: 2
-encoder_d: 128
+---
 
-decoder_type: nat  # pure NAT for Phase 1 simplicity
-decoder_layers: 2
-decoder_d: 128
+## bpe_train.py — BPE baseline
 
-# LM (same backbone)
-d_model: 128
-n_layers: 4
-n_heads: 4
-seq_len: 192       # latent positions (= 192*8 = 1536 bytes context)
+SentencePiece BPE trained on the corpus (`byte_fallback=True` → no UNK).
 
-# Training
-batch_size: 32
-lr: 3e-4
-total_steps: 8000  # more steps: joint enc+dec+lm training
-beta_warmup: 800   # KL weight ramp (not needed for FSQ, but keep scaffold)
+```bash
+python bpe_train.py --src ../datasets/quran_uthmani.txt --out data/quran --vocab_size 1024
 ```
+
+BPB conversion: `bpb = nats_per_token / (ln(2) * avg_bytes_per_token)`  
+`avg_bytes_per_token` measured on the full corpus (stored in `meta_bpe.json`).
 
 ---
 
 ## Metrics
 
-### Nats
+**Nats:** `mean(-log p(target))` (natural log).
 
-Mean negative log-likelihood in natural log units:
+**BPB (bits per byte):**
+
+- Byte-level: `bpb = nats / ln(2)` — exact, no approximation.
+- cqtok FSQ (reconstruction ≥ 99.9%): `bpb ≈ lm_code_ce / (ln(2) * K)`.
+- BPE: **exact per-batch** via token→byte map:
+
+  ```
+  bpb = sum(nll_i) / (sum(bytes(token_i)) * ln(2))
+  ```
+
+  `bytes(token_i)` is the UTF-8 byte length of token `i` in decoded text.
+  This is computed exactly from `build_token_bytes(sp)` — a `(vocab_size,)` int32 array
+  built once from the SentencePiece model.
+
+  The common approximation `nats_per_token / (ln(2) * avg_bytes_per_token)` is only
+  exact at corpus level. Per-batch it is biased whenever short and long tokens happen
+  to be sampled unevenly (std of token byte-length ≈ 2 for this corpus).
+
+  Note: `sum(token_bytes)` matches the SentencePiece-normalized byte count, which
+  may differ by a few bytes from the raw file due to NMT-NFKC normalization
+  (e.g. extra whitespace stripped). This is expected and correct.
+
+---
+
+## Logging
+
+Every run writes to `logs/<tag>_<timestamp>/`:
 
 ```
-nats = -mean(log p(target))   # log = natural log
+args.json      full CLI arguments
+train.log      human-readable (also printed via tqdm.write)
+train.jsonl    one JSON record per step; load with pd.read_json(..., lines=True)
 ```
 
-### Bits per byte (BPB)
+Log folder options:
 
-```
-bpb = nats / ln(2)            # for byte-level models: exact
-```
+| flag | effect |
+|---|---|
+| `--log_dir DIR` | base directory (default: `logs`) |
+| `--run_name foo` | folder becomes `logs/foo_<timestamp>/` |
+| `--run_name foo --no_date` | folder becomes `logs/foo/` (no timestamp) |
 
-For BPE models, convert from nats-per-token to bits-per-byte:
+Val is evaluated against `--val_file` (default: `../datasets/suratalfatihah.txt`).
+
+---
+
+## JAX / MPS
+
+MPS backend is available (`jax-mps`) but **JAX PRNG does not work on MPS**.
+Pattern used throughout: random on CPU, compute on MPS.
 
 ```python
-# on val set
-total_bytes = count_bytes(val_text)
-total_tokens = count_tokens(val_text)
-avg_bytes_per_token = total_bytes / total_tokens
+cpu = jax.devices("cpu")[0]
+mps = jax.devices("mps")[0]   # falls back to cpu if unavailable
 
-bpb = nats_per_token / (math.log(2) * avg_bytes_per_token)
+# All random sampling on CPU
+with jax.default_device(cpu):
+    key   = jax.random.PRNGKey(seed)
+    model = MyModel(..., key=key)
+
+# Transfer to MPS, then compute there
+model = jax.device_put(model, mps)
+with jax.default_device(mps):
+    out = jit_fn(model, batch)
 ```
 
-This is an approximation that assumes nats are uniform across token lengths. It is standard and comparable across tokenizers.
-
-For cqtok with FSQ + reconstruction ≥ 99.9%:
-
-```
-bpb ≈ lm_code_cross_entropy_nats / (ln(2) * K)
-```
-
-where `K=8` is bytes per latent.
+Do **not** set `JAX_PLATFORMS=cpu` in training scripts — that disables MPS.
+The utility modules (`bsq.py`, `fsq.py`, etc.) use `os.environ.setdefault("JAX_PLATFORMS", "cpu")` only as a fallback for standalone testing.
 
 ---
 
-## File layout
+## Expected BPB (1.4MB Quran, Arabic UTF-8)
 
-```
-cqtok/
-  README.md          ← this file
-  data.py            ← dataset: load any text/binary file, tokenize, save to disk
-  model.py           ← backbone: causal Transformer with RoPE, shared by all baselines
-  train.py           ← training loop (JAX + Equinox + Optax)
-  eval.py            ← compute nats and BPB on val set
-  tokenizer.py       ← BPE tokenizer wrapper + byte-level passthrough
-  fsq.py             ← FSQ encoder, decoder, quantizer (Phase 1+)
-  run_baseline_byte.py
-  run_baseline_bpe.py
-  run_cqtok.py
-```
-
----
-
-## JAX / Equinox notes
-
-MPS backend is installed but **JAX PRNG (random) does not work on MPS**. Use CPU for all random operations.
-
-```python
-import os
-os.environ["JAX_PLATFORMS"] = "cpu"   # put at top of every script
-import jax
-import jax.numpy as jnp
-import equinox as eqx
-```
-
-Alternatively, keep MPS for forward/backward but generate random keys on CPU:
-
-```python
-key = jax.random.PRNGKey(0)           # works on CPU (default)
-# jit-compiled forward will run on MPS if no random inside
-```
-
-Use `equinox.nn.MakeJaxArray` for parameter init — Equinox's `eqx.nn.Linear` etc. accept a `key` argument and are CPU-safe.
-
-Optax for optimizers (AdamW). Gradient clipping via `optax.clip_by_global_norm`.
-
----
-
-## Dataset code plan (`data.py`)
-
-```python
-# data.py
-# Converts any text or binary file to a flat uint8 array saved as .npy
-# Supports train/val split by byte offset (not random shuffle, to preserve order)
-
-def prepare(
-    src: str,           # path to text or binary file
-    out_dir: str,       # where to write train.npy and val.npy
-    val_frac: float = 0.1,
-    encoding: str = "utf-8",   # ignored for binary
-    mode: str = "text",        # "text" | "binary"
-):
-    ...
-
-# Usage:
-#   python data.py --src datasets/quran_uthmani.txt --out data/quran
-# Writes:
-#   data/quran/train.npy   shape (N_train,) dtype uint8
-#   data/quran/val.npy     shape (N_val,)   dtype uint8
-#   data/quran/meta.json   {"total_bytes": ..., "val_frac": ..., "mode": ...}
-```
-
-The `.npy` format is memory-mappable via `np.load(..., mmap_mode='r')`, so batches can be sliced without loading the full file into RAM.
-
-Batching: sample contiguous windows of `seq_len` bytes at random offsets from the mmap array. Since JAX PRNG is CPU-only, generate offsets on CPU, slice, then pass the batch as a JAX array.
-
----
-
-## Experiment sequence
-
-1. `python data.py --src datasets/quran_uthmani.txt --out data/quran`
-2. `python run_baseline_byte.py --data data/quran` → logs nats + BPB every 100 steps
-3. `python run_baseline_bpe.py --data data/quran --vocab 1024` → same
-4. Compare BPB. Byte baseline should win slightly at this scale (small corpus, BPE savings are minimal).
-5. `python run_cqtok.py --data data/quran` → Phase 1 autoencoder only, check reconstruction accuracy.
-6. Add LM and compare BPB against baselines.
-
----
-
-## Expected numbers (1.4MB Quran, Arabic UTF-8)
-
-Arabic text is UTF-8 multibyte (each Arabic character = 2 bytes).
-Entropy is lower than English (~1–2 bits/char), but UTF-8 overhead matters.
-Rough expected BPB:
+Arabic is UTF-8 multibyte (~2 bytes per character). BPE advantage shrinks because merges first deduplicate the byte pairs of each codepoint.
 
 | model | expected BPB |
 |---|---|
 | random byte model | 8.0 |
 | byte bigram | ~3.5–4.0 |
-| byte Transformer (d=128, L=4) | ~1.8–2.5 |
+| byte Transformer (d=128, L=4, 5k steps) | ~1.8–2.5 |
 | BPE Transformer (same compute) | ~1.7–2.3 |
-| cqtok FSQ K=8 (goal) | ≤ byte Transformer |
-
-BPE advantage shrinks for non-Latin scripts because the BPE merges must first deduplicate the UTF-8 byte pairs (each Arabic codepoint is 2 bytes, so BPE immediately merges them, effectively creating a 2-byte "byte-pair" baseline).
+| cqtok BSQ/FSQ K=8 (goal) | ≤ byte Transformer |

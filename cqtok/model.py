@@ -1,52 +1,38 @@
 """
-model.py — Causal Transformer with RoPE.
+model.py — Causal Transformer with RoPE (PyTorch).
 
-Used as backbone for both byte-level baseline and the latent LM.
-
-JAX note: set JAX_PLATFORMS=cpu before import (MPS has no PRNG support).
+Used as backbone for both byte-level and latent LM.
 """
 
-import os
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-
 import math
-from typing import Sequence
-
-import jax
-import jax.numpy as jnp
-import equinox as eqx
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# RoPE
 # ---------------------------------------------------------------------------
 
-def _seq(layer: eqx.nn.Linear, x: jax.Array) -> jax.Array:
-    """Apply Linear to (..., in) → (..., out) via matmul (avoids vmap overhead)."""
-    out = x @ layer.weight.T
-    if layer.bias is not None:
-        out = out + layer.bias
-    return out
-
-
-def _rotate_half(x: jax.Array) -> jax.Array:
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
-    return jnp.concatenate([-x[..., half:], x[..., :half]], axis=-1)
+    return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
 
-def _apply_rope(
-    q: jax.Array, k: jax.Array, positions: jax.Array, theta: float = 10_000.0
-) -> tuple[jax.Array, jax.Array]:
-    """
-    q, k : (T, H, d_head)
-    positions : (T,) int
-    """
-    d = q.shape[-1]
+def apply_rope(
+    q: torch.Tensor,   # (B, T, H, d_head)
+    k: torch.Tensor,
+    theta: float = 10_000.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    T, d = q.shape[1], q.shape[-1]
     half = d // 2
-    inv_freq = 1.0 / (theta ** (jnp.arange(half, dtype=jnp.float32) / half))
-    angles = jnp.outer(positions.astype(jnp.float32), inv_freq)  # (T, half)
-    cos = jnp.concatenate([jnp.cos(angles), jnp.cos(angles)], axis=-1)[:, None, :]  # (T,1,d)
-    sin = jnp.concatenate([jnp.sin(angles), jnp.sin(angles)], axis=-1)[:, None, :]
+    inv_freq = 1.0 / (theta ** (torch.arange(half, device=q.device).float() / half))
+    t = torch.arange(T, device=q.device).float()
+    freqs = torch.outer(t, inv_freq)                              # (T, half)
+    cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1)           # (T, d)
+    sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1)
+    cos = cos.unsqueeze(0).unsqueeze(2)                           # (1, T, 1, d)
+    sin = sin.unsqueeze(0).unsqueeze(2)
     q = q * cos + _rotate_half(q) * sin
     k = k * cos + _rotate_half(k) * sin
     return q, k
@@ -56,185 +42,107 @@ def _apply_rope(
 # Modules
 # ---------------------------------------------------------------------------
 
-class RMSNorm(eqx.Module):
-    weight: jax.Array
-    eps: float = eqx.field(static=True)
-
+class RMSNorm(nn.Module):
     def __init__(self, d: int, eps: float = 1e-6):
-        self.weight = jnp.ones(d)
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
         self.eps = eps
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        rms = jnp.sqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + self.eps)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
         return x / rms * self.weight
 
 
-class CausalAttention(eqx.Module):
-    q_proj: eqx.nn.Linear
-    k_proj: eqx.nn.Linear
-    v_proj: eqx.nn.Linear
-    o_proj: eqx.nn.Linear
-    n_heads: int = eqx.field(static=True)
-    rope_theta: float = eqx.field(static=True)
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        rope_theta: float = 10_000.0,
-        *,
-        key: jax.Array,
-    ):
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        k1, k2, k3, k4 = jax.random.split(key, 4)
-        self.q_proj = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k1)
-        self.k_proj = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k2)
-        self.v_proj = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k3)
-        self.o_proj = eqx.nn.Linear(d_model, d_model, use_bias=False, key=k4)
+class CausalAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, rope_theta: float = 10_000.0):
+        super().__init__()
+        assert d_model % n_heads == 0
         self.n_heads = n_heads
+        self.d_head = d_model // n_heads
         self.rope_theta = rope_theta
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        # x: (T, d_model)
-        T, d = x.shape
-        H, d_h = self.n_heads, d // self.n_heads
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, d = x.shape
+        H, d_h = self.n_heads, self.d_head
 
-        q = _seq(self.q_proj, x).reshape(T, H, d_h)
-        k = _seq(self.k_proj, x).reshape(T, H, d_h)
-        v = _seq(self.v_proj, x).reshape(T, H, d_h)
+        q = self.q_proj(x).view(B, T, H, d_h)
+        k = self.k_proj(x).view(B, T, H, d_h)
+        v = self.v_proj(x).view(B, T, H, d_h)
 
-        q, k = _apply_rope(q, k, jnp.arange(T), self.rope_theta)
+        q, k = apply_rope(q, k, self.rope_theta)
 
-        # scores: (H, T, T)
-        scores = jnp.einsum("qhd,khd->hqk", q, k) * (d_h ** -0.5)
-        causal_mask = jnp.triu(jnp.full((T, T), float("-inf")), k=1)
-        scores = scores + causal_mask[None]
+        # sdp_attention expects (B, H, T, d_head)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        attn = jax.nn.softmax(scores, axis=-1)          # (H, T, T)
-        out = jnp.einsum("hqk,khd->qhd", attn, v)       # (T, H, d_h)
-        return _seq(self.o_proj, out.reshape(T, d))
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (B, H, T, d_h)
+        out = out.transpose(1, 2).contiguous().view(B, T, d)
+        return self.o_proj(out)
 
 
-class SwiGLUFFN(eqx.Module):
-    gate_proj: eqx.nn.Linear
-    up_proj: eqx.nn.Linear
-    down_proj: eqx.nn.Linear
-
-    def __init__(self, d_model: int, expansion: int = 4, *, key: jax.Array):
-        k1, k2, k3 = jax.random.split(key, 3)
-        # 2/3 factor keeps parameter count equivalent to a standard 4x FFN
+class SwiGLUFFN(nn.Module):
+    def __init__(self, d_model: int, expansion: int = 4):
+        super().__init__()
         d_h = int(d_model * expansion * 2 / 3)
-        d_h = (d_h + 63) // 64 * 64   # round up to multiple of 64
-        self.gate_proj = eqx.nn.Linear(d_model, d_h, use_bias=False, key=k1)
-        self.up_proj   = eqx.nn.Linear(d_model, d_h, use_bias=False, key=k2)
-        self.down_proj = eqx.nn.Linear(d_h, d_model, use_bias=False, key=k3)
+        d_h = (d_h + 63) // 64 * 64
+        self.gate = nn.Linear(d_model, d_h, bias=False)
+        self.up   = nn.Linear(d_model, d_h, bias=False)
+        self.down = nn.Linear(d_h, d_model, bias=False)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
-        # x: (T, d_model)
-        gate = jax.nn.silu(_seq(self.gate_proj, x))
-        up = _seq(self.up_proj, x)
-        return _seq(self.down_proj, gate * up)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
-class TransformerBlock(eqx.Module):
-    attn: CausalAttention
-    ffn: SwiGLUFFN
-    norm1: RMSNorm
-    norm2: RMSNorm
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        rope_theta: float = 10_000.0,
-        *,
-        key: jax.Array,
-    ):
-        k1, k2 = jax.random.split(key)
-        self.attn  = CausalAttention(d_model, n_heads, rope_theta, key=k1)
-        self.ffn   = SwiGLUFFN(d_model, key=k2)
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, rope_theta: float = 10_000.0):
+        super().__init__()
         self.norm1 = RMSNorm(d_model)
+        self.attn  = CausalAttention(d_model, n_heads, rope_theta)
         self.norm2 = RMSNorm(d_model)
+        self.ffn   = SwiGLUFFN(d_model)
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
         x = x + self.ffn(self.norm2(x))
         return x
 
 
-class CausalTransformer(eqx.Module):
-    """
-    Stack of TransformerBlocks + final RMSNorm.
-    Input:  (T, d_model)
-    Output: (T, d_model)
-    """
-
-    blocks: list
-    norm: RMSNorm
-    d_model: int = eqx.field(static=True)
-    n_layers: int = eqx.field(static=True)
-    n_heads: int = eqx.field(static=True)
-
-    def __init__(
-        self,
-        d_model: int,
-        n_layers: int,
-        n_heads: int,
-        rope_theta: float = 10_000.0,
-        *,
-        key: jax.Array,
-    ):
-        keys = jax.random.split(key, n_layers)
-        self.blocks = [
-            TransformerBlock(d_model, n_heads, rope_theta, key=k) for k in keys
-        ]
+class CausalTransformer(nn.Module):
+    def __init__(self, d_model: int, n_layers: int, n_heads: int, rope_theta: float = 10_000.0):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, rope_theta) for _ in range(n_layers)
+        ])
         self.norm = RMSNorm(d_model)
-        self.d_model = d_model
-        self.n_layers = n_layers
-        self.n_heads = n_heads
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
             x = block(x)
         return self.norm(x)
 
     def param_count(self) -> int:
-        return sum(v.size for v in jax.tree_util.tree_leaves(self))
+        return sum(p.numel() for p in self.parameters())
 
 
-class LatentLM(eqx.Module):
-    """
-    Causal LM over a quantized latent sequence.
-      z_hat (T, d_q) → embed → Transformer → h (T, d_model)
+class LatentLM(nn.Module):
+    """z_hat (B, T, d_q) → embed → Transformer → h (B, T, d_model)."""
 
-    The LM head (BSQLMHead / FSQLMHead) lives outside; it predicts
-    the next chunk's codes from h.
-    """
+    def __init__(self, d_q: int, d_model: int, n_layers: int, n_heads: int,
+                 rope_theta: float = 10_000.0):
+        super().__init__()
+        self.in_proj     = nn.Linear(d_q, d_model)
+        self.transformer = CausalTransformer(d_model, n_layers, n_heads, rope_theta)
 
-    in_proj: eqx.nn.Linear        # d_q → d_model
-    transformer: CausalTransformer
-
-    def __init__(
-        self,
-        d_q: int,
-        d_model: int,
-        n_layers: int,
-        n_heads: int,
-        rope_theta: float = 10_000.0,
-        *,
-        key: jax.Array,
-    ):
-        k1, k2 = jax.random.split(key)
-        self.in_proj = eqx.nn.Linear(d_q, d_model, use_bias=True, key=k1)
-        self.transformer = CausalTransformer(d_model, n_layers, n_heads, rope_theta, key=k2)
-
-    def __call__(self, z_hat: jax.Array) -> jax.Array:
-        """z_hat: (T, d_q) → h: (T, d_model)"""
-        x = _seq(self.in_proj, z_hat)
-        return self.transformer(x)
+    def forward(self, z_hat: torch.Tensor) -> torch.Tensor:
+        return self.transformer(self.in_proj(z_hat))
 
     def param_count(self) -> int:
-        return sum(v.size for v in jax.tree_util.tree_leaves(self))
+        return sum(p.numel() for p in self.parameters())
 
 
 # ---------------------------------------------------------------------------
@@ -242,18 +150,8 @@ class LatentLM(eqx.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    key = jax.random.PRNGKey(0)
-
-    d_q, d_model, n_layers, n_heads, T = 18, 128, 4, 4, 64
-
-    lm = LatentLM(d_q=d_q, d_model=d_model, n_layers=n_layers, n_heads=n_heads, key=key)
-
-    key, k = jax.random.split(key)
-    z = jax.random.normal(k, (T, d_q))
+    dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    lm = LatentLM(d_q=18, d_model=128, n_layers=4, n_heads=4).to(dev)
+    z = torch.randn(2, 64, 18, device=dev)
     h = lm(z)
-
-    print(f"LatentLM  d_q={d_q} d_model={d_model} L={n_layers} H={n_heads}")
-    print(f"  input  z: {z.shape}")
-    print(f"  output h: {h.shape}")
-    print(f"  params:   {lm.param_count():,}")
-    print(f"  h[0,:4]:  {h[0, :4]}")
+    print(f"LatentLM  input={tuple(z.shape)}  output={tuple(h.shape)}  params={lm.param_count():,}")
