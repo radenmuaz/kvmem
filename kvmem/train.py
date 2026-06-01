@@ -161,6 +161,7 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     log_every   = hp.get('log_every', 100)
     slot_style  = hp.get('slot_style', 'seq')
     chunk_len   = hp.get('chunk_len', 0)
+    warmup_len  = hp.get('warmup_len', 4)   # context bytes before each window
     warmup_steps = hp.get('warmup_steps', 500)
     dataset_dir = hp.get('dataset_dir', None)
     seed        = hp.get('seed', 42)
@@ -191,18 +192,24 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         L_y, L_total = seg_len, seg_len + MEM_OVERHEAD + N + seg_len
         Y_start, Y_sup_len = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN, seg_len
     else:
-        L_y, L_total = 1 + chunk_len, seg_len + MEM_OVERHEAD + N + 1 + chunk_len
-        Y_start, Y_sup_len = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN, chunk_len
+        L_y      = warmup_len + chunk_len
+        L_total  = seg_len + MEM_OVERHEAD + N + warmup_len + chunk_len
+        Y_start  = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN
+        Y_sup_len = chunk_len
 
     mask_t = torch.tensor(make_mask_tag(seg_len, N, L_y),
                           dtype=torch.float32, device=device)
 
-    # LR schedule
+    # LR schedule — per-stage cosine, resets at each curriculum transition
+    stage_start_step = [0]   # mutable ref updated on stage switch
+
     def lr_schedule(step):
-        if step < warmup_steps:
-            return lr_max * step / warmup_steps
-        progress = (step - warmup_steps) / max(n_steps - warmup_steps, 1)
-        return max(lr_max * 1e-3, lr_max * 0.5 * (1 + math.cos(math.pi * progress)))
+        local = step - stage_start_step[0]
+        stage_steps = steps_per_stage if curriculum else n_steps
+        if local < warmup_steps:
+            return lr_max * max(local, 1) / warmup_steps
+        progress = (local - warmup_steps) / max(stage_steps - warmup_steps, 1)
+        return max(lr_max * 1e-3, lr_max * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0))))
 
     # Test sequences
     from kvmem.utils import make_test_sequences
@@ -218,24 +225,47 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     curr_Y_sup = Y_sup_len
 
     if dataset_dir:
-        meta = json.load(open(os.path.join(dataset_dir, 'meta.json')))
-        stages = meta['stages']
-        steps_per_stage = n_steps // len(stages)
-        curriculum = []
-        for s_chunk in stages:
-            data = np.load(os.path.join(dataset_dir, f'stage_chunk{s_chunk}.npy'))
-            is_full = (s_chunk >= seg_len)
-            s_chunk_len = 0 if is_full else s_chunk
-            s_L_y = seg_len if is_full else 1 + s_chunk
-            s_mask = torch.tensor(make_mask_tag(seg_len, N, s_L_y),
-                                  dtype=torch.float32, device=device)
-            s_Y_start = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN
-            s_Y_sup   = seg_len if is_full else s_chunk
-            curriculum.append((data, s_chunk_len, s_mask, s_Y_start, s_Y_sup))
-            _log(f'  [curriculum] stage chunk={s_chunk}  n={len(data)}  L={data.shape[1]}')
-        _log(f'  [curriculum] {len(stages)} stages × ~{steps_per_stage} steps each')
-        # Start at stage 0
-        _, curr_chunk, curr_mask, curr_Y_start, curr_Y_sup = curriculum[0]
+        meta   = json.load(open(os.path.join(dataset_dir, 'meta.json')))
+        wl     = meta.get('warmup_len', warmup_len)
+        d_mode = meta.get('mode', 'curriculum')
+
+        if d_mode == 'multi_size':
+            sizes = meta['sizes']
+            mix_w = meta.get('mix_weights', None)
+            mix_p = np.array(mix_w) / sum(mix_w) if mix_w else None
+            curriculum = []
+            for ws in sizes:
+                data = np.load(os.path.join(dataset_dir, f'win{ws}.npy'))
+                is_full = (ws >= seg_len)
+                s_chunk_len = 0 if is_full else ws
+                s_L_y  = seg_len if is_full else wl + ws
+                s_mask = torch.tensor(make_mask_tag(seg_len, N, s_L_y),
+                                      dtype=torch.float32, device=device)
+                s_Y_start = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN
+                s_Y_sup   = seg_len if is_full else ws
+                curriculum.append((data, s_chunk_len, s_mask, s_Y_start, s_Y_sup))
+                _log(f'  [multi-size] win={ws}  L={data.shape[1]}  n={len(data)}')
+            steps_per_stage = 0   # no stage switching in multi-size
+            _log(f'  [multi-size] {len(sizes)} window sizes mixed per step')
+            curr_chunk, curr_mask, curr_Y_start, curr_Y_sup = curriculum[-1][1:]
+        else:
+            # Curriculum: sequential stages
+            stages = meta['stages']
+            steps_per_stage = n_steps // len(stages)
+            curriculum = []
+            for s_chunk in stages:
+                data = np.load(os.path.join(dataset_dir, f'stage_chunk{s_chunk}.npy'))
+                is_full = (s_chunk >= seg_len)
+                s_chunk_len = 0 if is_full else s_chunk
+                s_L_y  = seg_len if is_full else wl + s_chunk
+                s_mask = torch.tensor(make_mask_tag(seg_len, N, s_L_y),
+                                      dtype=torch.float32, device=device)
+                s_Y_start = seg_len + MEM_OPEN_LEN + N + MEM_CLOSE_LEN
+                s_Y_sup   = seg_len if is_full else s_chunk
+                curriculum.append((data, s_chunk_len, s_mask, s_Y_start, s_Y_sup))
+                _log(f'  [curriculum] stage chunk={s_chunk}  warmup={wl if not is_full else 1}  n={len(data)}  L={data.shape[1]}')
+            _log(f'  [curriculum] {len(stages)} stages × ~{steps_per_stage} steps each')
+            _, curr_chunk, curr_mask, curr_Y_start, curr_Y_sup = curriculum[0]
 
     mode_str = f'random-window chunk={chunk_len}' if chunk_len > 0 else 'full-sequence'
     if dataset_dir:
@@ -254,19 +284,29 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
     pbar = tqdm(range(1, n_steps + 1), desc='recall', dynamic_ncols=True)
 
+    if not dataset_dir:
+        d_mode = 'online'
+
     for step in pbar:
-        # Curriculum stage switch
-        if curriculum is not None:
+        # Stage switch (curriculum only, not multi-size)
+        if curriculum is not None and steps_per_stage > 0:
             stage_i = min(step // steps_per_stage, len(curriculum) - 1)
             if stage_i != curr_idx:
                 curr_idx = stage_i
                 _, curr_chunk, curr_mask, curr_Y_start, curr_Y_sup = curriculum[curr_idx]
+                stage_start_step[0] = step
                 _log(f'\n  [curriculum] step={step} → stage {curr_idx} '
-                     f'chunk={curriculum[curr_idx][1] or "full"}')
+                     f'chunk={curriculum[curr_idx][1] or "full"}  (LR reset)')
 
         # Get batch
         if curriculum is not None:
-            stage_data = curriculum[curr_idx][0]
+            if d_mode == 'multi_size':
+                # Pick a random window size each step
+                size_i = int(rng.choice(len(curriculum), p=mix_p) if mix_p is not None
+                             else rng.integers(0, len(curriculum)))
+                stage_data, curr_chunk, curr_mask, curr_Y_start, curr_Y_sup = curriculum[size_i]
+            else:
+                stage_data = curriculum[curr_idx][0]
             idx = rng.integers(0, len(stage_data), size=B)
             tokens = torch.tensor(stage_data[idx], dtype=torch.long, device=device)
         else:
@@ -314,15 +354,52 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 _jlog(dict(step=step, seq=name, cer=c))
 
             mean_cer = sum(all_cer) / len(all_cer)
-            _log(f'  → mean CER={mean_cer:.3f}  mean match={100*(1-mean_cer):.1f}%')
+            _log(f'  → full-seq mean CER={mean_cer:.3f}  match={100*(1-mean_cer):.1f}%')
             _jlog(dict(step=step, mean_cer=mean_cer))
+
+            # Windowed eval (only when in windowed curriculum stage)
+            if curriculum is not None and curr_chunk > 0:
+                wl = hp.get('warmup_len', 4)
+                wl_mask = curr_mask
+                window_cers = []
+                for name, x_S in list(test_seqs.items())[:4]:  # first 4 seqs
+                    # pick window in middle of sequence
+                    y_start = seg_len // 4
+                    y_end   = y_start + curr_chunk
+                    wm_tok  = x_S[max(0, y_start-wl):y_start]
+                    if len(wm_tok) < wl:
+                        wm_tok = [x_S[0]] * (wl - len(wm_tok)) + wm_tok
+                    target_w = x_S[y_start:y_end]
+                    slot_ids = make_slot_ids_tag(N, slot_style)
+                    mem_blk  = MEM_OPEN + slot_ids + MEM_CLOSE
+                    L_w = seg_len + MEM_OVERHEAD + N + wl + curr_chunk
+                    wm_mask = torch.tensor(make_mask_tag(seg_len, N, wl + curr_chunk),
+                                           dtype=torch.float32, device=device)
+                    generated = list(wm_tok)
+                    with torch.no_grad():
+                        for _ in range(curr_chunk):
+                            cur = x_S + mem_blk + generated
+                            tok = torch.tensor(cur + [0]*(L_w-len(cur)), dtype=torch.long, device=device)
+                            logits = model(tok, wm_mask)
+                            generated.append(int(logits[len(cur)-1].argmax()))
+                    gen_w = generated[wl:]
+                    c_w = cer(gen_w, target_w)
+                    window_cers.append(c_w)
+                    ok = '✓' if c_w == 0.0 else '✗'
+                    _log(f'  {ok} [window] {name:12s} [{y_start}:{y_end}]  match={100*(1-c_w):5.1f}%  CER={c_w:.3f}')
+                mean_w = sum(window_cers)/len(window_cers)
+                _log(f'  → windowed mean CER={mean_w:.3f}  match={100*(1-mean_w):.1f}%')
+                _jlog(dict(step=step, windowed_cer=mean_w))
 
             if mean_cer == 0.0:
                 _log(f'\n★ PERFECT RECALL at step {step}!')
                 ckpt = os.path.join(ckpt_dir, f'step{step}.pt')
                 torch.save({'model': model.state_dict(), 'hp': hp, 'step': step}, ckpt)
                 _log(f'  [ckpt] {ckpt}')
-                break
+                # Only stop if no curriculum or already at final stage
+                is_final = (curriculum is None or curr_idx == len(curriculum) - 1)
+                if is_final:
+                    break
 
         if step % (eval_every * 10) == 0:
             ckpt = os.path.join(ckpt_dir, f'step{step}.pt')
@@ -361,6 +438,8 @@ if __name__ == '__main__':
     p.add_argument('--log-every',   type=int,   default=None)
     p.add_argument('--slot-style',  type=str,   default=None, choices=['zeros','seq'])
     p.add_argument('--chunk-len',   type=int,   default=None)
+    p.add_argument('--warmup-len',  type=int,   default=None,
+                   help='Context bytes before each window (default 4)')
     p.add_argument('--rope',        action='store_true', default=None)
     p.add_argument('--no-rope',     action='store_false', dest='rope')
     p.add_argument('--yarn',        action='store_true', default=None)
@@ -385,7 +464,8 @@ if __name__ == '__main__':
     if args.eval_every: hp['eval_every'] = args.eval_every
     if args.log_every:  hp['log_every']  = args.log_every
     if args.slot_style: hp['slot_style'] = args.slot_style
-    if args.chunk_len is not None: hp['chunk_len'] = args.chunk_len
+    if args.chunk_len  is not None: hp['chunk_len']  = args.chunk_len
+    if args.warmup_len is not None: hp['warmup_len'] = args.warmup_len
     if args.rope is not None: hp['rope'] = args.rope
     if args.yarn is not None: hp['yarn'] = args.yarn
     if args.dataset_dir: hp['dataset_dir'] = args.dataset_dir

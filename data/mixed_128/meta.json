@@ -1,0 +1,19 @@
+{
+  "seg_len": 128,
+  "N": 128,
+  "slot_style": "seq",
+  "warmup_len": 4,
+  "n_examples": 30000,
+  "seed": 42,
+  "mode": "multi_size",
+  "sizes": [
+    128,
+    64,
+    32
+  ],
+  "mix_weights": [
+    0.7,
+    0.15,
+    0.15
+  ]
+}

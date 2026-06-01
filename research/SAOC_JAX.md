@@ -14,6 +14,7 @@ rules over an operator algebra, built on top of JAX.**
 ## Table of contents
 
 1. [Motivation and scope](#1-motivation-and-scope)
+   - [Build decision](#11-build-decision)
 2. [Theory](#2-theory)
    1. [The certificate: a second tape](#21-the-certificate-a-second-tape)
    2. [The abstract domain $\mathcal{G}$](#22-the-abstract-domain-mathcalg)
@@ -30,6 +31,8 @@ rules over an operator algebra, built on top of JAX.**
 9. [Implementation roadmap](#9-implementation-roadmap)
 10. [Open problems and honest limitations](#10-open-problems-and-honest-limitations)
 11. [References](#11-references)
+12. [Research vision: the relaxation ladder](#12-research-vision-the-relaxation-ladder)
+13. [Duals and inverses](#13-duals-and-inverses)
 
 ---
 
@@ -58,6 +61,29 @@ Scope of this document: enough theory to implement, the JAX module layout and AP
 the transfer-function tables, the validation suite (toy examples with expected
 results), and per-architecture coverage for traditional DL (MLP, CNN, LSTM/GRU) and
 modern AI (Transformer/ViT, RoPE, SSM/Mamba, DeltaNet/gated DeltaNet, TTT).
+
+### 1.1 Build decision
+
+After weighing the conservative compiler, the fully generalized belief/trajectory system
+(§12), a monolithic learned optimizer, and the hybrids, the commitment is:
+
+> **Implement the conservative compiler core (§2–§11) first, architected explicitly as
+> the conservative corner of the generalized system (§12), then relax in priority order
+> — belief → posterior → trajectory/objective — and attach a *bounded learned residual*
+> only at the very end.**
+
+Rationale: the conservative core is the only part that has hard guarantees, is cheap and
+amortized, transfers zero-shot to new architectures, has a falsifiable kill-test (§6.3),
+and is implementable on JAX today with reused AD. It is also a strict special case of the
+generalized system (§12.1), so building it is the foundation the relaxations open up, not
+throwaway work. The principled endpoint — *derive what you can prove, learn only the
+bounded residual* (§12.4) — **requires** the derived core to exist first, since the
+residual is defined relative to it.
+
+We explicitly **do not** build: a monolithic learned optimizer (expensive meta-training,
+no transfer, no guarantees), data/architecture co-design (out of the optimizer frame),
+or anything requiring the test distribution (information-theoretically impossible). The
+phased plan is §9; the target it relaxes toward is §12.
 
 ---
 
@@ -925,6 +951,33 @@ On a small Transformer, compare against tuned AdamW / Muon / SOAP.
 - **Lowering equivalence:** the lowered jitted term must numerically equal a reference
   hand-written implementation of the same algebra term.
 
+### 6.5 Relaxation baselines and the non-stationary validation gate
+
+The core tests (§6.1–6.4) validate v0–v5. The relaxations (v6–v9) need a stricter
+discipline, imported from a sibling MHE/MPC project (§12.6) whose experiments showed that
+sophisticated estimation-plus-planning **fails to beat trust-region Newton on stationary
+smooth problems** and wins only in the non-stationary / saddle regime.
+
+- **Isolate the marginal value of each rung against the cheaper version of itself**, not
+  against AdamW. v6 must beat *AdamW + a cheap diagonal curvature estimate*; v7 must beat
+  *single surrogate + LM damping*; v8a must beat *plain extragradient / optimistic gradient
+  at matched compute*. A rung that only beats AdamW has not earned its layer.
+- **Stationary null check.** On stationary smooth problems, a trajectory relaxation must
+  **not lose** to trust-region Newton (the sibling project's confirmed null). If a rung
+  adds cost without benefit on the default cell (`P1 = potential`, `P3 = static`), gate it
+  off there — it is for the non-default cells only.
+- **The decisive non-stationary gate (single go/no-go for the trajectory layer).** On a
+  bilinear / WGAN-style game (`P1 = saddle`) and an online-drift task (`P3 =
+  non-stationary`), the compiler must **automatically derive curvature-aware optimism**
+  (v5 operator-class → extragradient, plus v6 belief → curvature) and **beat plain
+  optimism at matched compute**. This tests the *compiler thesis itself* — that it can
+  derive, from the problem class, the combination a human found by hand — and is more
+  decisive for the relaxation layer than any stationary benchmark. If it merely ties plain
+  optimism, the trajectory layer is a unification, not a new capability.
+- **Dual-control diagnostic.** With confidence-gated belief (v6), log estimator covariance
+  and an excitation/observability measure; verify the optimizer is not starving its own
+  estimator (the trajectory shaping which directions are observable).
+
 ---
 
 ## 7. Architecture and problem coverage
@@ -1054,6 +1107,13 @@ Direct/Sense. A method on a seam just means two combinators co-fire — the stag
 
 ## 9. Implementation roadmap
 
+Per the build decision (§1.1): **v0–v5 are the conservative core** — the corner of §12,
+fully guaranteed and implementable today. **v6–v9 are the relaxations** toward the
+generalized system, added in increasing-risk order, with the bounded learned residual
+last. Every phase is independently shippable.
+
+**Core — the conservative corner (§12.1):**
+
 - **v0 — kill-test (weeks).** No e-graph. Certificate computes only $\mathcal S$, $L$,
   $\mathcal I$. Hard-coded selection: Muon on matmul, Adam elsewhere, $\eta=c/L$,
   symmetry projection on pre-norm + softmax. Validate §6.3 against tuned AdamW/Muon/SOAP.
@@ -1075,6 +1135,42 @@ Direct/Sense. A method on a seam just means two combinators co-fire — the stag
   RL/saddles), domain geometry (Riemannian/mirror/Wasserstein for SLAM/control/discrete/
   distribution), evolution (warm-start/incremental, change-trust-region). This is where
   coverage extends past weight-training (§7.3).
+
+**Relaxations — toward the generalized system (§12), in increasing-risk order:**
+
+- **v6 — belief (lowest-risk relaxation).** Replace the binary guard with online,
+  confidence-gated empirical estimators (Hutchinson curvature, gradient-noise scale,
+  effective rank); soundness becomes the `confidence = 1` special case. **Implement as an
+  MHE-style recursive estimator with a covariance, not a bare EMA** (see §12.6): the
+  covariance feeds both the confidence guards and the dual-control probe. **Dual-control
+  gap:** a greedy structure-aware optimizer can starve its own estimator — the trajectory
+  shapes which directions are observable — so v6 must consider excitation/probing. Unlocks
+  the empirical-curvature family (Sophia / AdaHessian / Adafactor / GGT). §12.1 axis
+  *evidence*.
+- **v7 — posterior over surrogates + robust action.** Maintain an ensemble/posterior over
+  local models; act pessimistically or posterior-averaged. Unlocks Bayesian-optimization,
+  CMA-ES covariance, derivative-free, and DRO. §12.1 axis *surrogate*.
+- **v8a — trajectory tracking for non-stationary / saddle problems (validated regime).**
+  A predictive tracker (not EMA) over a horizon, gated to `P1 = saddle` / `P3 =
+  non-stationary` — the cells where a sibling MHE/MPC project showed real wins (≈7× over
+  exact-Hessian Newton on a moving quadratic; a divergent Dirac-GAN made convergent; §12.6).
+  **Do the schedule-level version first** (predictive control of per-block lr/momentum
+  over a cheap surrogate): near-zero overhead, directly comparable to cosine/warmup.
+- **v8b — trajectory control toward a generalization/flatness objective (high-risk,
+  unvalidated).** A *low-capacity*, dimensionless-feature outer controller optimizing a
+  held-out/flatness proxy. Makes SAM / SWA / warmup / noise-injection / early-stopping
+  *reachable* — but credit assignment is RL-hard (reachable ≠ reliably discovered), and the
+  sibling result is **silent** on this and raises skepticism for any trajectory relaxation
+  on *stationary* training. §12.1 axes *horizon/controller/objective*.
+- **v9 — bounded learned residual (endpoint, §12.4).** Attach a *small* learned head that
+  models only the unprovable complement of the derived update; the derived bulk keeps its
+  guarantees and transfer, and the un-guaranteed behavior stays confined to a bounded
+  residual. Only after v6 is mature, since the residual is defined relative to what is
+  derived.
+
+**Not building** (per §1.1): a monolithic learned optimizer (no transfer, no guarantees,
+astronomical meta-training); data/architecture co-design (out of the optimizer frame);
+anything requiring the test distribution (information-theoretically impossible).
 
 ---
 
@@ -1187,3 +1283,235 @@ Modern architectures (inner-loop relevance):
   (TTT). 2024.
 - Yang et al. *Gated Delta Networks: Improving Mamba2 with Delta Rule.* 2024/2025.
 - Gu, Dao. *Mamba: Linear-Time Sequence Modeling with Selective State Spaces.* 2023.
+
+---
+
+## 12. Research vision: the relaxation ladder
+
+This section is the **target the core relaxes toward**, not part of the v0–v5 build. Per
+§1.1 we implement §2–§11 first; §12 describes the generalized system whose conservative
+corner that core *is*. It is included so the §9 relaxation phases (v6–v9) have a
+specification.
+
+### 12.1 The ladder: the core is one corner of a larger design space
+
+Each capability the core lacks is a *constraint it deliberately keeps*. Relaxing each
+opens an axis; the core sits at the most-constrained (maximally guaranteed, minimally
+adaptive) corner.
+
+| Axis | Core corner (tightest) | Relaxes to | Phase |
+|---|---|---|---|
+| evidence | proof (`confidence = 1`) | belief (any confidence, online) | v6 |
+| surrogate | point estimate of $F$ | posterior / ensemble, robust action | v7 |
+| horizon | 1 step | trajectory (MPC over a window) | v8 |
+| controller | frozen at compile time | online, low-capacity, invariant-feature | v8 |
+| objective | per-step fidelity / cost | held-out / flatness / generalization | v8 |
+
+Reading down each column is *sound, amortizable, transferable, less powerful*; reading up
+trades guarantees for reach. The relaxations are continuous, so the core is recovered
+exactly by pinning every axis to its tightest value (it is a strict special case, not a
+different system).
+
+### 12.2 Why relax: the core's three inherent blind spots
+
+The core optimizes *per-step progress on the training objective using provable local
+structure*. Its inherent blind spots are the gaps between that and "a good model":
+
+1. **Soundness gap** — it forfeits empirically-real-but-unprovable structure (relaxed by
+   *belief*, v6).
+2. **Generalization gap** — faster training $\ne$ better model; it has no objective
+   rewarding a worse local step that generalizes better (relaxed by *trajectory +
+   generalization objective*, v8).
+3. **Wrong-object gap** — curvature is irrelevant for black-box/discrete and fragile under
+   noise (relaxed by *posterior over surrogates* + non-curvature models, v7).
+
+### 12.3 What each relaxation newly recovers
+
+The methods unlocked are exactly the complement of the blind spots — a coherent set, not
+a grab-bag:
+
+- **v6 (belief):** Sophia, AdaHessian, Adafactor, GGT, online empirical Fisher.
+- **v7 (posterior):** Bayesian optimization, CMA-ES covariance, derivative-free
+  trust-region, DRO / group-DRO.
+- **v8 (objective):** SAM/ASAM/GSAM, SWA / weight-EMA, warmup / cosine / one-cycle,
+  SGLD / entropy-SGD noise injection, early stopping — *reachable*, with the caveat that
+  reliable discovery is RL-hard credit assignment.
+
+Already expressible in the core (the §8 catalog) and merely *re-motivated*, not newly
+recovered: momentum, Nesterov, Lion, mirror, FISTA, Frank–Wolfe, Riemannian, SVRG, line
+search, lookahead, LARS/LAMB, GaLore.
+
+### 12.4 Endpoint: derive-plus-bounded-residual (v9)
+
+The chosen endpoint is **not** a monolithic learned optimizer. It is a hybrid: the core
+*derives* the guaranteed, transferable, provable part of the update, and a **small learned
+residual** models only the unprovable complement the belief cannot certify. This closes
+the largest learned-optimizer advantage (exploiting unprovable structure) while preserving
+the core's efficiency and transfer (the learned part is small — it models a residual, so
+low sample complexity and better off-distribution behavior) and confining un-guaranteed
+behavior to a bounded correction. One line: *derive what you can prove, learn the residual,
+never let the learned part exceed the bounded complement.*
+
+### 12.5 Ceilings no relaxation removes
+
+- **Test-distribution proxy (information-theoretic).** Every system optimizes a *proxy*
+  for generalization; true generalization needs the unknown test distribution. v8 buys a
+  *better* proxy and *calibrated uncertainty about it* — the real achievable win is
+  converting silent misalignment into surfaced, flagged misalignment — but not a guarantee
+  of a better model.
+- **Coverage vs guarantees.** Maximal coverage (a high-capacity learned function) and
+  maximal guarantee (certifiable steps) are mutually constraining; v9 keeps guarantees by
+  *bounding* the learned part, accepting less than full coverage.
+- **Scope.** Data ordering, augmentation, curriculum, and architecture co-design are out
+  of the optimizer frame — a different, larger system.
+- **Primitive invention.** The e-graph recombines a registered vocabulary; genuinely new,
+  interpretable optimization *principles* must still be added by a human.
+
+### 12.6 Empirical evidence from a sibling project (MHE/MPC)
+
+A separate, hand-built effort implemented a **low-rank-plus-scalar curvature surrogate**
+estimated backward over a horizon (**MHE** — moving horizon estimation, a Kalman/fixed-lag
+smoother *with covariance*) and used forward (**MPC** — model-predictive control planning
+an update sequence). In our terms it is a hand-built instance of **v6 (belief, via
+estimation theory) + v8a (trajectory, via control)** on one $\mathcal S$-structure choice
+— a partial, control-theoretic build of this section's generalized system. Its
+experimental verdict is directly informative:
+
+- **No-go on stationary smooth training.** Trust-region Newton tied or beat the predictive
+  method ("no information the predictor lacks"; a stiff-valley test had Newton at ~1e-19
+  while the predictor crawled). This **empirically confirms §12.2's claim** that the
+  trajectory relaxation collapses to the greedy second-order step on the default cell, and
+  it **independently re-derives the §1.1 decision** ("kill the better-Adam-for-normal-
+  training framing").
+- **Go on non-stationary / saddle problems.** ≈7× over exact-Hessian Newton on a moving
+  quadratic; a divergent Dirac-GAN rotation turned convergent. The advantage is
+  information-theoretic — a reactive method (even with the exact Hessian) is permanently
+  one step behind a moving target. This **confirms the PROBLEM tier**: trajectory
+  relaxations pay exactly in `P1 = saddle` / `P3 = non-stationary`, the cells v5 introduces.
+- **Gating conditions (import as guards):** the drift must be smooth/low-order, exceed the
+  estimation noise (it is a *large-batch* method), use a proper tracker (not EMA), and be
+  the *dominant* difficulty; otherwise the advantage vanishes or reverses.
+
+Lessons folded into the plan: (1) **v8 split into v8a (tracking, validated) and v8b
+(flatness/generalization, unvalidated and silent in this evidence)** — they are different
+phenomena despite both being "trajectory-level"; (2) **v6 should be an MHE-style estimator
+with covariance**, not a bare EMA; (3) **dual control is a real gap** — a greedy
+structure-aware optimizer starves its own estimator, so v6/v8 must consider excitation
+(§6.5 diagnostic); (4) the **baseline discipline** of §6.5 (beat the cheaper version of
+each rung; beat plain optimism on games) comes from this project; (5) its **honest novelty
+caveat** — the non-stationary method "largely rediscovers optimistic gradient / extragradient
+and Kalman/MHE trackers; the value-add is *jointly* modeling curvature and drift plus the
+unifying framing" — matches §12.3 exactly and is, in fact, the *intended* value of this
+compiler (derive and combine known methods per problem class, automatically), not a threat
+to it.
+
+The sharpest takeaway is a **warning that strengthens §1.1**: a sophisticated
+estimation-plus-planning optimizer could not beat Newton on the default regime, so be
+*more* skeptical that v6–v9 win on ordinary training (including v8b), build the conservative
+core so it stands without them, and gate the relaxations to the non-stationary/saddle
+niche — which is also the most decisive place to validate the compiler thesis (§6.5 gate).
+
+---
+
+## 13. Duals and inverses
+
+§1–§12 are one corner of a larger design space: *fix the DAG, read its structure, in
+reverse mode, estimating backward*. Flipping each of four independent knobs gives a
+coherent sibling research direction. This section sketches them as vision, not build.
+
+### 13.1 The expressivity ↔ tractability ladder
+
+Both the inverse problem and the forward-mode direction operate on this ladder. Each rung
+gains expressivity by changing the *parameterization* and sheds a specific optimization
+property — and the properties detach one at a time, they are not one cliff.
+
+| Class | Retained property | Lost | Mechanism |
+|---|---|---|---|
+| Linear regression | **closed-form** (one solve) | — | quadratic objective **and** linear-in-params |
+| Ridge / GLS | closed-form | — | still quadratic |
+| Logistic / GLM | **global convex**, Newton ~quadratic rate | closed-form | linear-in-params, *nonlinear convex* loss |
+| Quadratic (any sign) | **one-step Newton** | convexity may be gone | degree-2 objective (order, not curvature sign) |
+| Kernel / SVM | global convex | closed-form, cheap Hessian | convex composite in a *fixed* feature space |
+| Linear net $W_2W_1$ | **benign nonconvex** (all local min global) | convexity | bilinear-in-params — *no* expressivity gain |
+| 2-layer ReLU | convex *reformulation* exists | convexity in natural params | nonlinearity (but see below) |
+| NTK / infinite width | **effective convexity**, linear-rate GD | **feature learning** | over-parameterization → lazy regime |
+| Finite-width DNN | local structure only | all of the above | finite-width nonlinearity → feature learning |
+
+Three load-bearing observations:
+
+1. **The properties detach.** Closed-form needs quadratic + linear; one-step-Newton needs
+   only degree-2 (a nonconvex quadratic is one-step — to a saddle); global-convex needs a
+   convex composite; benign-nonconvex (linear nets, matrix factorization) keeps
+   all-local-are-global *without* convexity. You shed them individually.
+2. **The tension is mediated by parameterization, and the thing fundamentally at odds with
+   tractability is *feature learning*.** Linear-in-params → tractable; nonlinear-in-params
+   → expressive but hard. Infinite width buys back effective convexity but kills feature
+   learning (a tractability ↔ feature-learning trade, not a free lunch). The linear-net rung
+   is the cautionary case: convexity lost, expressivity unchanged.
+3. **Some lost properties are parameterization artifacts, recoverable by re-representation.**
+   2-layer ReLU training has an exact *convex* reformulation (Pilanci–Ergen) — convexity
+   was hidden by the weight parameterization, not truly gone. This is the hinge that makes
+   the inverse problem real.
+
+### 13.2 The inverse: write the certificate instead of reading it
+
+The forward project (§1–§12) is: *fix the DAG → **read** its certificate → synthesize the
+optimizer that copes.* The DAG's rung on the ladder is given.
+
+The **inverse** is an *architecture compiler*: *fix a tractability target (a certificate
+property to hold) → search DAGs / re-parameterizations for the most expressive one that
+**realizes** it.* Same certificate, opposite causality — the optimizer compiler reads it
+as an observation; the architecture compiler writes it as a specification.
+
+And just as the forward compiler *recovers* SGD/Adam/K-FAC/NGD, the inverse compiler
+*recovers* existing architecture tricks as its frontier:
+
+| Target property | Recovered architecture method |
+|---|---|
+| closed-form readout | random features / extreme-learning-machines / reservoir / **linear probing** (frozen body + exact head) |
+| global convex | Input-Convex Neural Networks; **convex reformulations** (ReLU duality) |
+| benign nonconvex | linear bottlenecks, over-parameterized / deep-linear designs, matrix factorization |
+| effective convex | very wide (NTK/lazy) layers — accepting no feature learning |
+
+**Co-design** is the join — search DAG *and* optimizer together — with the certificate as a
+**shared contract**: the architecture compiler writes a property, the optimizer compiler
+reads and exploits it, and the two negotiate the (expressivity × tractability ×
+convergence-rate) frontier. The original project is co-design with the architecture side
+pinned. This corner directly attacks the deepest tension on the ladder (feature learning
+vs tractability) instead of taking the DAG as fixed and coping — the highest-value sibling.
+
+### 13.3 The forward-mode dual
+
+Reverse mode is cheap for *few outputs, many inputs* (a scalar loss over millions of
+params) and rides a stored tape — right for bulk training. Forward mode is cheap for *many
+outputs, few inputs* and is *tapeless and causal*. Flipping to forward mode is not
+symmetric; it relocates the project to a different niche:
+
+- **Tapeless / streaming.** Forward gradient (one JVP along a random direction, unbiased,
+  no backward pass, O(1) depth memory) is the substrate for online/streaming/real-time
+  training — the same **non-stationary niche** §12.6 found wins in. Forward mode is the
+  streaming-friendly differentiation.
+- **The certificate flips polarity.** A forward certificate is a *forward* abstract
+  interpretation — sensitivity / Lipschitz / **reachability** ("which directions can I
+  steer"), dual to the backward certificate's influence / **observability** ("which
+  directions can I see"). This is the same observability ↔ controllability duality of the
+  MHE/MPC memo, reappearing as reverse ↔ forward AD.
+- **Cheap schedule / hyperparameter control.** Forward-mode hypergradients
+  (`d(loss)/d(few hyperparameters)`) are cheap precisely *because* the input count is
+  small — making forward mode the natural substrate for the scheduler variant (§12.6's
+  cheapest, most-deployable first win).
+
+### 13.4 The lattice of duals
+
+| Knob | This project | Sibling |
+|---|---|---|
+| fixed side | optimizer-searched | DAG-searched (§13.2) / both (co-design) |
+| certificate causality | **read** (observe a fixed DAG) | **write** (specify the DAG) |
+| AD direction | reverse (training, observability) | forward (streaming/control, reachability; §13.3) |
+| time direction | backward estimate (MHE) | forward plan (MPC) — §12.6 |
+
+This project is the corner *{optimizer-searched, certificate-read, reverse-mode,
+backward-estimate}*. The richest single new direction is the **co-design corner with a
+shared-certificate contract** (§13.2): an architecture compiler that writes tractability
+properties and an optimizer compiler that reads and exploits them, jointly navigating the
+expressivity–tractability frontier rather than taking the architecture as fixed.
