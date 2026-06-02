@@ -41,17 +41,18 @@ def yarn_freqs(d_head: int, L_train: int, L_max: int,
 def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     """
     Apply rotary embeddings.
-    x: (H, L, d_head)   freqs: (d_head//2,)
+    x: (..., H, L, d_head)  — works for both (H,L,dh) and (B,H,L,dh).
+    freqs: (d_head//2,)
     """
-    H, L, dh = x.shape
+    L, dh  = x.shape[-2], x.shape[-1]
     pos    = torch.arange(L, dtype=torch.float32, device=x.device)
-    angles = pos[:, None] * freqs[None, :]          # (L, dh//2)
-    cos_a  = angles.cos()[None]                      # (1, L, dh//2)
-    sin_a  = angles.sin()[None]
+    angles = pos[:, None] * freqs[None, :]   # (L, dh//2)
+    cos_a  = angles.cos()                    # (L, dh//2) — broadcasts over ...H
+    sin_a  = angles.sin()
     x1, x2 = x[..., 0::2], x[..., 1::2]
     rx1 = x1 * cos_a - x2 * sin_a
     rx2 = x1 * sin_a + x2 * cos_a
-    return torch.stack([rx1, rx2], dim=-1).reshape(H, L, dh)
+    return torch.stack([rx1, rx2], dim=-1).reshape(x.shape)
 
 
 # ---------------------------------------------------------------------------
@@ -75,20 +76,26 @@ class MHAttention(nn.Module):
             self.freqs = None
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # x: (L, d)   mask: (L, L) additive (-inf / 0)
-        L, d = x.shape
+        # x: (L, d) or (B, L, d)   mask: (L, L)
+        batched = x.dim() == 3
+        if not batched:
+            x = x.unsqueeze(0)   # (1, L, d)
+        B, L, d = x.shape
         H, dh = self.n_heads, self.d_head
-        Q = self.W_Q(x).reshape(L, H, dh).permute(1, 0, 2)  # (H, L, dh)
-        K = self.W_K(x).reshape(L, H, dh).permute(1, 0, 2)
-        V = self.W_V(x).reshape(L, H, dh).permute(1, 0, 2)
+        Q = self.W_Q(x).reshape(B, L, H, dh).permute(0, 2, 1, 3)  # (B, H, L, dh)
+        K = self.W_K(x).reshape(B, L, H, dh).permute(0, 2, 1, 3)
+        V = self.W_V(x).reshape(B, L, H, dh).permute(0, 2, 1, 3)
         if self.rope and self.freqs is not None:
-            Q = apply_rope(Q, self.freqs)
+            Q = apply_rope(Q, self.freqs)   # (B, H, L, dh)
             K = apply_rope(K, self.freqs)
-        # Flash attention via SDPA — handles MPS efficiently
+        # mask: (L,L) → (1,1,L,L) broadcasts over (B,H,L,L)
         out = F.scaled_dot_product_attention(Q, K, V,
-                                             attn_mask=mask.unsqueeze(0))
-        out = out.permute(1, 0, 2).reshape(L, d)
-        return self.W_O(out)
+                                             attn_mask=mask.unsqueeze(0).unsqueeze(0))
+        out = out.permute(0, 2, 1, 3).reshape(B, L, d)
+        out = self.W_O(out)
+        if not batched:
+            out = out.squeeze(0)
+        return out
 
 
 class FFN(nn.Module):
@@ -114,6 +121,7 @@ class TransformerBlock(nn.Module):
         self.ffn   = FFN(d, d_ff)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # x: (L, d) or (B, L, d) — LayerNorm and FFN handle both via broadcasting
         x = x + self.attn(self.norm1(x), mask)
         x = x + self.ffn(self.norm2(x))
         return x
@@ -154,8 +162,12 @@ class KVMemModel(nn.Module):
                 nn.init.normal_(p, std=math.sqrt(2.0 / p.shape[-1]))
 
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """tokens: (L,) int64   mask: (L, L) float32   → logits (L, V)"""
-        x = self.embed(tokens)
+        """
+        tokens: (L,) int64 → logits (L, V)
+             or (B, L) int64 → logits (B, L, V)
+        mask: (L, L) float32 — same for all batch elements
+        """
+        x = self.embed(tokens)   # (L, d) or (B, L, d)
         for block in self.blocks:
             x = block(x, mask)
         return self.W_out(self.norm_out(x))

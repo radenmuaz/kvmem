@@ -1,9 +1,0 @@
-{
-  "src": "/Users/muaz/code/kvmem/datasets/quran_uthmani.txt",
-  "mode": "text",
-  "encoding": "utf-8",
-  "total_bytes": 1359946,
-  "train_bytes": 1223952,
-  "val_bytes": 135994,
-  "val_frac": 0.1
-}

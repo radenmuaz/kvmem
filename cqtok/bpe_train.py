@@ -4,7 +4,7 @@ bpe_train.py — BPE baseline: SentencePiece trained on corpus + causal Transfor
 BPB is exact per-batch via token→byte map (build_token_bytes), not a corpus-average approximation.
 
 Usage:
-    python bpe_train.py --src ../datasets/quran_uthmani.txt --out data/quran
+    python bpe_train.py --src ../datasets/quran_uthmani.txt --out data/quran_uthmani
 """
 
 import argparse
@@ -38,7 +38,7 @@ def train_bpe(src: str, out_dir: str, vocab_size: int = 1024) -> Path:
         input=src, model_prefix=prefix, vocab_size=vocab_size,
         model_type="bpe", byte_fallback=True, character_coverage=1.0,
         pad_id=0, unk_id=1, bos_id=2, eos_id=3, add_dummy_prefix=False,
-        logspec="FATAL",
+        # logspec="FATAL",
     )
     print(f"BPE model: {prefix}.model  (vocab={vocab_size})")
     return Path(prefix + ".model")
@@ -147,11 +147,12 @@ def token_loss_and_bpb(
 def eval_file(model: BPELM, path: str, sp, token_bytes_np: np.ndarray,
               seq_len: int, device: torch.device) -> dict:
     model.eval()
-    text   = Path(path).read_text(encoding="utf-8")
-    toks   = np.array(sp.encode(text), dtype=np.int64)
-    n_seqs = max(1, len(toks) // seq_len)
-    arr    = toks[: n_seqs * seq_len].reshape(n_seqs, seq_len)
-    batch  = torch.from_numpy(np.concatenate([arr, arr[:, -1:]], axis=1)).to(device)
+    text    = Path(path).read_text(encoding="utf-8")
+    toks    = np.array(sp.encode(text), dtype=np.int64)
+    T_use   = min(seq_len, max(2, len(toks) - 1))
+    n_seqs  = max(1, len(toks) // T_use)
+    arr     = toks[: n_seqs * T_use].reshape(n_seqs, T_use)
+    batch   = torch.from_numpy(np.concatenate([arr, arr[:, -1:]], axis=1)).to(device)
     tb     = torch.from_numpy(token_bytes_np).to(device)
     nats, bpb = token_loss_and_bpb(model, batch, tb)
     model.train()

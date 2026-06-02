@@ -161,6 +161,26 @@ Reasoning:
 
 ---
 
+## Explicit Role-Tag Scheme (if warmup-anchor fails)
+
+If windowed recall still fails with 16-byte warmup, try semantic role tags:
+
+```
+<s> x_S </s> <m> slots </m> <f> warmup_bytes </f> <c> continuation </c>
+```
+
+- `<s>` / `</s>` — wraps source (replaces bare x_S prefix)
+- `<m>` / `</m>` — wraps KV slots (existing)
+- `<f>` / `</f>` — "from": explicit anchor bytes, tells model WHERE in source to start
+- `<c>` / `</c>` — "continue": model outputs here
+
+**Why this works better than bare warmup bytes:**
+The current scheme relies on the model inferring "these warmup bytes are a position hint" — implicit. With `<f>`, the role is explicit: "find where `<f>...</f>` appears in `<s>...</s>`, then continue from there into `<c>`." The model can learn to attend the `<f>` content against the source KV to locate position, rather than relying on YaRN alone.
+
+**Implementation:** new tag bytes (e.g., `<s>` = `[0x3C, 0x73, 0x3E]`, `</s>` = `[0x3C, 0x2F, 0x73, 0x3E]`, etc.), new mask rules where `<c>` region can see `<f>` region and `<m>` slots but NOT `<s>` source directly.
+
+---
+
 ## What Stage 1 plan defers
 
 From PLAN_STAGE1.md, the following are still valid and unchanged:

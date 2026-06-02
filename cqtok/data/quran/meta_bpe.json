@@ -1,9 +1,0 @@
-{
-  "model_path": "/Users/muaz/code/kvmem/cqtok/data/quran/bpe_512.model",
-  "vocab_size": 512,
-  "total_tokens": 364059,
-  "train_tokens": 327654,
-  "val_tokens": 36405,
-  "total_bytes": 1359946,
-  "avg_bytes_per_token": 3.735509903614524
-}

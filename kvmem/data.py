@@ -79,6 +79,116 @@ def make_slot_ids_tag(N: int, style: str = 'seq') -> list[int]:
         raise ValueError(f"slot style must be 'zeros' or 'seq', got {style!r}")
 
 
+# ---------------------------------------------------------------------------
+# Role-tag scheme: explicit <s>, <f>, <c> anchor tags
+# ---------------------------------------------------------------------------
+# Sequence:
+#   <s> x_S </s> <m> slots </m> <f> warmup </f> <c> output </c>
+#
+# Tags (printable ASCII, from existing 256-token vocab):
+#   SRC_OPEN   '<s>'  = [0x3C, 0x73, 0x3E]       3 bytes
+#   SRC_CLOSE  '</s>' = [0x3C, 0x2F, 0x73, 0x3E] 4 bytes
+#   FROM_OPEN  '<f>'  = [0x3C, 0x66, 0x3E]       3 bytes
+#   FROM_CLOSE '</f>' = [0x3C, 0x2F, 0x66, 0x3E] 4 bytes
+#   CONT_OPEN  '<c>'  = [0x3C, 0x63, 0x3E]       3 bytes
+#   CONT_CLOSE '</c>' = [0x3C, 0x2F, 0x63, 0x3E] 4 bytes
+#
+# Key mask rules:
+#   - slots attend to x_S (encode source into KV)
+#   - <f>warmup</f> attends to slots (locate position via KV)
+#   - <c>output</c> attends to slots + <f>...</f>, CANNOT see x_S directly
+#   - Nothing outside <c> attends to <c> (write-only output)
+# ---------------------------------------------------------------------------
+
+SRC_OPEN   = [0x3C, 0x73, 0x3E]           # '<s>'
+SRC_CLOSE  = [0x3C, 0x2F, 0x73, 0x3E]    # '</s>'
+FROM_OPEN  = [0x3C, 0x66, 0x3E]           # '<f>'
+FROM_CLOSE = [0x3C, 0x2F, 0x66, 0x3E]    # '</f>'
+CONT_OPEN  = [0x3C, 0x63, 0x3E]           # '<c>'
+CONT_CLOSE = [0x3C, 0x2F, 0x63, 0x3E]    # '</c>'
+
+SRC_OPEN_LEN    = len(SRC_OPEN)       # 3
+SRC_CLOSE_LEN   = len(SRC_CLOSE)      # 4
+FROM_OPEN_LEN   = len(FROM_OPEN)      # 3
+FROM_CLOSE_LEN  = len(FROM_CLOSE)     # 4
+CONT_OPEN_LEN   = len(CONT_OPEN)      # 3
+CONT_CLOSE_LEN  = len(CONT_CLOSE)     # 4
+
+# Overhead: <s></s><m></m><f></f><c></c> = (3+4)+(3+4)+(3+4)+(3+4) = 28
+ROLE_OVERHEAD = (SRC_OPEN_LEN + SRC_CLOSE_LEN +
+                 MEM_OPEN_LEN + MEM_CLOSE_LEN +
+                 FROM_OPEN_LEN + FROM_CLOSE_LEN +
+                 CONT_OPEN_LEN + CONT_CLOSE_LEN)
+
+
+def make_mask_role(L_S: int, N: int, L_f: int, L_c: int) -> np.ndarray:
+    """
+    Attention mask for the role-tag scheme.
+
+    Layout (absolute positions):
+      <s>       [0,                3)
+      x_S       [3,                3+L_S)
+      </s>      [3+L_S,            7+L_S)
+      <m>       [7+L_S,            10+L_S)
+      slots     [10+L_S,           10+L_S+N)
+      </m>      [10+L_S+N,         14+L_S+N)
+      <f>       [14+L_S+N,         17+L_S+N)
+      warmup    [17+L_S+N,         17+L_S+N+L_f)
+      </f>      [17+L_S+N+L_f,     21+L_S+N+L_f)
+      <c>       [21+L_S+N+L_f,     24+L_S+N+L_f)
+      output    [24+L_S+N+L_f,     24+L_S+N+L_f+L_c)
+      </c>      [24+L_S+N+L_f+L_c, 28+L_S+N+L_f+L_c)
+
+    Mask rules:
+      1. <c>/output/</c> are write-only from outside.
+      2. <c>/output can attend to: slots, </m>, <f>/warmup/</f> — NOT x_S or <s>.
+      3. <f>/warmup can attend to: slots, </m> — NOT x_S (forces use of KV).
+      4. slots attend to x_S + prior slots (causal within M).
+      5. Standard causal everywhere else.
+    """
+    src_start   = SRC_OPEN_LEN                              # 3
+    src_end     = src_start + L_S                           # 3+L_S
+    s_close_end = src_end + SRC_CLOSE_LEN                  # 7+L_S
+    m_open_end  = s_close_end + MEM_OPEN_LEN               # 10+L_S
+    slot_start  = m_open_end
+    slot_end    = slot_start + N                            # 10+L_S+N
+    m_close_end = slot_end + MEM_CLOSE_LEN                  # 14+L_S+N
+    f_open_end  = m_close_end + FROM_OPEN_LEN               # 17+L_S+N
+    f_start     = f_open_end
+    f_end       = f_start + L_f                             # 17+L_S+N+L_f
+    f_close_end = f_end + FROM_CLOSE_LEN                    # 21+L_S+N+L_f
+    c_open_end  = f_close_end + CONT_OPEN_LEN               # 24+L_S+N+L_f
+    c_start     = c_open_end
+    c_end       = c_start + L_c                             # 24+L_S+N+L_f+L_c
+    L           = c_end + CONT_CLOSE_LEN                    # 28+L_S+N+L_f+L_c
+
+    rows = np.arange(L)[:, None]
+    cols = np.arange(L)[None, :]
+    causal = cols <= rows
+
+    # Region membership
+    is_src      = (cols >= SRC_OPEN_LEN) & (cols < s_close_end)   # <s> + x_S + </s>
+    is_slot     = (cols >= slot_start) & (cols < m_close_end)      # slots + </m>
+    is_f_region = (cols >= m_close_end) & (cols < f_close_end)     # <f>..warmup..</f>
+    is_c_region = (cols >= f_close_end)                             # <c>..output..</c>
+
+    is_c_row    = (rows >= f_close_end)
+    is_f_row    = (rows >= m_close_end) & (rows < f_close_end)
+
+    # Rule 1: <c> is write-only
+    block_c_sink = is_c_region & ~is_c_row
+
+    # Rule 2: <c> rows cannot see x_S/<s>
+    block_c_sees_src = is_c_row & is_src
+
+    # Rule 3: <f> rows cannot see x_S either (forces KV lookup)
+    block_f_sees_src = is_f_row & is_src
+
+    blocked = block_c_sink | block_c_sees_src | block_f_sees_src
+    visible = causal & ~blocked
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
+
+
 def make_mask_tag(L_S: int, N: int, L_y: int) -> np.ndarray:
     """
     Attention mask for the tag-based scheme.

@@ -94,18 +94,16 @@ def compute_loss(model, tokens: torch.Tensor, mask: torch.Tensor,
     chunk_len>0: supervise Y_start+1..Y_start+1+chunk_len (skip warmup)
     """
     B, L = tokens.shape
-    total_loss = torch.tensor(0.0, device=tokens.device)
-    for i in range(B):
-        logits = model(tokens[i], mask)          # (L, V)
-        lp     = F.log_softmax(logits[:-1], dim=-1)
-        tgts   = tokens[i, 1:]
-        nll    = -lp[torch.arange(L - 1, device=tokens.device), tgts]
-        sup_start = Y_start + (1 if chunk_len > 0 else 0)
-        sup_end   = sup_start + Y_sup_len
-        mask_y    = torch.zeros(L - 1, device=tokens.device)
-        mask_y[sup_start:sup_end] = 1.0
-        total_loss = total_loss + (nll * mask_y).sum() / (mask_y.sum() + 1e-8)
-    return total_loss / B
+    # Batched forward: (B, L) → (B, L, V)
+    logits = model(tokens, mask)
+    lp     = F.log_softmax(logits[:, :-1], dim=-1)   # (B, L-1, V)
+    tgts   = tokens[:, 1:]                            # (B, L-1)
+    nll    = -lp.gather(2, tgts.unsqueeze(-1)).squeeze(-1)  # (B, L-1)
+    sup_start = Y_start + (1 if chunk_len > 0 else 0)
+    sup_end   = sup_start + Y_sup_len
+    mask_y    = torch.zeros(L - 1, device=tokens.device)
+    mask_y[sup_start:sup_end] = 1.0
+    return (nll * mask_y).sum(1).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +183,15 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     model = build_model(hp, device)
     if hp.get('compile', False):
         model = torch.compile(model)
-    opt   = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=wd)
+    from kvmem.optim import GrokAdamW
+    use_grok = hp.get('grok', True)   # GrokAdamW is default
+    if use_grok:
+        opt = GrokAdamW(model.parameters(), lr=lr_max, weight_decay=wd,
+                        rho=hp.get('grok_rho', 0.9), batch_size=B)
+        if hp.get('compile', False):
+            opt.step = torch.compile(opt.step)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=wd)
 
     # Mask
     if chunk_len == 0:
@@ -203,13 +209,21 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     # LR schedule — per-stage cosine, resets at each curriculum transition
     stage_start_step = [0]   # mutable ref updated on stage switch
 
+    cycle_steps = hp.get('cycle_steps', 0)   # 0 = one-shot cosine; >0 = cosine restarts
+
     def lr_schedule(step):
         local = step - stage_start_step[0]
-        stage_steps = steps_per_stage if curriculum else n_steps
         if local < warmup_steps:
             return lr_max * max(local, 1) / warmup_steps
-        progress = (local - warmup_steps) / max(stage_steps - warmup_steps, 1)
-        return max(lr_max * 1e-3, lr_max * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0))))
+        local -= warmup_steps
+        if cycle_steps > 0:
+            # Cosine restarts every cycle_steps
+            t = local % cycle_steps
+            progress = t / cycle_steps
+        else:
+            stage_steps = steps_per_stage if (curriculum and steps_per_stage > 0) else n_steps
+            progress = min(local / max(stage_steps - warmup_steps, 1), 1.0)
+        return max(lr_max * 1e-2, lr_max * 0.5 * (1 + math.cos(math.pi * progress)))
 
     # Test sequences
     from kvmem.utils import make_test_sequences
@@ -357,32 +371,36 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             _log(f'  → full-seq mean CER={mean_cer:.3f}  match={100*(1-mean_cer):.1f}%')
             _jlog(dict(step=step, mean_cer=mean_cer))
 
-            # Windowed eval (only when in windowed curriculum stage)
-            if curriculum is not None and curr_chunk > 0:
+            # Windowed eval — always run if dataset has windowed examples
+            eval_chunk = hp.get('chunk_len', 0)
+            if eval_chunk == 0 and curriculum is not None:
+                # infer from dataset: use smallest window size available
+                sizes = meta.get('sizes', meta.get('stages', []))
+                non_full = [s for s in sizes if s < seg_len]
+                eval_chunk = min(non_full) if non_full else 0
+            if curriculum is not None and eval_chunk > 0:
                 wl = hp.get('warmup_len', 4)
-                wl_mask = curr_mask
                 window_cers = []
-                for name, x_S in list(test_seqs.items())[:4]:  # first 4 seqs
-                    # pick window in middle of sequence
+                for name, x_S in list(test_seqs.items())[:4]:
                     y_start = seg_len // 4
-                    y_end   = y_start + curr_chunk
+                    y_end   = y_start + eval_chunk
                     wm_tok  = x_S[max(0, y_start-wl):y_start]
                     if len(wm_tok) < wl:
                         wm_tok = [x_S[0]] * (wl - len(wm_tok)) + wm_tok
-                    target_w = x_S[y_start:y_end]
                     slot_ids = make_slot_ids_tag(N, slot_style)
                     mem_blk  = MEM_OPEN + slot_ids + MEM_CLOSE
-                    L_w = seg_len + MEM_OVERHEAD + N + wl + curr_chunk
-                    wm_mask = torch.tensor(make_mask_tag(seg_len, N, wl + curr_chunk),
+                    L_w = seg_len + MEM_OVERHEAD + N + wl + eval_chunk
+                    wm_mask = torch.tensor(make_mask_tag(seg_len, N, wl + eval_chunk),
                                            dtype=torch.float32, device=device)
                     generated = list(wm_tok)
                     with torch.no_grad():
-                        for _ in range(curr_chunk):
+                        for _ in range(eval_chunk):
                             cur = x_S + mem_blk + generated
                             tok = torch.tensor(cur + [0]*(L_w-len(cur)), dtype=torch.long, device=device)
                             logits = model(tok, wm_mask)
                             generated.append(int(logits[len(cur)-1].argmax()))
                     gen_w = generated[wl:]
+                    target_w = x_S[y_start:y_end]
                     c_w = cer(gen_w, target_w)
                     window_cers.append(c_w)
                     ok = '✓' if c_w == 0.0 else '✗'
@@ -444,6 +462,14 @@ if __name__ == '__main__':
     p.add_argument('--no-rope',     action='store_false', dest='rope')
     p.add_argument('--yarn',        action='store_true', default=None)
     p.add_argument('--no-yarn',     action='store_false', dest='yarn')
+    p.add_argument('--warmup-steps', type=int, default=None,
+                   help='LR warmup steps per stage (default 200)')
+    p.add_argument('--grok',        action='store_true',
+                   help='Use GrokAdamW (SNR-gated, arXiv:2605.01172)')
+    p.add_argument('--grok-rho',    type=float, default=None,
+                   help='GrokAdamW deviation EMA decay (default 0.9)')
+    p.add_argument('--cycle-steps', type=int,   default=None,
+                   help='Cosine restart period in steps (0=one-shot, e.g. 5000)')
     p.add_argument('--compile',     action='store_true', help='torch.compile (faster on MPS)')
     p.add_argument('--dataset-dir', type=str,   default=None)
     p.add_argument('--log-dir',     type=str,   default='logs')
@@ -469,7 +495,11 @@ if __name__ == '__main__':
     if args.rope is not None: hp['rope'] = args.rope
     if args.yarn is not None: hp['yarn'] = args.yarn
     if args.dataset_dir: hp['dataset_dir'] = args.dataset_dir
-    if args.compile:     hp['compile']     = True
+    if args.grok:                     hp['grok']         = True
+    if args.grok_rho is not None:     hp['grok_rho']     = args.grok_rho
+    if args.warmup_steps is not None: hp['warmup_steps'] = args.warmup_steps
+    if args.cycle_steps  is not None: hp['cycle_steps']  = args.cycle_steps
+    if args.compile:                 hp['compile']     = True
     if args.seed:       hp['seed'] = args.seed
 
     seg = hp['seg_len']; N = hp['N']
