@@ -53,12 +53,13 @@ from tqdm import tqdm
 
 from kvmem.model import build_model
 from kvmem.data import (
-    HIDDEN_OPEN, HIDDEN_CLOSE, INPUT_OPEN, INPUT_CLOSE,
-    QUERY_OPEN, QUERY_CLOSE, OUTPUT_OPEN, OUTPUT_CLOSE,
-    HIDDEN_OPEN_LEN, HIDDEN_CLOSE_LEN,
-    INPUT_OPEN_LEN, INPUT_CLOSE_LEN,
-    QUERY_OPEN_LEN, QUERY_CLOSE_LEN,
-    OUTPUT_OPEN_LEN, OUTPUT_CLOSE_LEN,
+    MEM_OPEN, MEM_CLOSE, SRC_OPEN, SRC_CLOSE,
+    FROM_OPEN, FROM_CLOSE, CONT_OPEN, CONT_CLOSE,
+    MEM_OPEN_LEN, MEM_CLOSE_LEN,
+    SRC_OPEN_LEN, SRC_CLOSE_LEN,
+    FROM_OPEN_LEN, FROM_CLOSE_LEN,
+    CONT_OPEN_LEN, CONT_CLOSE_LEN,
+    make_slot_ids_tag,
     multi_block_positions, make_mask_multi, make_multi_batch,
 )
 from kvmem.utils import make_test_sequences, cer
@@ -101,7 +102,7 @@ def ocd_rollout_full(model, tokens_batch: np.ndarray,
     c0      = pos['c0']
     B       = tokens_batch.shape[0]
     tok_t       = torch.tensor(tokens_batch, dtype=torch.long, device=device)
-    ocd_targets = np.zeros((B, out_len, 256), dtype=np.float32)  # output vocab = 256
+    ocd_targets = np.zeros((B, out_len, 256), dtype=np.float32)
     y_gens      = [[] for _ in range(B)]
     for k in range(out_len):
         logits = model(tok_t, mask_t)
@@ -118,36 +119,34 @@ def ocd_rollout_full(model, tokens_batch: np.ndarray,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def ar_decode_role(model, x_S: list[int], slot_len: int,
+def ar_decode_role(model, x_S: list[int], slot_len: int, slot_style: str,
                    warmup: list[int], out_len: int, device) -> list[int]:
     """
     Greedy AR decode (eval). Builds a memory-first single-block sequence:
-      <m>slot_0..slot_{N-1}</m><s>x_S</s><f>warmup</f><c>...</c>
+      <m>slots</m><s>x_S</s><f>warmup</f><c>...</c>
     Returns out_len generated tokens.
     """
-    from kvmem.data import make_mem_slot_ids
     seg_len  = len(x_S)
     wl       = len(warmup)
-    slot_ids = make_mem_slot_ids(slot_len)
+    slot_ids = make_slot_ids_tag(slot_len, slot_style)
     pos      = multi_block_positions(1, seg_len, slot_len, wl, out_len)
     L        = pos['L']
     mask_t   = torch.tensor(make_mask_multi(1, seg_len, slot_len, wl, out_len, 0),
                              dtype=torch.float32, device=device)
     b0       = pos['blocks'][0]
     tokens   = np.zeros(L, dtype=np.int64)
-    # Source-first: <s>src</s><m>slots</m>
-    tokens[b0['block_start']:b0['s0']]          = INPUT_OPEN
-    tokens[b0['s0']:b0['s1']]                   = x_S
-    tokens[b0['s1']:b0['s_close_end']]          = INPUT_CLOSE
-    tokens[b0['s_close_end']:b0['sl0']]         = HIDDEN_OPEN
+    tokens[b0['block_start']:b0['sl0']]         = MEM_OPEN
     tokens[b0['sl0']:b0['sl1']]                 = slot_ids
-    tokens[b0['sl1']:b0['mc1']]                 = HIDDEN_CLOSE
+    tokens[b0['sl1']:b0['mc1']]                 = MEM_CLOSE
+    tokens[b0['mc1']:b0['s0']]                  = SRC_OPEN
+    tokens[b0['s0']:b0['s1']]                   = x_S
+    tokens[b0['s1']:b0['s_close_end']]          = SRC_CLOSE
     rs = pos['recall_start']
-    tokens[rs:rs+QUERY_OPEN_LEN]                 = QUERY_OPEN
+    tokens[rs:rs+FROM_OPEN_LEN]                 = FROM_OPEN
     tokens[pos['f0']:pos['f1']]                 = warmup
-    tokens[pos['f1']:pos['f1']+QUERY_CLOSE_LEN]  = QUERY_CLOSE
-    fc_end = pos['f1'] + QUERY_CLOSE_LEN
-    tokens[fc_end:fc_end+OUTPUT_OPEN_LEN]         = OUTPUT_OPEN
+    tokens[pos['f1']:pos['f1']+FROM_CLOSE_LEN]  = FROM_CLOSE
+    fc_end = pos['f1'] + FROM_CLOSE_LEN
+    tokens[fc_end:fc_end+CONT_OPEN_LEN]         = CONT_OPEN
 
     tok_t     = torch.tensor(tokens, dtype=torch.long, device=device)
     generated = []
@@ -174,7 +173,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     wd          = hp['wd']
     eval_every  = hp['eval_every']
     log_every   = hp['log_every']
-    # slot_style removed — learned embeddings use make_mem_slot_ids()
+    slot_style  = hp['slot_style']
     drop_close_prob = hp['drop_close_prob']
     warmup_steps = hp['warmup_steps']
     cycle_steps  = hp['cycle_steps']
@@ -183,7 +182,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     _ocd_prob    = hp['ocd_prob']
     grad_clip    = hp['grad_clip']
     dataset_size = hp['dataset_size']
-    # active_slots removed — slot_len IS the bottleneck
+    active_slots = hp['active_slots']
     log_probs_fn = _stablemax_log_probs if hp['stablemax'] else \
                    lambda x: F.log_softmax(x, dim=-1)
     eval_offset  = hp['eval_offset']
@@ -210,7 +209,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         'seg_len':     hp['seg_len'],
         'slot_len':    hp.get('slot_len', hp['seg_len']),
         'warmup_len':  hp.get('warmup_len', 16),
-        'intermed_len':  hp.get('intermed_len', 0),
+        'ponder_len':  hp.get('ponder_len', 0),
         'out_len':     hp.get('out_len', 32),
         'n_blocks':    hp.get('n_blocks', 1),
         'recall_from': hp.get('recall_from', 0),
@@ -239,7 +238,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                       max_stage.get('slot_len', max_stage['seg_len']),
                                       max_stage.get('warmup_len', 32),
                                       max_stage.get('out_len', 128),
-                                      max_stage.get('intermed_len', 0))
+                                      max_stage.get('ponder_len', 0))
     L_max_seq = max_pos['L']
     hp_model  = dict(hp, seg_len=max_stage['seg_len'],
                      slot_len=max_stage.get('slot_len', max_stage['seg_len']),
@@ -273,8 +272,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         p  = multi_block_positions(nb, st['seg_len'],
                                    st.get('slot_len', st['seg_len']),
                                    st.get('warmup_len', 16), st.get('out_len', 32),
-                                   st.get('intermed_len', 0))
-        pl = st.get('intermed_len', 0)
+                                   st.get('ponder_len', 0))
+        pl = st.get('ponder_len', 0)
         _log(f'    stage {i}: n_blocks={nb} recall_from={rf}'
              f'  seg={st["seg_len"]}  slot={st.get("slot_len",st["seg_len"])}'
              f'  wl={st.get("warmup_len",16)}'
@@ -292,7 +291,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         seg_len    = stage['seg_len']
         slot_len   = stage.get('slot_len', seg_len)
         warmup_len = stage.get('warmup_len', 16)
-        intermed_len = stage.get('intermed_len', 0)
+        ponder_len = stage.get('ponder_len', 0)
         out_len    = stage.get('out_len', 32)
         n_blocks   = stage.get('n_blocks', 1)
         recall_from = stage.get('recall_from', 0)
@@ -309,25 +308,25 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             return max(lr_max * 1e-2, lr_max * 0.5 * (1 + math.cos(math.pi * t / _cycle)))
 
         pos     = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len,
-                                        intermed_len)
+                                        ponder_len)
         L_total = pos['L']
         c0, c1  = pos['c0'], pos['c1']
         mask_t  = torch.tensor(
             make_mask_multi(n_blocks, seg_len, slot_len, warmup_len, out_len,
-                            intermed_len),
+                            active_slots, ponder_len),
             dtype=torch.float32, device=device)
 
         test_seqs = make_test_sequences(seg_len)
         val_np    = make_multi_batch(
             np.random.default_rng(seed + stage_i + 1),
-            B, n_blocks, recall_from, seg_len, slot_len,
-            warmup_len, out_len, drop_close_prob=0.0, intermed_len=intermed_len)
+            B, n_blocks, recall_from, seg_len, slot_len, slot_style,
+            warmup_len, out_len, drop_close_prob=0.0, ponder_len=ponder_len)
         pool_rng  = np.random.default_rng(seed + stage_i + 1000)
         ds   = dataset_size if dataset_size > 0 else None
         pool = (np.stack([make_multi_batch(pool_rng, B, n_blocks, recall_from,
-                                           seg_len, slot_len,
+                                           seg_len, slot_len, slot_style,
                                            warmup_len, out_len, drop_close_prob,
-                                           intermed_len)
+                                           ponder_len)
                           for _ in range(ds)])
                 if ds else None)
         _log(f'  dataset: {"infinite" if ds is None else f"{ds} batches ({ds*B} examples)"}')
@@ -352,9 +351,9 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             tokens_np = (pool[(local_step - 1) % ds]
                          if pool is not None
                          else make_multi_batch(rng, B, n_blocks, recall_from,
-                                               seg_len, slot_len,
+                                               seg_len, slot_len, slot_style,
                                                warmup_len, out_len, drop_close_prob,
-                                               intermed_len))
+                                               ponder_len))
 
             if use_ocd:
                 _p     = _resolve_ocd_prob(local_step)
@@ -378,16 +377,15 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 mode = 'ocd'
             else:
                 # Full-pass TF — exact gradients
-                # Supervise only <c> positions; targets there are always data bytes (0-255).
-                # V_out=256 so we gather only on the output region to avoid out-of-range
-                # indices from special token IDs (256+) in other sequence positions.
-                tokens   = torch.tensor(tokens_np, device=device)
+                tokens  = torch.tensor(tokens_np, device=device)
                 opt.zero_grad()
-                logits   = model(tokens, mask_t)                    # (B, L, 256)
-                lp_c     = log_probs_fn(logits[:, c0-1:c1-1])       # (B, out_len, 256)
-                tgts_c   = tokens[:, c0:c1]                         # (B, out_len) in [0,255]
-                nll_c    = -lp_c.gather(2, tgts_c.unsqueeze(-1)).squeeze(-1)
-                loss_val = nll_c.mean()
+                logits  = model(tokens, mask_t)
+                lp      = log_probs_fn(logits[:, :-1])
+                tgts    = tokens[:, 1:]
+                nll     = -lp.gather(2, tgts.unsqueeze(-1)).squeeze(-1)
+                mask_y  = torch.zeros(L_total - 1, device=device)
+                mask_y[c0:c1] = 1.0
+                loss_val = (nll * mask_y).sum(1).mean() / (c1 - c0)
                 mode = 'tf'
 
             loss_val.backward()
@@ -406,11 +404,11 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 model.eval()
                 with torch.no_grad():
                     val_tok  = torch.tensor(val_np, device=device)
-                    val_log  = model(val_tok, mask_t)               # (B, L, 256)
-                    val_lp_c = F.log_softmax(val_log[:, c0-1:c1-1], dim=-1)
-                    val_tgt  = val_tok[:, c0:c1]                    # always 0-255
-                    val_nll  = -val_lp_c.gather(2, val_tgt.unsqueeze(-1)).squeeze(-1)
-                    val_loss = float(val_nll.mean())
+                    val_lp   = F.log_softmax(model(val_tok, mask_t)[:, :-1], dim=-1)
+                    val_nll  = -val_lp.gather(2, val_tok[:, 1:].unsqueeze(-1)).squeeze(-1)
+                    val_mask = torch.zeros(L_total - 1, device=device)
+                    val_mask[c0:c1] = 1.0
+                    val_loss = float((val_nll * val_mask).sum(1).mean() / (c1 - c0))
                     val_bpb  = val_loss / math.log(2)
                 elapsed = time.time() - t0
                 _log(f'\n--- stage={stage_i} step={local_step}/{n_steps}  g={global_step}'
@@ -427,7 +425,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     if len(warmup) < warmup_len:
                         warmup = [x_S[0]] * (warmup_len - len(warmup)) + list(warmup)
                     target  = x_S[y_start:y_end]
-                    gen     = ar_decode_role(model, x_S, slot_len,
+                    gen     = ar_decode_role(model, x_S, slot_len, slot_style,
                                              warmup, len(target), device)
                     c = cer(gen, target)
                     all_cer.append(c)
@@ -435,12 +433,10 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     _log(f'  {ok} {name:15s} <f>[{f_start}:{y_start}]</f>'
                          f' <c>[{y_start}:{y_end}]</c>'
                          f'  match={100*(1-c):5.1f}%  CER={c:.3f}')
-                    def _tok_hex(seq):
-                        return ''.join(f'{t:02x}' if t < 256 else f'[{t}]' for t in seq)
-                    _log(f'    src={_tok_hex(x_S)}')
-                    _log(f'    wup={_tok_hex(warmup)}')
-                    _log(f'    gen={_tok_hex(gen)}')
-                    _log(f'    ref={_tok_hex(target)}')
+                    _log(f'    src={bytes(x_S).hex()}')
+                    _log(f'    wup={bytes(warmup).hex()}')
+                    _log(f'    gen={bytes(gen).hex()}')
+                    _log(f'    ref={bytes(target).hex()}')
 
                 mean_cer = sum(all_cer) / len(all_cer)
                 _log(f'  → mean CER={mean_cer:.3f}  match={100*(1-mean_cer):.1f}%')
@@ -491,14 +487,14 @@ CURRICULUM_SURAH = [
 ]
 
 DEFAULTS = dict(
-    seg_len=32, slot_len=32, d=64, n_layers=4, n_heads=4, d_ff=256,
+    seg_len=32, slot_len=32, V=256, d=64, n_layers=4, n_heads=4, d_ff=256,
     B=64, lr_max=3e-4, wd=0.001, warmup_steps=1000, cycle_steps=0,
     n_steps=10000, eval_every=5000, log_every=1000,
-    warmup_len=8, out_len=8,
+    slot_style='seq', warmup_len=8, out_len=8,
     rope=True, yarn=True, grok=False, seed=42,
     drop_close_prob=0.5,
     ocd=False, ocd_prob=0.01, tf_warmup=0,
-    grad_clip=10.0, dataset_size=5000,
+    grad_clip=10.0, dataset_size=5000, active_slots=2,
     stablemax=False, eval_offset=0.25,
     grad_checkpoint=False,
     n_blocks=1, recall_from=0,
@@ -531,6 +527,7 @@ if __name__ == '__main__':
     p.add_argument('--ocd-prob',        type=str)
     p.add_argument('--grad-clip',       type=float)
     p.add_argument('--dataset-size',    type=int)
+    p.add_argument('--active-slots',    type=int)
     p.add_argument('--eval-offset',     type=float)
     p.add_argument('--stablemax',       action='store_true')
     p.add_argument('--grad-checkpoint', action='store_true',
@@ -560,9 +557,9 @@ if __name__ == '__main__':
         ('steps', 'n_steps'), ('eval_every', 'eval_every'), ('log_every', 'log_every'),
         ('warmup_len', 'warmup_len'), ('out_len', 'out_len'),
         ('warmup_steps', 'warmup_steps'), ('cycle_steps', 'cycle_steps'),
-        ('seed', 'seed'),
+        ('slot_style', 'slot_style'), ('seed', 'seed'),
         ('grad_clip', 'grad_clip'), ('dataset_size', 'dataset_size'),
-        ('eval_offset', 'eval_offset'),
+        ('active_slots', 'active_slots'), ('eval_offset', 'eval_offset'),
         ('n_blocks', 'n_blocks'), ('recall_from', 'recall_from'),
     ]:
         v = getattr(args, src, None)

@@ -152,23 +152,11 @@ class KVMemModel(nn.Module):
                  d_ff: int,
                  rope: bool = False, yarn: bool = False,
                  L_train: int = 512, L_max: int = 4096,
-                 grad_checkpoint: bool = False,
-                 V_out: int = 256):
-        """
-        V     : input vocab size (covers data bytes + special tag/slot tokens)
-        V_out : output vocab size (default 256 — only data bytes are predicted)
-
-        Special tokens (tags, slot IDs, ponder IDs) appear in the INPUT only.
-        The model never needs to predict them, so the output head stays at 256.
-        This avoids "bytes out of range" errors and keeps loss over data bytes only.
-        """
+                 grad_checkpoint: bool = False):
         super().__init__()
-        n_special            = V - 256             # number of special tokens (tags, slot IDs)
-        self.data_embed      = nn.Embedding(256, d)        # data bytes 0-255
-        self.special_embed   = nn.Embedding(n_special, d)  # special tokens 256+
-        self.n_special       = n_special
+        self.embed           = nn.Embedding(V, d)
         self.norm_out        = nn.LayerNorm(d)
-        self.W_out           = nn.Linear(d, V_out, bias=False)  # output: data bytes only
+        self.W_out           = nn.Linear(d, V, bias=False)
         self.grad_checkpoint = grad_checkpoint
 
         freqs = None
@@ -183,27 +171,11 @@ class KVMemModel(nn.Module):
         ])
         self._init_weights()
 
-    def _embed(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Route tokens to data_embed (0-255) or special_embed (256+)."""
-        is_sp = tokens >= 256
-        data_ids    = tokens.clamp(0, 255)
-        special_ids = (tokens - 256).clamp(0, self.n_special - 1)
-        d_emb = self.data_embed(data_ids)
-        s_emb = self.special_embed(special_ids)
-        mask  = is_sp.unsqueeze(-1).to(d_emb.dtype)
-        return s_emb * mask + d_emb * (1.0 - mask)
-
     def _init_weights(self):
-        # Data embeddings: standard small normal (content tokens)
-        nn.init.normal_(self.data_embed.weight, std=0.02)
-        # Special embeddings: slightly larger, orthogonal-ish init
-        # (structural tokens need stronger, distinct representations)
-        nn.init.normal_(self.special_embed.weight, std=0.05)
-        nn.init.normal_(self.W_out.weight, std=0.02)
         for name, p in self.named_parameters():
             if 'embed' in name or 'W_out' in name:
-                continue   # already initialized above
-            if p.dim() == 2:
+                nn.init.normal_(p, std=0.02)
+            elif p.dim() == 2:
                 nn.init.normal_(p, std=math.sqrt(2.0 / p.shape[-1]))
 
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor,
@@ -224,7 +196,7 @@ class KVMemModel(nn.Module):
         batched = tokens.dim() == 2
         if not batched:
             tokens = tokens.unsqueeze(0)
-        x      = self._embed(tokens)
+        x      = self.embed(tokens)
         kv_out = []
         L_past = past_kv[0][0].shape[2] if past_kv is not None else 0
         _offset = offset if offset else L_past
@@ -269,21 +241,14 @@ class KVMemModel(nn.Module):
 
 
 def build_model(hp: dict, device=None) -> KVMemModel:
-    # V_in covers all tokens (data + special); V_out = 256 (data bytes only)
-    if 'V' in hp:
-        V_in = hp['V']
-    else:
-        from kvmem.data import compute_vocab_size
-        V_in = compute_vocab_size(hp.get('slot_len', 8), hp.get('ponder_len', 0))
     model = KVMemModel(
-        V=V_in, d=hp['d'], n_layers=hp['n_layers'],
+        V=hp['V'], d=hp['d'], n_layers=hp['n_layers'],
         n_heads=hp['n_heads'], d_ff=hp['d_ff'],
         rope=hp.get('rope', False),
         yarn=hp.get('yarn', False),
         L_train=hp.get('L_train', hp.get('seg_len', 512)),
         L_max=hp.get('L_max', hp.get('seg_len', 512) * 8),
         grad_checkpoint=hp.get('grad_checkpoint', False),
-        V_out=256,  # output always over data bytes only
     )
     if device is not None:
         model = model.to(device)

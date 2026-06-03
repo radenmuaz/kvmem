@@ -66,8 +66,10 @@ MEM_OVERHEAD  = MEM_OPEN_LEN + MEM_CLOSE_LEN  # 7
 
 def make_slot_ids_tag(N: int, style: str = 'seq') -> list[int]:
     """
-    Return N slot tokens for tag-based scheme (legacy, kept for compat).
-    Prefer make_mem_slot_ids() / make_ponder_slot_ids() for new code.
+    Return N slot tokens for tag-based scheme.
+
+    style='zeros': all tokens are 0x00 — positional encoding (YaRN) alone must route.
+    style='seq':   token i = i % 256   — position + token identity both available.
     """
     if style == 'zeros':
         return [0x00] * N
@@ -78,104 +80,50 @@ def make_slot_ids_tag(N: int, style: str = 'seq') -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Learned-embedding token vocab  (v2)
+# Role-tag scheme: explicit <s>, <f>, <c> anchor tags
 # ---------------------------------------------------------------------------
-# DB-style tag vocabulary  (d=data, e=extract, k=key, q=query, v=value)
+# Sequence:
+#   <s> x_S </s> <m> slots </m> <f> warmup </f> <c> output </c>
 #
-# Data bytes   : IDs 0–255    (all 256 byte values, unchanged)
-# Boundary tags: IDs 256–265  (1 token each, never appear in data)
-# Key slots    : IDs 266–265+hidden_len    (1 per key position, style D)
-# Extract slots: IDs 266+hidden_len–…     (1 per extract position, style D)
+# Tags (printable ASCII, from existing 256-token vocab):
+#   SRC_OPEN   '<s>'  = [0x3C, 0x73, 0x3E]       3 bytes
+#   SRC_CLOSE  '</s>' = [0x3C, 0x2F, 0x73, 0x3E] 4 bytes
+#   FROM_OPEN  '<f>'  = [0x3C, 0x66, 0x3E]       3 bytes
+#   FROM_CLOSE '</f>' = [0x3C, 0x2F, 0x66, 0x3E] 4 bytes
+#   CONT_OPEN  '<c>'  = [0x3C, 0x63, 0x3E]       3 bytes
+#   CONT_CLOSE '</c>' = [0x3C, 0x2F, 0x63, 0x3E] 4 bytes
 #
-# V = 256 + 10 + hidden_len + intermed_len  (computed by compute_vocab_size)
-#
-# Sequence layout (source-first, fully causal):
-#   <d> data_bytes </x>
-#   [<e> extract_0 ... extract_{P-1} </z>]   ← ponder before compression
-#   <k> key_0 ... key_{N-1} </h>             ← compressed memory
-#   <q> warmup </q>                           ← query anchor
-#   <v> output </y>                           ← returned value
-#
-# Causal access: e sees d; k sees d+e; q/v blocked from d+e (bottleneck via k).
-# All boundary tags are 1 token; all lengths = 1.
+# Key mask rules:
+#   - slots attend to x_S (encode source into KV)
+#   - <f>warmup</f> attends to slots (locate position via KV)
+#   - <c>output</c> attends to slots + <f>...</f>, CANNOT see x_S directly
+#   - Nothing outside <c> attends to <c> (write-only output)
 # ---------------------------------------------------------------------------
 
-# Boundary tag IDs (IDs 256–265)
-HIDDEN_OPEN_ID      = 256   # <k>  key/memory open
-HIDDEN_CLOSE_ID     = 257   # </h>
-INPUT_OPEN_ID     = 258   # <d>  data/source open
-INPUT_CLOSE_ID    = 259   # </x>
-QUERY_OPEN_ID    = 260   # <q>  query/anchor open
-QUERY_CLOSE_ID   = 261   # </q>
-INTERMED_OPEN_ID  = 262   # <e>  extract/ponder open
-INTERMED_CLOSE_ID = 263   # </z>
-OUTPUT_OPEN_ID    = 264   # <v>  value/output open
-OUTPUT_CLOSE_ID   = 265   # </y>
+SRC_OPEN    = [0x3C, 0x73, 0x3E]           # '<s>'
+SRC_CLOSE   = [0x3C, 0x2F, 0x73, 0x3E]    # '</s>'
+FROM_OPEN   = [0x3C, 0x66, 0x3E]           # '<f>'
+FROM_CLOSE  = [0x3C, 0x2F, 0x66, 0x3E]    # '</f>'
+PONDER_OPEN  = [0x3C, 0x70, 0x3E]          # '<p>'  — ponder scratchpad
+PONDER_CLOSE = [0x3C, 0x2F, 0x70, 0x3E]   # '</p>'
+CONT_OPEN   = [0x3C, 0x63, 0x3E]           # '<c>'
+CONT_CLOSE  = [0x3C, 0x2F, 0x63, 0x3E]    # '</c>'
 
-# Base ID for key/extract position tokens (style D: unique per position)
-HIDDEN_SLOT_BASE    = 266   # key slot i → HIDDEN_SLOT_BASE + i
-# extract slot j → HIDDEN_SLOT_BASE + hidden_len + j  (hidden_len known at runtime)
+SRC_OPEN_LEN     = len(SRC_OPEN)       # 3
+SRC_CLOSE_LEN    = len(SRC_CLOSE)      # 4
+FROM_OPEN_LEN    = len(FROM_OPEN)      # 3
+FROM_CLOSE_LEN   = len(FROM_CLOSE)     # 4
+PONDER_OPEN_LEN  = len(PONDER_OPEN)    # 3
+PONDER_CLOSE_LEN = len(PONDER_CLOSE)   # 4
+CONT_OPEN_LEN    = len(CONT_OPEN)      # 3
+CONT_CLOSE_LEN   = len(CONT_CLOSE)     # 4
 
-N_BOUNDARY_TAGS  = 10
-
-# List form for batch builder
-HIDDEN_OPEN     = [HIDDEN_OPEN_ID]
-HIDDEN_CLOSE    = [HIDDEN_CLOSE_ID]
-INPUT_OPEN    = [INPUT_OPEN_ID]
-INPUT_CLOSE   = [INPUT_CLOSE_ID]
-QUERY_OPEN   = [QUERY_OPEN_ID]
-QUERY_CLOSE  = [QUERY_CLOSE_ID]
-INTERMED_OPEN  = [INTERMED_OPEN_ID]
-INTERMED_CLOSE = [INTERMED_CLOSE_ID]
-OUTPUT_OPEN   = [OUTPUT_OPEN_ID]
-OUTPUT_CLOSE  = [OUTPUT_CLOSE_ID]
-
-# All tag lengths = 1
-HIDDEN_OPEN_LEN = HIDDEN_CLOSE_LEN         = 1
-INPUT_OPEN_LEN = INPUT_CLOSE_LEN       = 1
-QUERY_OPEN_LEN = QUERY_CLOSE_LEN     = 1
-INTERMED_OPEN_LEN = INTERMED_CLOSE_LEN = 1
-OUTPUT_OPEN_LEN = OUTPUT_CLOSE_LEN     = 1
-
-# Backward-compat aliases (old names → new)
-MEM_OPEN_LEN = MEM_CLOSE_LEN     = 1  # <k>
-SRC_OPEN_LEN = SRC_CLOSE_LEN     = 1  # <d>
-FROM_OPEN_LEN = FROM_CLOSE_LEN   = 1  # <q>
-PONDER_OPEN_LEN = PONDER_CLOSE_LEN = 1  # <e>
-CONT_OPEN_LEN = CONT_CLOSE_LEN   = 1  # <v>
-
-MEM_OPEN = HIDDEN_OPEN;   MEM_CLOSE = HIDDEN_CLOSE
-SRC_OPEN = INPUT_OPEN;  SRC_CLOSE = INPUT_CLOSE
-FROM_OPEN = QUERY_OPEN; FROM_CLOSE = QUERY_CLOSE
-PONDER_OPEN = INTERMED_OPEN; PONDER_CLOSE = INTERMED_CLOSE
-CONT_OPEN = OUTPUT_OPEN; CONT_CLOSE = OUTPUT_CLOSE
-
-ROLE_OVERHEAD = (HIDDEN_OPEN_LEN + HIDDEN_CLOSE_LEN +
-                 INPUT_OPEN_LEN + INPUT_CLOSE_LEN +
-                 QUERY_OPEN_LEN + QUERY_CLOSE_LEN +
-                 OUTPUT_OPEN_LEN + OUTPUT_CLOSE_LEN)
-
-
-def compute_vocab_size(hidden_len: int, intermed_len: int = 0) -> int:
-    """V = 256 (data) + 10 (boundary tags) + hidden_len + intermed_len."""
-    return 256 + N_BOUNDARY_TAGS + hidden_len + intermed_len
-
-
-def make_hidden_slot_ids(hidden_len: int) -> list[int]:
-    """key slot i = HIDDEN_SLOT_BASE + i  (IDs 266..265+hidden_len)"""
-    return [HIDDEN_SLOT_BASE + i for i in range(hidden_len)]
-
-# backward-compat alias
-make_mem_slot_ids = make_hidden_slot_ids
-
-
-def make_intermed_slot_ids(intermed_len: int, hidden_len: int) -> list[int]:
-    """extract slot j = HIDDEN_SLOT_BASE + hidden_len + j"""
-    base = HIDDEN_SLOT_BASE + hidden_len
-    return [base + j for j in range(intermed_len)]
-
-# backward-compat alias
-make_ponder_slot_ids = make_intermed_slot_ids
+# Overhead: <s></s><m></m><f></f><c></c> = (3+4)+(3+4)+(3+4)+(3+4) = 28
+# (excludes optional <p></p>)
+ROLE_OVERHEAD = (SRC_OPEN_LEN + SRC_CLOSE_LEN +
+                 MEM_OPEN_LEN + MEM_CLOSE_LEN +
+                 FROM_OPEN_LEN + FROM_CLOSE_LEN +
+                 CONT_OPEN_LEN + CONT_CLOSE_LEN)
 
 
 def make_mask_role(L_S: int, N: int, L_f: int, L_c: int,
@@ -314,66 +262,56 @@ def _sample_seg(rng: np.random.Generator, seg_len: int) -> np.ndarray:
 
 def multi_block_positions(n_blocks: int, seg_len: int, slot_len: int,
                           warmup_len: int, out_len: int,
-                          intermed_len: int = 0) -> dict:
+                          ponder_len: int = 0) -> dict:
     """
-    Absolute token positions for a multi-block sequence.
+    Absolute token positions for a memory-first multi-block sequence.
 
-    Block layout (fully causal, no overrides):
-        <s>src</s> [<p>ponder</p>] <m>slots</m>
+    Block layout:   <m>slots</m><s>src</s>
+    Full sequence:  [block_0]...[block_{n-1}]
+                    <f>warmup</f> [<p>ponder</p>] <c>output</c>
 
-    Causal access within each block:
-        <p> sees src  (src before p)
-        <m> sees src + ponder  (both before m)
-        <p> CANNOT see <m>  (m after p — blocked by causal)
+    ponder_len=0 (default): no <p> region, <c> follows directly after </f>.
+    ponder_len>0: model has a scratchpad between warmup and output.
+      <p> attends to slots + <f>; <c> attends to <p> + slots + <f>.
+      No loss on <p> — model uses it freely. Supervised only on <c>.
 
-    Recall region:  <f>warmup</f> <c>output</c>
-        <f>/<c> blocked from src AND ponder (explicit) — bottleneck via slots only.
-
-    intermed_len=0: block is just <s>src</s><m>slots</m>  (no ponder tags written)
+    n_blocks=1 is the single-block degenerate case.
 
     Returns a dict with:
-      blocks[i]    : {block_start, s0, s1, s_close_end,
-                      p_open, p0, p1, p_close_end,  (p* same as s_close_end when intermed_len==0)
-                      sl0, sl1, mc1}
-      recall_start, f0, f1, fc1, c0, c1, L
-      mc1  : last block </m> end (kvcache prefix split)
+      blocks[i]    : {block_start, sl0, sl1, mc1, s0, s1, s_close_end}
+      recall_start : start of recall region (= n_blocks * BLOCK_LEN)
+      f0, f1, fc1  : warmup region
+      p0, p1, pc1  : ponder region (p0==p1==pc1==fc1 when ponder_len==0)
+      c0, c1, L    : output region and total length
+      mc1          : last block </m> end (kvcache prefix split point)
     """
-    # Per-block length depends on whether ponder is included
-    EXTRACT_BLOCK = (INTERMED_OPEN_LEN + intermed_len + INTERMED_CLOSE_LEN) if intermed_len > 0 else 0
-    BLOCK_LEN = (INPUT_OPEN_LEN + seg_len + INPUT_CLOSE_LEN +
-                 EXTRACT_BLOCK +
-                 MEM_OPEN_LEN + slot_len + MEM_CLOSE_LEN)
+    BLOCK_LEN = (MEM_OPEN_LEN + slot_len + MEM_CLOSE_LEN +
+                 SRC_OPEN_LEN + seg_len  + SRC_CLOSE_LEN)
     blocks = []
     for i in range(n_blocks):
         bs          = i * BLOCK_LEN
-        s0          = bs + SRC_OPEN_LEN
-        s1          = s0 + seg_len
-        s_close_end = s1 + SRC_CLOSE_LEN
-        # Optional ponder region inside encoding block
-        if intermed_len > 0:
-            p_open      = s_close_end
-            p0          = p_open + PONDER_OPEN_LEN
-            p1          = p0 + intermed_len
-            p_close_end = p1 + PONDER_CLOSE_LEN
-        else:
-            p_open = p0 = p1 = p_close_end = s_close_end
-        sl0         = p_close_end + MEM_OPEN_LEN
+        sl0         = bs + MEM_OPEN_LEN
         sl1         = sl0 + slot_len
         mc1         = sl1 + MEM_CLOSE_LEN
-        blocks.append(dict(block_start=bs,
-                           s0=s0, s1=s1, s_close_end=s_close_end,
-                           p_open=p_open, p0=p0, p1=p1, p_close_end=p_close_end,
-                           sl0=sl0, sl1=sl1, mc1=mc1))
+        s0          = mc1 + SRC_OPEN_LEN
+        s1          = s0 + seg_len
+        s_close_end = s1 + SRC_CLOSE_LEN
+        blocks.append(dict(block_start=bs, sl0=sl0, sl1=sl1, mc1=mc1,
+                           s0=s0, s1=s1, s_close_end=s_close_end))
     recall_start = n_blocks * BLOCK_LEN
     f0  = recall_start + FROM_OPEN_LEN
     f1  = f0 + warmup_len
     fc1 = f1 + FROM_CLOSE_LEN
-    c0  = fc1 + CONT_OPEN_LEN
+    # ponder region (optional scratchpad)
+    p0  = fc1 + (PONDER_OPEN_LEN  if ponder_len > 0 else 0)
+    p1  = p0  + ponder_len
+    pc1 = p1  + (PONDER_CLOSE_LEN if ponder_len > 0 else 0)
+    c0  = pc1 + CONT_OPEN_LEN
     c1  = c0  + out_len
     L   = c1  + CONT_CLOSE_LEN
     return dict(blocks=blocks, recall_start=recall_start,
                 f0=f0, f1=f1, fc1=fc1,
-                p0=fc1, p1=fc1, pc1=fc1,   # no recall-region ponder
+                p0=p0, p1=p1, pc1=pc1,
                 c0=c0, c1=c1, L=L,
                 sl0=blocks[0]['sl0'], sl1=blocks[0]['sl1'],
                 s0=blocks[0]['s0'],   s1=blocks[0]['s1'],
@@ -382,108 +320,116 @@ def multi_block_positions(n_blocks: int, seg_len: int, slot_len: int,
 
 def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
                     warmup_len: int, out_len: int,
-                    intermed_len: int = 0) -> np.ndarray:
+                    active_slots: int = 0,
+                    ponder_len: int = 0) -> np.ndarray:
     """
-    Attention mask for multi-block sequences. Pure causal — no non-causal overrides.
+    Attention mask for memory-first multi-block sequences.
 
-    Block: <s>src</s> [<p>ponder</p>] <m>slots</m>
-      Causal access:
-        <p> sees src only  (src before p; m after p = blocked by causal)
-        <m> sees src + ponder  (both before m)
-      Explicit blocks on recall:
-        <f>/<c> BLOCKED from src and ponder — bottleneck enforced via slots only
-        <c> is write-only
+    ponder_len=0 (default): no ponder region, same as before.
+    ponder_len>0: inserts <p>ponder</p> between </f> and <c>.
+      - <p> rows: attend to slots + <f> warmup; cannot see src.
+      - <c> rows: additionally attend to <p> (causally prior).
+      - <p> is write-only from ingestion region (falls out of causal).
 
-    Cross-block: slots_i blocked from src_j, ponder_j, slots_j (j≠i).
-    active_slots removed — slot_len IS the bottleneck.
+    Mask is built as:
+        visible = (causal | slots_read_own_src) & ~blocked
     """
     pos    = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len,
-                                   intermed_len)
+                                   ponder_len)
     L      = pos['L']
     blocks = pos['blocks']
     r      = np.arange(L)
     c      = np.arange(L)
     causal  = c[None, :] <= r[:, None]
     blocked = np.zeros((L, L), dtype=bool)
+    extra   = np.zeros((L, L), dtype=bool)
 
-    # Recall region rows
-    is_f_row    = (r >= pos['recall_start']) & (r < pos['fc1'])
-    is_c_row    = r >= pos['fc1']
-    is_c_col    = c >= pos['fc1']
-    recall_rows = is_f_row | is_c_row
-
-    # All src and ponder col regions across blocks
-    is_any_src    = np.zeros(L, dtype=bool)
-    is_any_ponder = np.zeros(L, dtype=bool)
-    for b in blocks:
-        is_any_src |= (c >= b['s0']) & (c < b['s1'])
-        if intermed_len > 0:
-            is_any_ponder |= (c >= b['p0']) & (c < b['p1'])
-
-    # <c> write-only
-    blocked |= is_c_col[None, :] & ~is_c_row[:, None]
-    # recall rows blocked from src and ponder (forced through slot bottleneck)
-    blocked |= recall_rows[:, None] & is_any_src[None, :]
-    blocked |= recall_rows[:, None] & is_any_ponder[None, :]
-
-    # Cross-block slot isolation
     for i, b in enumerate(blocks):
         slot_row = (r >= b['sl0']) & (r < b['sl1'])
+        src_col  = (c >= b['s0'])  & (c < b['s1'])
+        # Non-causal: slots_i read src_i
+        extra |= slot_row[:, None] & src_col[None, :]
+        # Cross-block isolation
         for j, bj in enumerate(blocks):
             if j == i:
                 continue
-            cross_col = ((c >= bj['s0'])  & (c < bj['s1']))  | \
-                        ((c >= bj['sl0']) & (c < bj['sl1'])) | \
-                        ((c >= bj['p0'])  & (c < bj['p1']))
+            cross_col = ((c >= bj['s0'])  & (c < bj['s1'])) | \
+                        ((c >= bj['sl0']) & (c < bj['sl1']))
             blocked |= slot_row[:, None] & cross_col[None, :]
 
-    visible = causal & ~blocked
+    # Recall region row masks
+    fc1 = pos['fc1']
+    pc1 = pos['pc1']   # end of </p>; equals fc1 when ponder_len==0
+    is_f_row = (r >= pos['recall_start']) & (r < fc1)
+    is_p_row = (r >= fc1) & (r < pc1)     # empty when ponder_len==0
+    is_c_row = r >= pc1
+    is_c_col = c >= pc1
+
+    is_any_src = np.zeros(L, dtype=bool)
+    for b in blocks:
+        is_any_src |= (c >= b['s0']) & (c < b['s1'])
+
+    blocked |= is_c_col[None, :] & ~is_c_row[:, None]  # <c> write-only
+    blocked |= is_c_row[:, None] & is_any_src[None, :]  # <c> no src
+    blocked |= is_f_row[:, None] & is_any_src[None, :]  # <f> no src
+    blocked |= is_p_row[:, None] & is_any_src[None, :]  # <p> no src
+
+    recall_rows = is_f_row | is_p_row | is_c_row
+    if active_slots > 0:
+        for b in blocks:
+            if slot_len > active_slots:
+                inactive_end = b['sl0'] + (slot_len - active_slots)
+                is_inactive  = (c >= b['sl0']) & (c < inactive_end)
+                blocked |= recall_rows[:, None] & is_inactive[None, :]
+
+    visible = (causal | extra) & ~blocked
     return np.where(visible, 0.0, -1e9).astype(np.float32)
 
 
 def make_multi_batch(rng: np.random.Generator, B: int,
                      n_blocks: int, recall_from: int,
-                     seg_len: int, slot_len: int,
+                     seg_len: int, slot_len: int, slot_style: str,
                      warmup_len: int, out_len: int,
                      drop_close_prob: float = 0.5,
-                     intermed_len: int = 0) -> np.ndarray:
+                     ponder_len: int = 0) -> np.ndarray:
     """
-    Build one memory-first multi-block batch (style D learned embeddings).
+    Build one memory-first multi-block role-tag batch.
 
-    Each block:  <m> slot_0 slot_1 ... slot_{N-1} </m> <s> src </s>
-    Recall:      <f> warmup </f> [<p> ponder_0 ... </p>] <c> output </c>
+    Each block layout:  <m>slots</m><s>src</s>
 
-    Memory slots: dedicated token IDs SLOT_BASE+i (no data collision, unique V).
-    Ponder slots: dedicated token IDs SLOT_BASE+slot_len+j (unique per position).
-    Source bytes: regular data bytes 0–255 (unchanged).
-
-    recall_from: which block index (0-based) the <f><c> pair queries.
+    recall_from: which block index (0-indexed) the <f><c> pair queries.
     n_blocks=1, recall_from=0 is the single-block degenerate case.
+
+    Example (n_blocks=2, recall_from=0):
+
+        <m>slots_0</m><s>src_0</s>  <m>slots_1</m><s>src_1</s>
+        <f>warmup_from_src_0</f><c>continuation_of_src_0</c>
+
+    Example (n_blocks=2, recall_from=1):
+
+        <m>slots_0</m><s>src_0</s>  <m>slots_1</m><s>src_1</s>
+        <f>warmup_from_src_1</f><c>continuation_of_src_1</c>
+
+    The model must route the query anchor to the correct slot bank.
     """
-    pos        = multi_block_positions(n_blocks, seg_len, slot_len,
-                                       warmup_len, out_len, intermed_len)
-    L          = pos['L']
-    slot_ids   = make_hidden_slot_ids(slot_len)
-    ponder_ids = make_intermed_slot_ids(intermed_len, slot_len) if intermed_len > 0 else []
-    out        = np.zeros((B, L), dtype=np.int64)
-    n_win      = max(1, seg_len - out_len)
+    pos      = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len,
+                                     ponder_len)
+    L        = pos['L']
+    slot_ids = make_slot_ids_tag(slot_len, slot_style)
+    out      = np.zeros((B, L), dtype=np.int64)
+    n_win    = max(1, seg_len - out_len)
 
     for i in range(B):
         segs = [_sample_seg(rng, seg_len) for _ in range(n_blocks)]
 
         for k, b in enumerate(pos['blocks']):
             seg = segs[k]
-            # Block layout: <s>src</s> [<p>ponder</p>] <m>slots</m>
-            out[i, b['block_start']:b['s0']]             = SRC_OPEN
-            out[i, b['s0']:b['s1']]                      = seg
-            out[i, b['s1']:b['s_close_end']]             = SRC_CLOSE
-            if intermed_len > 0:
-                out[i, b['p_open']:b['p0']]              = PONDER_OPEN
-                out[i, b['p0']:b['p1']]                  = ponder_ids
-                out[i, b['p1']:b['p_close_end']]         = PONDER_CLOSE
-            out[i, b['p_close_end']:b['sl0']]            = MEM_OPEN
-            out[i, b['sl0']:b['sl1']]                    = slot_ids
-            out[i, b['sl1']:b['mc1']]                    = MEM_CLOSE
+            out[i, b['block_start']:b['sl0']]         = MEM_OPEN
+            out[i, b['sl0']:b['sl1']]                  = slot_ids
+            out[i, b['sl1']:b['mc1']]                  = MEM_CLOSE
+            out[i, b['mc1']:b['s0']]                   = SRC_OPEN
+            out[i, b['s0']:b['s1']]                    = seg
+            out[i, b['s1']:b['s_close_end']]           = SRC_CLOSE
 
         seg_r   = segs[recall_from]
         y_start = int(rng.integers(0, n_win + 1))
@@ -495,13 +441,19 @@ def make_multi_batch(rng: np.random.Generator, B: int,
                 [np.full(warmup_len - len(wm), seg_r[0], dtype=np.int32), wm])
 
         rs = pos['recall_start']
-        out[i, rs:rs+FROM_OPEN_LEN]                      = FROM_OPEN
-        out[i, pos['f0']:pos['f1']]                      = wm
-        out[i, pos['f1']:pos['f1']+FROM_CLOSE_LEN]       = FROM_CLOSE
-        out[i, pos['fc1']:pos['fc1']+CONT_OPEN_LEN]      = CONT_OPEN
-        out[i, pos['c0']:pos['c0']+(y_end-y_start)]      = seg_r[y_start:y_end]
+        out[i, rs:rs+FROM_OPEN_LEN]                     = FROM_OPEN
+        out[i, pos['f0']:pos['f1']]                     = wm
+        out[i, pos['f1']:pos['f1']+FROM_CLOSE_LEN]      = FROM_CLOSE
+        # ponder region: tags written, content left as zeros (model generates freely)
+        if ponder_len > 0:
+            fc1 = pos['fc1']
+            out[i, fc1:fc1+PONDER_OPEN_LEN]             = PONDER_OPEN
+            # ponder content [p0..p1) stays zeros
+            out[i, pos['p1']:pos['p1']+PONDER_CLOSE_LEN] = PONDER_CLOSE
+        out[i, pos['pc1']:pos['pc1']+CONT_OPEN_LEN]    = CONT_OPEN
+        out[i, pos['c0']:pos['c0']+(y_end-y_start)]    = seg_r[y_start:y_end]
         if rng.random() >= drop_close_prob:
-            out[i, pos['c1']:pos['c1']+CONT_CLOSE_LEN]  = CONT_CLOSE
+            out[i, pos['c1']:pos['c1']+CONT_CLOSE_LEN] = CONT_CLOSE
 
     return out
 
