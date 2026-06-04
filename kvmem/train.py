@@ -414,19 +414,16 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 pg['lr'] = lr
 
             model.train()
-            # Pick mode per step for 'mix' (alternates between end and int)
-            _mode_this = seq_mode
-            if seq_mode == 'mix':
-                _mode_this = 'int' if rng.random() < 0.5 else 'end'
-
-            if _mode_this in ('int',):
-                # Interleaved: random query count per batch
+            # Batch generation: int mode = interleaved with random k; end mode = standard
+            if seq_mode in ('int', 'mix'):
+                # Single unified mode: k ~ Uniform(1, n_blocks) per step
+                # end is a special case (k=1, last block) — not needed separately
                 _q_count = int(rng.integers(1, n_blocks + 1))
                 tokens_np, _active_c = make_interleaved_batch(
                     rng, B, n_blocks, seg_len, slot_len,
                     warmup_len, out_len, drop_close_prob, intermed_len, _q_count)
                 _use_interleaved = True
-            else:
+            else:   # 'end' (default) or 'acc'
                 tokens_np = (pool[(local_step - 1) % ds]
                              if pool is not None
                              else make_multi_batch(rng, B, n_blocks, recall_from,

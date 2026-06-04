@@ -144,14 +144,13 @@ seq_spec | stage, stage, stage @eval:eval_spec
 
 **Op sequence modes (`mMODE`):**
 
-| Mode | Pattern per example | Use |
-|------|---------------------|-----|
-| (default) `mend` | `xh xh ... q` | all ingest then one recall |
-| `mint` | `xhq xhq ... xhq` | recall after every block (interleaved) |
-| `macc` | `xh xh ... xh` | ingest only, no recall, no loss |
-| `mmix` | random per example | mix of all patterns — interactive training |
+| Mode | Pattern | Use |
+|------|---------|-----|
+| (default) `mend` | all blocks then one recall | simple baseline |
+| `mint` / `mmix` | k ~ Uniform(1,n) queries, each targeting a random prior block | interactive training |
+| `macc` | ingest only, no recall | not useful (no gradient) |
 
-For `mmix`, each batch example randomly picks a pattern: some examples just accumulate, some have end-recall, some have interleaved queries. Trains the model to handle both "new data in" and "user query" interactively.
+`mint` and `mmix` are the same: **one unified mode** where each step samples k ~ Uniform(1, n_blocks) random query positions. `mend` (k=1, last block) is a degenerate case already covered. Use `mint` for interactive training.
 
 **`+` overlap:** prefix a stage with `+` to merge into the previous stage's batch distribution:
 ```
