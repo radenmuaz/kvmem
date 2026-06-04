@@ -130,55 +130,127 @@ def _parse_stage(token: str, seq: SeqSpec, defaults: dict) -> dict:
 # Main parser
 # ---------------------------------------------------------------------------
 
-def parse_curriculum(dsl: str, **stage_defaults) -> tuple[SeqSpec, list[dict]]:
-    """
-    Parse a curriculum DSL string.
-
-    Returns (seq_spec, curriculum_list) where curriculum_list is ready for
-    hp['curriculum'].
-
-    Args:
-        dsl           : curriculum DSL string
-        stage_defaults: shared params merged into every stage (B, dataset_size, etc.)
-
-    Example:
-        spec, cur = parse_curriculum(
-            "<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k, n2/r[0,1]/80k",
-            B=16, dataset_size=20000
-        )
-        hp['curriculum'] = cur
-    """
-    dsl = dsl.strip()
-
-    # Split on ':' to get seq_spec and stages
-    if '|' not in dsl:
-        raise ValueError(f'Curriculum DSL must contain "|" separating seq spec from stages')
-
-    colon_idx = dsl.index('|')
-    seq_str   = dsl[:colon_idx].strip()
-    stages_str = dsl[colon_idx+1:].strip()
-
-    seq = parse_seq(seq_str)
-
-    # Split on commas NOT inside brackets (to handle r[0,1])
-    stage_tokens = []
-    depth, buf = 0, []
-    for ch in stages_str:
+def _bracket_split(s: str) -> list[str]:
+    """Split on commas not inside brackets."""
+    tokens, depth, buf = [], 0, []
+    for ch in s:
         if ch == '[': depth += 1
         elif ch == ']': depth -= 1
         if ch == ',' and depth == 0:
             t = ''.join(buf).strip()
-            if t: stage_tokens.append(t)
+            if t: tokens.append(t)
             buf = []
         else:
             buf.append(ch)
     t = ''.join(buf).strip()
-    if t: stage_tokens.append(t)
-    if not stage_tokens:
-        raise ValueError('No stages found after ":"')
+    if t: tokens.append(t)
+    return tokens
 
-    curriculum = [_parse_stage(t, seq, stage_defaults) for t in stage_tokens]
-    return seq, curriculum
+
+def parse_curriculum(dsl: str, **stage_defaults) -> tuple[SeqSpec, list[dict], list[tuple]]:
+    """
+    Parse a curriculum DSL string.
+
+    Returns (seq_spec, curriculum_list, eval_configs) where:
+      curriculum_list : list of stage dicts for hp['curriculum']
+      eval_configs    : list of (n_blocks, recall_from) tuples tested at every eval step
+
+    Grammar extensions:
+      @eval:nN/rK,...  explicit eval configs (tested at every eval_every step)
+      +nN/rK/Xk        overlap stage — run alongside the previous stage in the same
+                        training steps (same batch, mixed recall_froms and n_blocks)
+
+    Examples:
+      # Basic:
+      "<x:16><z:7><h:1><q:4><y:8> | n2/r[0,1]/160k"
+
+      # With explicit eval:
+      "<x:16><z:7><h:1><q:4><y:8> | n2/r[0,1]/160k @eval:n1/r0,n2/r0,n2/r1"
+
+      # Overlapping stages (same steps, different routing mixed per example):
+      "<x:16><z:7><h:1><q:4><y:8> | n2/r0/80k +n2/r1, n2/r[0,1]/80k"
+      Stage 0 mixes n2/r0 and n2/r1 in recall_froms=[0,1].
+      Stage 1 is explicit mixed.
+
+    If @eval is omitted: eval_configs = sorted set of (n_blocks, recall_from)
+    from all stages, plus (1, 0) baseline.
+    """
+    dsl = dsl.strip()
+    if '|' not in dsl:
+        raise ValueError('Curriculum DSL must contain "|" separating seq spec from stages')
+
+    pipe_idx  = dsl.index('|')
+    seq_str   = dsl[:pipe_idx].strip()
+    rest      = dsl[pipe_idx+1:].strip()
+
+    # Extract optional @eval: annotation
+    eval_str = None
+    if '@eval:' in rest:
+        eval_idx = rest.index('@eval:')
+        eval_str = rest[eval_idx + len('@eval:'):].strip()
+        rest     = rest[:eval_idx].strip()
+
+    seq = parse_seq(seq_str)
+
+    # Parse stage tokens, handling '+' overlap prefix
+    raw_tokens = _bracket_split(rest)
+    stage_tokens = []  # list of lists (each inner list = overlapping group)
+    current_group = []
+    for tok in raw_tokens:
+        tok = tok.strip()
+        if tok.startswith('+'):
+            current_group.append(tok[1:].strip())   # add to current overlap group
+        else:
+            if current_group:
+                stage_tokens.append(current_group)
+            current_group = [tok]
+    if current_group:
+        stage_tokens.append(current_group)
+
+    if not stage_tokens:
+        raise ValueError('No stages found after "|"')
+
+    # Parse each group: overlapping tokens merge into one stage with combined recall_froms
+    curriculum = []
+    for group in stage_tokens:
+        if len(group) == 1:
+            curriculum.append(_parse_stage(group[0], seq, stage_defaults))
+        else:
+            # Merge overlap group: first token sets n_steps/window, all contribute recall_froms
+            base = _parse_stage(group[0], seq, stage_defaults)
+            all_rfs = []
+            for tok in group:
+                s = _parse_stage(tok, seq, stage_defaults)
+                rfs = s['recall_froms'] if isinstance(s['recall_froms'], list) else [s['recall_froms']]
+                all_rfs.extend(rfs)
+            base['recall_froms'] = sorted(set(all_rfs))
+            curriculum.append(base)
+
+    # Parse eval configs
+    if eval_str:
+        eval_configs = []
+        for tok in _bracket_split(eval_str):
+            tok = tok.strip()
+            # Format: nN/rK  e.g. n1/r0, n2/r1, n2/r[0,1]
+            parts = tok.split('/', 1)
+            m_nb  = _BLOCKS_RE.match(parts[0])
+            if not m_nb or len(parts) < 2:
+                raise ValueError(f'Invalid eval token: {tok!r}  (expected nN/rK)')
+            nb   = int(m_nb.group(1))
+            rf   = _parse_routes(parts[1])
+            rfs  = rf if isinstance(rf, list) else [rf]
+            for r in rfs:
+                eval_configs.append((nb, r))
+    else:
+        seen = {(1, 0)}
+        for s in curriculum:
+            nb  = s['n_blocks']
+            rfs = s['recall_froms'] if isinstance(s['recall_froms'], list) else [s['recall_froms']]
+            for rf in rfs:
+                seen.add((nb, rf))
+        eval_configs = sorted(seen)
+
+    return seq, curriculum, eval_configs
 
 
 # ---------------------------------------------------------------------------
@@ -188,12 +260,11 @@ def parse_curriculum(dsl: str, **stage_defaults) -> tuple[SeqSpec, list[dict]]:
 if __name__ == '__main__':
     import sys
     dsl = sys.argv[1] if len(sys.argv) > 1 else (
-        "<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k, n2/r0/40k, n2/r[0,1]/80k, n2/r[0,1]/80k/w1"
+        "<x:16><z:7><h:1><q:4><y:8> | n2/r[0,1]/160k @eval:n1/r0,n2/r0,n2/r1"
     )
-    spec, cur = parse_curriculum(dsl, B=16, dataset_size=20000)
+    spec, cur, evals = parse_curriculum(dsl, B=16, dataset_size=20000)
     print(f'SeqSpec: {spec}')
     print(f'Curriculum ({len(cur)} stages):')
     for i, s in enumerate(cur):
-        rf = s['recall_froms']
-        w  = s['mem_window']
-        print(f'  s{i}: n_blocks={s["n_blocks"]}  recall={rf}  mem_window={w}  steps={s["n_steps"]}')
+        print(f'  s{i}: n={s["n_blocks"]}  rf={s["recall_froms"]}  w={s["mem_window"]}  steps={s["n_steps"]}')
+    print(f'Eval configs: {evals}')

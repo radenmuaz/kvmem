@@ -223,6 +223,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 hp[k] = v
 
     _cur = hp.get('curriculum')
+    eval_configs = hp.get('eval_configs', None)  # [(n_blocks, recall_from), ...]
     curriculum = _cur if _cur else [{
         'seg_len':     hp['seg_len'],
         'slot_len':    hp.get('slot_len', hp['seg_len']),
@@ -234,6 +235,16 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         'recall_from': hp.get('recall_from', 0),
         'B': hp['B'], 'n_steps': hp['n_steps'],
     }]
+
+    # Default eval_configs: unique (n_blocks, recall_from) from curriculum + (1,0) baseline
+    if eval_configs is None:
+        seen = {(1, 0)}
+        for s in curriculum:
+            nb  = s.get('n_blocks', 1)
+            rfs = s.get('recall_froms', s.get('recall_from', 0))
+            for rf in (rfs if isinstance(rfs, list) else [rfs]):
+                seen.add((nb, rf))
+        eval_configs = sorted(seen)
 
     ts     = datetime.now().strftime('%m%d_%H%M')
     name   = hp.get('name')
@@ -428,55 +439,49 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 model.eval()
                 with torch.no_grad():
                     val_tok  = torch.tensor(val_np, device=device)
-                    val_log  = model(val_tok, mask_t)               # (B, L, 256)
+                    val_log  = model(val_tok, mask_t)
                     val_lp_c = F.log_softmax(val_log[:, c0-1:c1-1], dim=-1)
-                    val_tgt  = val_tok[:, c0:c1]                    # always 0-255
+                    val_tgt  = val_tok[:, c0:c1]
                     val_nll  = -val_lp_c.gather(2, val_tgt.unsqueeze(-1)).squeeze(-1)
                     val_loss = float(val_nll.mean())
                     val_bpb  = val_loss / math.log(2)
                 elapsed = time.time() - t0
                 _log(f'\n--- stage={stage_i} step={local_step}/{n_steps}  g={global_step}'
-                     f'  loss={loss_f:.4f}  val_loss={val_loss:.4f}'
-                     f'  val_bpb={val_bpb:.3f}  lr={lr:.2e}  {elapsed:.0f}s ---')
+                     f'  loss={loss_f:.4f}  val_bpb={val_bpb:.3f}  lr={lr:.2e}  {elapsed:.0f}s ---')
 
-                all_cer = []
-                for name, x_S in test_seqs.items():
-                    assert out_len <= seg_len - warmup_len
-                    f_start = min(int(seg_len * eval_offset), seg_len - warmup_len - out_len)
-                    y_start = f_start + warmup_len
-                    y_end   = min(y_start + out_len, seg_len)
-                    warmup  = x_S[max(0, y_start - warmup_len):y_start]
-                    if len(warmup) < warmup_len:
-                        warmup = [x_S[0]] * (warmup_len - len(warmup)) + list(warmup)
-                    target  = x_S[y_start:y_end]
-                    # Use first recall_from for per-step eval (list → int)
-                    _rf_eval = recall_from[0] if isinstance(recall_from, list) else recall_from
-                    gen     = ar_decode_role(model, x_S, slot_len,
-                                             warmup, len(target), device,
-                                             n_blocks=n_blocks,
-                                             recall_from=_rf_eval,
-                                             intermed_len=intermed_len,
-                                             mem_window=mem_window)
-                    c = cer(gen, target)
-                    all_cer.append(c)
-                    ok = '✓' if c == 0.0 else '✗'
-                    _log(f'  {ok} {name:15s} <f>[{f_start}:{y_start}]</f>'
-                         f' <c>[{y_start}:{y_end}]</c>'
-                         f'  match={100*(1-c):5.1f}%  CER={c:.3f}')
-                    def _tok_hex(seq):
-                        return ''.join(f'{t:02x}' if t < 256 else f'[{t}]' for t in seq)
-                    _log(f'    src={_tok_hex(x_S)}')
-                    _log(f'    wup={_tok_hex(warmup)}')
-                    _log(f'    gen={_tok_hex(gen)}')
-                    _log(f'    ref={_tok_hex(target)}')
+                # Multi-config eval: test all eval_configs at every eval step
+                def _tok_hex(seq):
+                    return ''.join(f'{t:02x}' if t < 256 else f'[{t}]' for t in seq)
+                f_start = min(int(seg_len * eval_offset), seg_len - warmup_len - out_len)
+                y_start = f_start + warmup_len
+                y_end   = min(y_start + out_len, seg_len)
 
-                mean_cer = sum(all_cer) / len(all_cer)
-                _log(f'  → mean CER={mean_cer:.3f}  match={100*(1-mean_cer):.1f}%')
+                cfg_results = {}
+                perfect_all = True
+                for eval_nb, eval_rf in eval_configs:
+                    all_c = []
+                    for sname, x_S in test_seqs.items():
+                        wm = x_S[max(0, y_start - warmup_len):y_start]
+                        if len(wm) < warmup_len:
+                            wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
+                        tgt = x_S[y_start:y_end]
+                        with torch.no_grad():
+                            g = ar_decode_role(model, x_S, slot_len, wm, len(tgt), device,
+                                               n_blocks=eval_nb, recall_from=eval_rf,
+                                               intermed_len=intermed_len, mem_window=mem_window)
+                        all_c.append(cer(g, tgt))
+                    mean_c = sum(all_c) / len(all_c)
+                    key = f'n{eval_nb}_r{eval_rf}'
+                    cfg_results[key] = round(100 * (1 - mean_c), 1)
+                    ok = '✓' if mean_c == 0.0 else '✗'
+                    if mean_c != 0.0: perfect_all = False
+                    _log(f'  {ok} n={eval_nb} rf={eval_rf}  match={100*(1-mean_c):.1f}%')
+
                 _jlog(dict(global_step=global_step, stage=stage_i, loss=loss_f,
-                           val_loss=val_loss, val_bpb=val_bpb, mean_cer=mean_cer))
+                           val_loss=val_loss, val_bpb=val_bpb, **cfg_results))
 
-                if mean_cer == 0.0:
-                    _log(f'\n★ PERFECT at stage {stage_i} step={local_step}!')
+                if perfect_all:
+                    _log(f'\n★ PERFECT (all eval configs) at stage {stage_i} step={local_step}!')
                     ckpt = os.path.join(ckpt_dir, f'stage{stage_i}_step{local_step}.pt')
                     torch.save({'model': model.state_dict(), 'hp': hp,
                                 'stage': stage_i, 'step': local_step}, ckpt)
@@ -487,32 +492,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         torch.save({'model': model.state_dict(), 'hp': hp, 'stage': stage_i}, ckpt)
         _log(f'  [ckpt stage {stage_i} end] {ckpt}')
 
-        # Cross-config generalisation eval at end of each stage
-        # Tests 1-block + 2-block(from=0) + 2-block(from=1) regardless of training config.
-        # Measures whether the fast-weight algorithm generalises across n_blocks.
-        model.eval()
-        _log(f'\n  [generalisation eval]')
-        gen_results = {}
-        for nb, rf in [(1, 0), (2, 0), (2, 1)]:
-            all_c = []
-            for sname, x_S in test_seqs.items():
-                f_start = min(int(seg_len * eval_offset), seg_len - warmup_len - out_len)
-                y_start = f_start + warmup_len
-                y_end   = min(y_start + out_len, seg_len)
-                wm      = x_S[max(0, y_start - warmup_len):y_start]
-                if len(wm) < warmup_len:
-                    wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
-                tgt = x_S[y_start:y_end]
-                with torch.no_grad():
-                    g = ar_decode_role(model, x_S, slot_len, wm, len(tgt), device,
-                                       n_blocks=nb, recall_from=rf,
-                                       intermed_len=intermed_len, mem_window=mem_window)
-                all_c.append(cer(g, tgt))
-            mean_c = sum(all_c) / len(all_c)
-            key = f'nb{nb}_rf{rf}'
-            gen_results[key] = round(100 * (1 - mean_c), 1)
-            _log(f'    n_blocks={nb} recall_from={rf}  match={100*(1-mean_c):.1f}%')
-        _jlog(dict(global_step=global_step, stage=stage_i, event='gen_eval', **gen_results))
+
 
     _log(f'\nDone. Total: {time.time()-t0:.0f}s')
     log_f.close(); jlog_f.close()
@@ -556,7 +536,8 @@ DEFAULTS = dict(
     grad_clip=10.0, dataset_size=5000,
     stablemax=False, eval_offset=0.25,
     grad_checkpoint=False,
-    mem_window=-1,  # -1=full history; 1=isolated; N=window; 1=isolated; N=last N h states
+    mem_window=-1,  # -1=full history; 1=isolated; N=window
+    null_kv=False,  # append fixed zero KV before softmax (abstain option)
     n_blocks=1, recall_from=0,
     compile=False,
     curriculum=CURRICULUM_SURAH,

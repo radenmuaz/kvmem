@@ -18,7 +18,7 @@ from kvmem.curriculum_dsl import parse_curriculum
 
 _DSL = "<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k, n2/r0/40k, n2/r[0,1]/80k, n2/r[0,1]/80k/w1"
 
-_seq, _curriculum = parse_curriculum(
+_seq, _curriculum, _eval_cfgs = parse_curriculum(
     _DSL,
     B=16, dataset_size=20000,
     cycle_steps=-1,   # cosine LR per stage
@@ -38,4 +38,5 @@ hp = dict(
     name='exp2_multiturn',
     # Curriculum from DSL
     curriculum=_curriculum,
+    eval_configs=_eval_cfgs,
 )

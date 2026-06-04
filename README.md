@@ -128,25 +128,42 @@ Two DSLs covering all sequence and training configuration.
 ### Curriculum DSL (`kvmem/curriculum_dsl.py`)
 
 ```
-"<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k, n2/r0/40k, n2/r[0,1]/80k, n2/r[0,1]/80k/w1"
+seq_spec | stage, stage, stage @eval:eval_spec
 ```
 
-Seq spec once, then comma-separated stage tokens: `nN/rK/Xk[/wM]`
+**Stage token:** `nN/rK/Xk[/wM]`
 
 | Token | Meaning | Example |
 |-------|---------|---------|
 | `nN` | n_blocks | `n1`, `n2` |
-| `rK` | recall_from (single) | `r0`, `r1` |
-| `r[K,...]` | recall_froms (mixed batch) | `r[0,1]` |
-| `Xk` | n_steps | `40k`, `80k` |
-| `wM` | mem_window (-1=full, 1=isolated) | `w-1`, `w1` |
+| `rK` | recall_from single | `r0`, `r1` |
+| `r[K,...]` | recall_froms mixed (per-example random draw) | `r[0,1]` |
+| `Xk` | steps | `40k`, `160k` |
+| `wM` | mem_window (-1=full, 1=isolated, N=window) | `w-1`, `w1` |
+
+**`+` overlap:** prefix a stage with `+` to merge into the previous stage's batch distribution:
+```
+n2/r0/80k +n2/r1   →  n2, recall_froms=[0,1] for 80k steps  (same as n2/r[0,1]/80k)
+```
+
+**`@eval:` annotation:** eval configs tested at every `eval_every` step, independent of training stages. If omitted, auto-derived from all stages + `n1/r0` baseline.
+```
+@eval:n1/r0,n2/r0,n2/r1
+```
+
+**Full example:**
+```
+"<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k, n2/r[0,1]/80k/w1 @eval:n1/r0,n2/r0,n2/r1"
+```
 
 ```python
 from kvmem.curriculum_dsl import parse_curriculum
-spec, curriculum = parse_curriculum(
-    "<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r[0,1]/80k",
+spec, curriculum, eval_configs = parse_curriculum(
+    "<x:16><z:7><h:1><q:4><y:8> | n2/r[0,1]/160k @eval:n1/r0,n2/r0,n2/r1",
     B=16, dataset_size=20000
 )
+hp['curriculum']   = curriculum
+hp['eval_configs'] = eval_configs
 ```
 
 **Hparams absorbed by DSL** (no longer set manually):  

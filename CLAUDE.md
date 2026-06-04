@@ -102,15 +102,28 @@ All attention is **pure causal** — no non-causal overrides. `<q>/<y>` are expl
 
 **Sequence DSL:** `<x:16><z:7><h:1><q:4><y:8>` → parsed by `kvmem/seq_dsl.py` → `SeqSpec`.
 
-**Curriculum DSL:** `kvmem/curriculum_dsl.py` — extends sequence DSL with training schedule.
+**Curriculum DSL:** `kvmem/curriculum_dsl.py` — batch scheduler + eval config.
 ```
-"<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k, n2/r0/40k, n2/r[0,1]/80k, n2/r[0,1]/80k/w1"
-  │                              │  │   │   │           │                 │              │
-  seq spec (SeqSpec)             │  │   │   n_blocks=2  recall_froms     steps=80k      w=mem_window
-                                 │  r=  40k                =[0,1]=mixed
-                              n_blocks  steps
+seq_spec | stage, stage @eval:eval_spec
 ```
-Stage token: `nN/rK/Xk[/wM]`  — n_blocks / recall / steps / mem_window (default -1=full)
+
+Stage token: `nN/rK/Xk[/wM]` — n_blocks / recall / steps / mem_window
+
+```
+"<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k +n2/r0, n2/r[0,1]/80k/w1 @eval:n1/r0,n2/r0,n2/r1"
+```
+
+| Syntax | Meaning |
+|--------|---------|
+| `nN/rK/Xk` | stage: n_blocks=N, recall=K, steps=X |
+| `r[0,1]` | mixed batch: each example randomly draws recall from list |
+| `+nN/rK` | overlap: merge into previous stage's batch distribution |
+| `wM` | mem_window (-1=full, 1=isolated) |
+| `@eval:nN/rK,...` | eval configs tested every `eval_every` steps (independent of training) |
+
+Eval is independent of curriculum — `@eval:` specifies exactly which (n_blocks, recall_from) pairs are tested at each eval step. If omitted: auto-derived from all stages + `n1/r0` baseline.
+
+Returns `(SeqSpec, curriculum_list, eval_configs)` — pass `eval_configs` to `hp['eval_configs']`.
 
 **Hparams absorbed by DSL (no longer set manually):**
 `seg_len`, `slot_len`, `intermed_len`, `warmup_len`, `out_len` → from seq spec  

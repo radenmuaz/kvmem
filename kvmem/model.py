@@ -62,15 +62,28 @@ def apply_rope(x: torch.Tensor, freqs: torch.Tensor, offset: int = 0) -> torch.T
 
 class MHAttention(nn.Module):
     def __init__(self, d: int, n_heads: int,
-                 rope: bool = False, freqs: torch.Tensor | None = None):
+                 rope: bool = False, freqs: torch.Tensor | None = None,
+                 null_kv: bool = False):
+        """
+        null_kv=True: append a learnable (null_k, null_v) pair to the KV sequence
+        before softmax. Gives each query a "blank slot" to attend to when no real
+        token is relevant — soft gating without hard masking.
+
+        null_k is initialised to zero so Q·null_k = 0 initially (score=0 before
+        scaling), but it is learned and can diverge. null_v is also learnable —
+        the model decides what to emit when attending to nothing.
+        """
         super().__init__()
         self.n_heads = n_heads
         self.d_head  = d // n_heads
         self.rope    = rope
+        self.null_kv = null_kv
         self.W_Q = nn.Linear(d, d, bias=False)
         self.W_K = nn.Linear(d, d, bias=False)
         self.W_V = nn.Linear(d, d, bias=False)
         self.W_O = nn.Linear(d, d, bias=False)
+        # null_kv uses fixed zero K and V — no learned parameters.
+        # Q·null_k = 0 always, giving a fixed-score "abstain" option in softmax.
         if freqs is not None:
             self.register_buffer('freqs', freqs)
         else:
@@ -96,6 +109,12 @@ class MHAttention(nn.Module):
             K_past, V_past = past_kv
             K = torch.cat([K_past, K], dim=2)
             V = torch.cat([V_past, V], dim=2)
+        if self.null_kv:
+            # Append fixed zero (K=0, V=0); extend mask with 0-column (always visible)
+            null = torch.zeros(B, H, 1, dh, device=K.device, dtype=K.dtype)
+            K    = torch.cat([K, null], dim=2)
+            V    = torch.cat([V, null], dim=2)
+            mask = F.pad(mask, (0, 1), value=0.0)
         out = F.scaled_dot_product_attention(Q, K, V,
                                              attn_mask=mask.unsqueeze(0).unsqueeze(0))
         out = out.permute(0, 2, 1, 3).reshape(B, L, d)
@@ -121,10 +140,11 @@ class FFN(nn.Module):
 
 class TransformerBlock(nn.Module):
     def __init__(self, d: int, n_heads: int, d_ff: int,
-                 rope: bool = False, freqs: torch.Tensor | None = None):
+                 rope: bool = False, freqs: torch.Tensor | None = None,
+                 null_kv: bool = False):
         super().__init__()
         self.norm1 = nn.LayerNorm(d)
-        self.attn  = MHAttention(d, n_heads, rope=rope, freqs=freqs)
+        self.attn  = MHAttention(d, n_heads, rope=rope, freqs=freqs, null_kv=null_kv)
         self.norm2 = nn.LayerNorm(d)
         self.ffn   = FFN(d, d_ff)
 
@@ -153,6 +173,7 @@ class KVMemModel(nn.Module):
                  rope: bool = False, yarn: bool = False,
                  L_train: int = 512, L_max: int = 4096,
                  grad_checkpoint: bool = False,
+                 null_kv: bool = False,
                  V_out: int = 256):
         """
         V     : input vocab size (covers data bytes + special tag/slot tokens)
@@ -178,7 +199,7 @@ class KVMemModel(nn.Module):
                       if yarn else rope_freqs(d_head))
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(d, n_heads, d_ff, rope=rope, freqs=freqs)
+            TransformerBlock(d, n_heads, d_ff, rope=rope, freqs=freqs, null_kv=null_kv)
             for _ in range(n_layers)
         ])
         self._init_weights()
@@ -283,7 +304,8 @@ def build_model(hp: dict, device=None) -> KVMemModel:
         L_train=hp.get('L_train', hp.get('seg_len', 512)),
         L_max=hp.get('L_max', hp.get('seg_len', 512) * 8),
         grad_checkpoint=hp.get('grad_checkpoint', False),
-        V_out=256,  # output always over data bytes only
+        null_kv=hp.get('null_kv', False),
+        V_out=256,
     )
     if device is not None:
         model = model.to(device)
