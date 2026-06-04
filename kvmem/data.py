@@ -84,8 +84,8 @@ def make_slot_ids_tag(N: int, style: str = 'seq') -> list[int]:
 #
 # Data bytes   : IDs 0–255    (all 256 byte values, unchanged)
 # Boundary tags: IDs 256–265  (1 token each, never appear in data)
-# Key slots    : IDs 266–265+hidden_len    (1 per key position, style D)
-# Extract slots: IDs 266+hidden_len–…     (1 per extract position, style D)
+# Key slots    : IDs 266–265+hidden_len    (1 per position — unique dedicated ID)
+# Extract slots: IDs 266+hidden_len–…     (1 per position — unique dedicated ID)
 #
 # V = 256 + 10 + hidden_len + intermed_len  (computed by compute_vocab_size)
 #
@@ -112,7 +112,7 @@ INTERMED_CLOSE_ID = 263   # </z>
 OUTPUT_OPEN_ID    = 264   # <v>  value/output open
 OUTPUT_CLOSE_ID   = 265   # </y>
 
-# Base ID for key/extract position tokens (style D: unique per position)
+# Base ID for key/extract position tokens (dedicated indexed: unique ID per position)
 HIDDEN_SLOT_BASE    = 266   # key slot i → HIDDEN_SLOT_BASE + i
 # extract slot j → HIDDEN_SLOT_BASE + hidden_len + j  (hidden_len known at runtime)
 
@@ -161,9 +161,24 @@ def compute_vocab_size(hidden_len: int, intermed_len: int = 0) -> int:
     return 256 + N_BOUNDARY_TAGS + hidden_len + intermed_len
 
 
-def make_hidden_slot_ids(hidden_len: int) -> list[int]:
-    """key slot i = HIDDEN_SLOT_BASE + i  (IDs 266..265+hidden_len)"""
-    return [HIDDEN_SLOT_BASE + i for i in range(hidden_len)]
+def make_hidden_slot_ids(hidden_len: int, cycle_len: int = 0) -> list[int]:
+    """
+    Return hidden_len slot token IDs.
+
+    cycle_len=0 (default): dedicated indexed — slot i → HIDDEN_SLOT_BASE + i.
+      Unique ID per position. Vocab grows with hidden_len. No extrapolation.
+
+    cycle_len=K (K>0): dedicated cyclic — slot i → HIDDEN_SLOT_BASE + (i % K).
+      K dedicated IDs cycle over all slots. Fixed vocab regardless of hidden_len.
+      Extrapolates to arbitrary hidden_len — model trained with K=8 can infer
+      with hidden_len=1024 using the same 8 IDs, RoPE carries absolute position.
+      Zero data collision (all IDs > 255). Best design before scaling slot_len.
+
+    TODO: add cycle_len to SeqSpec DSL (e.g. <h:1,cycle=8>) and train.py hp.
+          Set cycle_len=8 before scaling slot_len beyond training budget.
+    """
+    K = cycle_len if cycle_len > 0 else hidden_len
+    return [HIDDEN_SLOT_BASE + (i % K) for i in range(hidden_len)]
 
 # backward-compat alias
 make_mem_slot_ids = make_hidden_slot_ids
@@ -383,7 +398,7 @@ def multi_block_positions(n_blocks: int, seg_len: int, slot_len: int,
 def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
                     warmup_len: int, out_len: int,
                     intermed_len: int = 0,
-                    mem_window: int = 0) -> np.ndarray:
+                    mem_window: int = -1) -> np.ndarray:
     """
     Attention mask for multi-block sequences. Pure causal — no non-causal overrides.
 
@@ -444,7 +459,7 @@ def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
             # Block cross-block <h> slots outside mem_window
             # j < i: prior blocks — allowed if within window, blocked if outside
             if j < i:
-                outside_window = (mem_window > 0) and ((i - j) >= mem_window)
+                outside_window = (mem_window != -1) and ((i - j) >= mem_window)
                 if outside_window:
                     h_j_col = (c >= bj['sl0']) & (c < bj['sl1'])
                     blocked |= slot_row[:, None] & h_j_col[None, :]
@@ -455,13 +470,33 @@ def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
 
 
 def make_multi_batch(rng: np.random.Generator, B: int,
-                     n_blocks: int, recall_from: int,
+                     n_blocks: int, recall_from,
                      seg_len: int, slot_len: int,
                      warmup_len: int, out_len: int,
                      drop_close_prob: float = 0.5,
                      intermed_len: int = 0) -> np.ndarray:
     """
-    Build one memory-first multi-block batch (style D learned embeddings).
+    recall_from: int OR list[int].
+    If list, each example in the batch independently draws a random recall_from
+    from the list — mixed routing batch. All configs must have same sequence
+    length (same n_blocks/seg_len/slot_len/warmup_len/out_len).
+    """
+    if isinstance(recall_from, (list, tuple)):
+        recall_froms = list(recall_from)
+        choices = rng.integers(0, len(recall_froms), size=B)
+        pos = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len)
+        L   = pos['L']
+        out_arr = np.zeros((B, L), dtype=np.int64)
+        for i, rf in enumerate(recall_froms):
+            mask = choices == i
+            if mask.any():
+                sub = make_multi_batch(rng, int(mask.sum()), n_blocks, rf,
+                                       seg_len, slot_len, warmup_len, out_len,
+                                       drop_close_prob, intermed_len)
+                out_arr[mask] = sub
+        return out_arr
+    """
+    Build one multi-block batch. Slot tokens use dedicated indexed scheme — unique ID per position.
 
     Each block:  <m> slot_0 slot_1 ... slot_{N-1} </m> <s> src </s>
     Recall:      <f> warmup </f> [<p> ponder_0 ... </p>] <c> output </c>

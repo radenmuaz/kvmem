@@ -18,7 +18,7 @@ hp = dict(
     ocd=False, ocd_prob=0.01, tf_warmup=0,
     rope=True, yarn=True, grok=False,
     stablemax=False, eval_offset=0.25, grad_clip=10.0,
-    mem_window=0,  # 0=full; 1=isolated; N=window
+    mem_window=-1,  # -1=full; 1=isolated; N=window
     compile=False,
     name='ablate_2b_mixed',
 

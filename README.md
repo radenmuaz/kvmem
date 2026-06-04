@@ -76,31 +76,82 @@ This is informationally equivalent to a sliding-window KV cache but compressed: 
 
 - IDs 0–255: data bytes
 - IDs 256–265: boundary tags (`<x>` `</x>` `<z>` `</z>` `<h>` `</h>` `<q>` `</q>` `<y>` `</y>`) — 1 token each
-- IDs 266–265+slot_len: hidden slot tokens (unique per position, style D)
-- IDs 266+slot_len–…: intermediate slot tokens
-- V_in = 256 + 10 + slot_len + intermed_len
+- IDs 266–265+slot_len: hidden slot tokens — **one dedicated ID per position**
+- IDs 266+slot_len–…: intermediate slot tokens — one dedicated ID per position
+- V_in = 256 + 10 + slot_len + intermed_len (auto-computed)
 - V_out = 256 — output head predicts data bytes only
 
+**Slot token scheme — three options with different scaling properties:**
+
+| Scheme | IDs | Vocab | Extrapolation | Collision | V per slot |
+|--------|-----|-------|---------------|-----------|-----------|
+| **Dedicated indexed** (current, K=slot_len) | 266+i | grows | ✗ unseen IDs | none | unique |
+| **Dedicated cyclic** (K < slot_len) | 266+(i%K) | fixed at K | ✓ cycle repeats | none | unique within cycle |
+| **Looped byte** (style A) | i % 256 | fixed at 256 | ✓ cycle repeats | with data | unique within cycle |
+
+**Dedicated cyclic** is the best design for scale: choose cycle length K (e.g. K=8), allocate K dedicated token IDs above 255, and assign `slot_i → 266 + (i % K)`. Combines the fixed vocab and extrapolation of style A with zero data collision and gradient purity of dedicated indexed.
+
+```
+K=8 dedicated slot IDs: 266, 267, ..., 273
+slot_0 → 266,  slot_1 → 267, ...,  slot_7 → 273
+slot_8 → 266,  slot_9 → 267, ...   ← cycle repeats
+```
+
+Vocab size = 256 + 10 + K (independent of slot_len). Model trained on slot_len=8 extrapolates to slot_len=1024 — same 8 cyclic IDs, RoPE carries absolute position. K is the "slot vocabulary budget": small K → more RoPE reliance, large K → more unique per-slot identity.
+
+**Current code** uses dedicated indexed (K=slot_len). Dedicated cyclic with small K is the right choice before scaling to large slot_len. `make_hidden_slot_ids` accepts an optional `cycle_len` parameter.
+
 Two embedding matrices:
-- `data_embed: Embedding(256, d)` — data bytes
-- `special_embed: Embedding(V_in-256, d)` — tags and slot IDs
+- `data_embed: Embedding(256, d)` — data bytes, std=0.02
+- `special_embed: Embedding(V_in-256, d)` — tags + slot IDs, std=0.05
 
 ---
 
-## Config DSL
+## DSL
+
+Two DSLs covering all sequence and training configuration.
+
+### Sequence DSL (`kvmem/seq_dsl.py`)
+
+```
+<x:16><z:7><h:1><q:4><y:8>
+```
+
+| Token | Param | Meaning |
+|-------|-------|---------|
+| `<h:N>` | slot_len=N | N hidden/memory slots |
+| `<x:N>` | seg_len=N | N-byte source input |
+| `<z:N>` | intermed_len=N | N intermediate tokens |
+| `<q:N>` | warmup_len=N | N-byte query anchor |
+| `<y:N>` | out_len=N | N-byte output |
+
+### Curriculum DSL (`kvmem/curriculum_dsl.py`)
+
+```
+"<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k, n2/r0/40k, n2/r[0,1]/80k, n2/r[0,1]/80k/w1"
+```
+
+Seq spec once, then comma-separated stage tokens: `nN/rK/Xk[/wM]`
+
+| Token | Meaning | Example |
+|-------|---------|---------|
+| `nN` | n_blocks | `n1`, `n2` |
+| `rK` | recall_from (single) | `r0`, `r1` |
+| `r[K,...]` | recall_froms (mixed batch) | `r[0,1]` |
+| `Xk` | n_steps | `40k`, `80k` |
+| `wM` | mem_window (-1=full, 1=isolated) | `w-1`, `w1` |
 
 ```python
-# configs/single_s16.py
-hp = dict(
-    seg_len=16, slot_len=1, intermed_len=7,
-    warmup_len=4, out_len=8,
-    B=16, lr_max=3e-4, n_steps=80000,
-    dataset_size=10000, name='single_s16',
-    curriculum=None,
+from kvmem.curriculum_dsl import parse_curriculum
+spec, curriculum = parse_curriculum(
+    "<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r[0,1]/80k",
+    B=16, dataset_size=20000
 )
 ```
 
-DSL string equivalent: `<h:1><x:16><z:7><q:4><y:8>`
+**Hparams absorbed by DSL** (no longer set manually):  
+`seg_len`, `slot_len`, `intermed_len`, `warmup_len`, `out_len`, `n_blocks`, `recall_from`, `mem_window`  
+**Removed entirely:** `active_slots`, `slot_style`, `V` — slot_len IS the bottleneck; dedicated indexed tokens always.
 
 ```bash
 python -m kvmem.train --config configs/single_s16.py --device mps
@@ -143,7 +194,8 @@ kvmem/
   train.py        — training (NTP on <y>, config DSL, --config flag)
   model.py        — transformer (dual embeddings, V_out=256, grad_checkpoint)
   data.py         — masks + batch builders (pure causal, make_mask_multi)
-  seq_dsl.py      — DSL parser (<h:N><x:M><z:P><q:Q><y:R> → SeqSpec)
+  seq_dsl.py        — sequence DSL (<x:M><z:P><h:N><q:Q><y:R> → SeqSpec)
+  curriculum_dsl.py — curriculum DSL (<seq> | nN/rK/Xk → stage list)
   kvcache.py      — blockwise KV-cache training (for large sequences)
   optim.py        — GrokAdamW
 configs/

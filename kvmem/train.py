@@ -194,7 +194,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     # slot_style removed — learned embeddings use make_mem_slot_ids()
     drop_close_prob = hp['drop_close_prob']
     warmup_steps = hp['warmup_steps']
-    cycle_steps  = hp['cycle_steps']
+    cycle_steps  = hp.get('cycle_steps', 0)
     seed         = hp['seed']
     use_ocd      = hp['ocd']
     _ocd_prob    = hp['ocd_prob']
@@ -228,7 +228,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         'slot_len':    hp.get('slot_len', hp['seg_len']),
         'warmup_len':  hp.get('warmup_len', 16),
         'intermed_len':  hp.get('intermed_len', 0),
-        'mem_window':    hp.get('mem_window', 0),
+        'mem_window':    hp.get('mem_window', -1),
         'out_len':     hp.get('out_len', 32),
         'n_blocks':    hp.get('n_blocks', 1),
         'recall_from': hp.get('recall_from', 0),
@@ -311,10 +311,10 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         slot_len   = stage.get('slot_len', seg_len)
         warmup_len = stage.get('warmup_len', 16)
         intermed_len = stage.get('intermed_len', 0)
-        mem_window   = stage.get('mem_window', 0)
+        mem_window   = stage.get('mem_window', -1)
         out_len    = stage.get('out_len', 32)
         n_blocks   = stage.get('n_blocks', 1)
-        recall_from = stage.get('recall_from', 0)
+        recall_from = stage.get('recall_froms', stage.get('recall_from', 0))
         B          = stage['B']
         n_steps    = stage['n_steps']
         stage_cycle = stage.get('cycle_steps', cycle_steps)
@@ -357,7 +357,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             for pg in opt.param_groups:
                 pg['batch_size'] = B
         _log(f'\n{"="*60}')
-        _log(f'  [stage {stage_i}] n_blocks={n_blocks} recall_from={recall_from}'
+        _rf_label = recall_from if isinstance(recall_from, int) else f'mixed{recall_from}'
+        _log(f'  [stage {stage_i}] n_blocks={n_blocks} recall_from={_rf_label}'
              f'  seg={seg_len}  slot={slot_len}  wl={warmup_len}  out={out_len}'
              f'  B={B}  steps={n_steps}  L={L_total}')
 
@@ -448,10 +449,12 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     if len(warmup) < warmup_len:
                         warmup = [x_S[0]] * (warmup_len - len(warmup)) + list(warmup)
                     target  = x_S[y_start:y_end]
+                    # Use first recall_from for per-step eval (list → int)
+                    _rf_eval = recall_from[0] if isinstance(recall_from, list) else recall_from
                     gen     = ar_decode_role(model, x_S, slot_len,
                                              warmup, len(target), device,
                                              n_blocks=n_blocks,
-                                             recall_from=recall_from,
+                                             recall_from=_rf_eval,
                                              intermed_len=intermed_len,
                                              mem_window=mem_window)
                     c = cer(gen, target)
@@ -553,7 +556,7 @@ DEFAULTS = dict(
     grad_clip=10.0, dataset_size=5000,
     stablemax=False, eval_offset=0.25,
     grad_checkpoint=False,
-    mem_window=0,   # 0=full history; 1=isolated; N=last N h states
+    mem_window=-1,  # -1=full history; 1=isolated; N=window; 1=isolated; N=last N h states
     n_blocks=1, recall_from=0,
     compile=False,
     curriculum=CURRICULUM_SURAH,

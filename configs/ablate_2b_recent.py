@@ -1,6 +1,6 @@
 """
 Stage 1 — Two blocks, recall from recent chunk.
-DSL: 2x<h:1><x:16><z:7><q:4><y:8,from=1>
+DSL: 2x<x:16><z:7><h:1><q:4><y:8,from=1>
 
 Warm-up test. h_1 has absorbed both chunks; query targets chunk_1 (recency
 advantage). If this fails the fast-weight update mechanism itself is broken.
@@ -28,7 +28,7 @@ hp = dict(
 
     rope=True, yarn=True, grok=False,
     stablemax=False, eval_offset=0.25, grad_clip=10.0,
-    mem_window=0,  # 0=full; 1=isolated; N=window
+    mem_window=-1,  # -1=full; 1=isolated; N=window
     compile=False,
     name='ablate_2b_recent',
     curriculum=None,

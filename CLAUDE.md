@@ -84,16 +84,38 @@ All attention is **pure causal** — no non-causal overrides. `<q>/<y>` are expl
 
 **Bottleneck:** `slot_len` directly (no `active_slots` masking). `slot_len=1, intermed_len=7` ≈ v1's `slot_len=8, active_slots=1`.
 
-**Vocab:** V_in = 256 + 10 + slot_len + intermed_len (computed). V_out = 256 (data bytes only).
-- `data_embed: Embedding(256, d)` — data bytes
-- `special_embed: Embedding(V_in-256, d)` — tags + slot IDs
+**Vocab:** V_in = 256 + 10 + slot_len + intermed_len (auto-computed). V_out = 256 (data bytes only).
+- `data_embed: Embedding(256, d)` — data bytes (std=0.02)
+- `special_embed: Embedding(V_in-256, d)` — boundary tags + slot IDs (std=0.05)
+
+**Slot token scheme — three options:**
+- **Dedicated indexed** (current, K=slot_len): slot i → `266+i`. Unique V per slot, zero collision. Vocab grows with slot_len. No extrapolation beyond training slot_len.
+- **Dedicated cyclic** (K < slot_len): slot i → `266 + (i % K)`. K dedicated IDs above 255 cycle over all slots. Fixed vocab (K tokens), zero collision, extrapolates to arbitrary slot_len. Best design for scaling.
+- **Looped byte** (style A): slot i → `i % 256`. Fixed vocab=256, extrapolates, but collides with data bytes.
+
+**Dedicated cyclic is the right choice for scaling.** K is the "slot vocab budget" — train with K=8, infer with slot_len=1024 using the same 8 IDs cycling, RoPE carries absolute position. Current code uses dedicated indexed (K=slot_len=1 for now, so no practical difference). `make_hidden_slot_ids(slot_len, cycle_len=slot_len)` — set `cycle_len=8` before scaling.
 
 **mem_window:** controls how many prior `<h>` states each new `<h>` can attend to.
 - 0 (default): full history — fast-weight accumulation
 - 1: isolated — each `<h>` compresses only its own block
 - N: N-step sliding window
 
-**Config DSL:** `<h:1><x:16><z:7><q:4><y:8>` → parsed by `kvmem/seq_dsl.py`.
+**Sequence DSL:** `<x:16><z:7><h:1><q:4><y:8>` → parsed by `kvmem/seq_dsl.py` → `SeqSpec`.
+
+**Curriculum DSL:** `kvmem/curriculum_dsl.py` — extends sequence DSL with training schedule.
+```
+"<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k, n2/r0/40k, n2/r[0,1]/80k, n2/r[0,1]/80k/w1"
+  │                              │  │   │   │           │                 │              │
+  seq spec (SeqSpec)             │  │   │   n_blocks=2  recall_froms     steps=80k      w=mem_window
+                                 │  r=  40k                =[0,1]=mixed
+                              n_blocks  steps
+```
+Stage token: `nN/rK/Xk[/wM]`  — n_blocks / recall / steps / mem_window (default -1=full)
+
+**Hparams absorbed by DSL (no longer set manually):**
+`seg_len`, `slot_len`, `intermed_len`, `warmup_len`, `out_len` → from seq spec  
+`n_blocks`, `recall_from`/`recall_froms`, `mem_window` → from curriculum stage tokens  
+`active_slots`, `slot_style`, `V` → removed entirely (slot_len is the bottleneck, dedicated indexed always)
 
 ---
 
@@ -131,6 +153,7 @@ The model must learn to propagate what matters through the chain (vanishing info
 | 2026-06-04 | Catastrophic forgetting between sequential stages confirmed |
 | 2026-06-04 | 2-block recall (from=0 and from=1) each achieves ~98% in isolation |
 | 2026-06-04 | ar_decode_role was broken for multi-block — now uses correct n_blocks eval |
+| 2026-06-04 | Dedicated cyclic IDs (266+(i%K)) is the right scaling design — fixed vocab K, zero data collision, extrapolates to arbitrary slot_len via cycle; looped byte (i%256) also works but collides with data |
 
 ---
 
@@ -138,6 +161,8 @@ The model must learn to propagate what matters through the chain (vanishing info
 
 | What | Where |
 |------|-------|
+| Exp 1 results | `reports/EXP1_DATASET_ABLATION.md` |
+| Exp 2 live tracking | `reports/EXP2_MULTITURN_TRACKING.md` |
 | Exp 2 plan + refine plan | `plan/PLAN_EXP2.md` |
 | Tag naming rationale | `reports/tag_naming.md` |
 | KV dimension tables | `reports/kv_dims.md` |

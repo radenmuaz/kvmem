@@ -128,25 +128,25 @@ def parse_seq(spec: str) -> 'SeqSpec':
     if q_len is None or y_len is None:
         raise ValueError(f'Spec must contain <q:N> and <y:N>: {spec!r}')
 
-    if len(blocks_raw) % 2 != 0:
-        raise ValueError(f'Block tags must be <h><x> pairs, got: {[b[:2] for b in blocks_raw]}')
+    # Order-invariant: collect h and x counts independently.
+    # DSL can be written in sequence order <x><z><h><q><y> or any order.
+    # Each block = one <h> + one <x>; counts must match.
+    slot_lens = [n for name, n, _ in blocks_raw if name == 'h']
+    src_lens  = [n for name, n, _ in blocks_raw if name == 'x']
 
-    pairs = [(blocks_raw[i], blocks_raw[i+1]) for i in range(0, len(blocks_raw), 2)]
-    for (a, _, _), (b, _, _) in pairs:
-        if a != 'h' or b != 'x':
-            raise ValueError(f'Expected <h><x> pairs, got <{a}><{b}>')
-
-    slot_lens   = [n for name, n, _ in blocks_raw if name == 'h']
-    src_lens    = [n for name, n, _ in blocks_raw if name == 'x']
-
+    if len(slot_lens) != len(src_lens):
+        raise ValueError(
+            f'Number of <h> tags ({len(slot_lens)}) must equal <x> tags ({len(src_lens)})')
+    if not slot_lens:
+        raise ValueError('Spec must contain at least one <h:N><x:N> block pair')
     if len(set(slot_lens)) > 1:
-        raise ValueError(f'All <m:N> must share the same N, got {slot_lens}')
+        raise ValueError(f'All <h:N> must share the same N, got {slot_lens}')
     if len(set(src_lens)) > 1:
-        raise ValueError(f'All <s:N> must share the same N, got {src_lens}')
+        raise ValueError(f'All <x:N> must share the same N, got {src_lens}')
     if len(set(active_slots_vals)) > 1:
-        raise ValueError(f'All <m> active values must match, got {active_slots_vals}')
+        raise ValueError(f'All <h> active values must match, got {active_slots_vals}')
 
-    n_blocks    = len(pairs) * multiplier
+    n_blocks    = len(slot_lens) * multiplier
     slot_len    = slot_lens[0]
     seg_len     = src_lens[0]
     active_slots = active_slots_vals[0] if active_slots_vals else 0
@@ -285,16 +285,16 @@ class SeqSpec:
         return '\n'.join(lines)
 
     def to_spec_str(self) -> str:
-        """Round-trip to canonical spec string."""
+        """Round-trip to canonical spec string (sequence order: x z h q y)."""
         frm = f',from={self.recall_from}' if self.recall_from else ''
         ext = f'<z:{self.intermed_len}>'   if self.intermed_len  else ''
-        block = f'<h:{self.slot_len}><x:{self.seg_len}>'
-        return f'{block * self.n_blocks}{ext}<q:{self.warmup_len}><y:{self.out_len}{frm}>'
+        block = f'<x:{self.seg_len}>{ext}<h:{self.slot_len}>'
+        return f'{block * self.n_blocks}<q:{self.warmup_len}><y:{self.out_len}{frm}>'
 
     def __repr__(self) -> str:
         frm = f',from={self.recall_from}' if self.recall_from else ''
         ext = f'<z:{self.intermed_len}>'   if self.intermed_len  else ''
-        block = f'<h:{self.slot_len}><x:{self.seg_len}>'
+        block = f'<x:{self.seg_len}>{ext}<h:{self.slot_len}>'
         return (f'SeqSpec  {(block + " ") * self.n_blocks}'
-                f'{ext}<q:{self.warmup_len}><y:{self.out_len}{frm}>  '
+                f'<q:{self.warmup_len}><y:{self.out_len}{frm}>  '
                 f'n_blocks={self.n_blocks}  L={self.L}')
