@@ -554,6 +554,196 @@ def make_multi_batch(rng: np.random.Generator, B: int,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Interleaved (int) mode: [block_0 recall_0] [block_1 recall_1] ...
+# Each recall_k targets its preceding block_k.
+# Later h_k can see prior q/y tokens (interactive: model knows Q&A history).
+# Same masking rules as make_mask_multi — just applied to different layout.
+# ---------------------------------------------------------------------------
+
+def interleaved_positions(n_blocks: int, seg_len: int, slot_len: int,
+                          warmup_len: int, out_len: int,
+                          intermed_len: int = 0) -> dict:
+    """
+    Positions for interleaved sequence: N × (block + recall).
+    Each sub-unit = <x>src</x>[<z>z</z>]<h>h</h><q>wm</q><y>out</y>
+    """
+    sub = multi_block_positions(1, seg_len, slot_len, warmup_len, out_len, intermed_len)
+    unit_len = sub['L']   # length of one (block + recall) unit
+    L = unit_len * n_blocks
+
+    units = []
+    for k in range(n_blocks):
+        base = k * unit_len
+        p = {key: sub[key] + base if isinstance(sub[key], (int, np.integer)) else sub[key]
+             for key in sub if key != 'blocks'}
+        # Adjust single block positions
+        b0 = sub['blocks'][0]
+        block = {bk: bv + base for bk, bv in b0.items()}
+        p['blocks'] = [block]
+        p['L'] = unit_len
+        units.append(p)
+
+    return dict(units=units, unit_len=unit_len, L=L, n_blocks=n_blocks,
+                seg_len=seg_len, slot_len=slot_len, warmup_len=warmup_len,
+                out_len=out_len, intermed_len=intermed_len)
+
+
+def make_mask_interleaved(n_blocks: int, seg_len: int, slot_len: int,
+                          warmup_len: int, out_len: int,
+                          intermed_len: int = 0,
+                          mem_window: int = -1) -> np.ndarray:
+    """
+    Attention mask for interleaved sequences.
+    Same rules as make_mask_multi: q/y blocked from x/z; y write-only;
+    cross-block h isolation; h can see prior q/y (interactive).
+    """
+    pos = interleaved_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len)
+    L = pos['L']
+    r = np.arange(L)
+    c = np.arange(L)
+    causal  = c[None, :] <= r[:, None]
+    blocked = np.zeros((L, L), dtype=bool)
+
+    all_x     = np.zeros(L, dtype=bool)
+    all_intermed = np.zeros(L, dtype=bool)
+    all_y_col = np.zeros(L, dtype=bool)
+
+    for k, unit in enumerate(pos['units']):
+        b = unit['blocks'][0]
+        all_x |= (c >= b['s0']) & (c < b['s1'])
+        if intermed_len > 0:
+            all_intermed |= (c >= b['p0']) & (c < b['p1'])
+        # y write-only
+        c0, c1 = unit['c0'], unit['c1']
+        all_y_col |= (c >= unit['fc1'])  # c_open onward
+
+        # q/y rows blocked from x/z
+        qy_row = r >= unit['recall_start']
+        if k < n_blocks - 1:
+            next_start = (k + 1) * pos['unit_len']
+            qy_row = qy_row & (r < next_start)
+        blocked |= qy_row[:, None] & (all_x | all_intermed)[None, :]
+
+        # h cross-block isolation: block h_k from x_j, z_j (j≠k)
+        h_row = (r >= b['sl0']) & (r < b['sl1'])
+        for j, u2 in enumerate(pos['units']):
+            if j == k: continue
+            b2 = u2['blocks'][0]
+            cross = ((c >= b2['s0']) & (c < b2['s1'])) | \
+                    ((c >= b2['p0']) & (c < b2['p1']))
+            # also block cross-block h slots outside mem_window
+            if j < k:
+                outside = (mem_window != -1) and ((k - j) >= mem_window)
+                if outside:
+                    cross |= (c >= b2['sl0']) & (c < b2['sl1'])
+            blocked |= h_row[:, None] & cross[None, :]
+
+    # y write-only: nothing outside y attends to y cols
+    # (but later q/y in same or later units can see earlier y causally)
+    for k, unit in enumerate(pos['units']):
+        y_col = (c >= unit['fc1'])
+        if k < n_blocks - 1:
+            y_col &= (c < (k + 1) * pos['unit_len'])
+        is_y_row_k = (r >= unit['fc1'])
+        if k < n_blocks - 1:
+            is_y_row_k &= (r < (k + 1) * pos['unit_len'])
+        # block non-q/y rows from seeing y_k columns
+        non_qy_row = ~is_y_row_k
+        # but later units' q/y rows CAN see earlier y (interactive)
+        for j in range(k + 1, n_blocks):
+            later_qy = (r >= pos['units'][j]['recall_start'])
+            if j < n_blocks - 1:
+                later_qy &= (r < (j + 1) * pos['unit_len'])
+            non_qy_row &= ~later_qy
+        blocked |= non_qy_row[:, None] & y_col[None, :]
+
+    visible = causal & ~blocked
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
+
+
+def make_interleaved_batch(rng: np.random.Generator, B: int,
+                           n_blocks: int, seg_len: int, slot_len: int,
+                           warmup_len: int, out_len: int,
+                           drop_close_prob: float = 0.5,
+                           intermed_len: int = 0,
+                           q_count: int = -1) -> tuple:
+    """
+    Build interleaved batch: full layout [block_k recall_k] × n_blocks.
+
+    q_count: how many blocks get real queries with loss supervision.
+      -1 (default): all n_blocks get real queries (pure int mode)
+       k in [1,n]: randomly select k blocks to have active recalls;
+                   remaining blocks have their recall region filled with
+                   structural tokens but y positions zeroed (no loss).
+
+    Returns (tokens, active_c_ranges) where:
+      tokens         : (B, L) int64
+      active_c_ranges: list of (c0, c1) output ranges with real targets
+                       (one per active query per example — same for all B)
+    """
+    pos      = interleaved_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len)
+    L        = pos['L']
+    slot_ids = make_hidden_slot_ids(slot_len)
+    intermed_ids = make_intermed_slot_ids(intermed_len, slot_len) if intermed_len > 0 else []
+    out_arr  = np.zeros((B, L), dtype=np.int64)
+    n_win    = max(1, seg_len - out_len)
+
+    # Decide which blocks have active recalls (same for whole batch, sampled once)
+    if q_count == -1 or q_count >= n_blocks:
+        active_blocks = list(range(n_blocks))
+    else:
+        k = max(1, min(q_count, n_blocks))
+        active_blocks = sorted(rng.choice(n_blocks, size=k, replace=False).tolist())
+    active_c_ranges = [(pos['units'][k]['c0'], pos['units'][k]['c1']) for k in active_blocks]
+
+    for i in range(B):
+        segs = [_sample_seg(rng, seg_len) for _ in range(n_blocks)]
+        for k, unit in enumerate(pos['units']):
+            seg = segs[k]
+            b   = unit['blocks'][0]
+            out_arr[i, b['block_start']:b['s0']]         = INPUT_OPEN
+            out_arr[i, b['s0']:b['s1']]                  = seg
+            out_arr[i, b['s1']:b['s_close_end']]         = INPUT_CLOSE
+            if intermed_len > 0:
+                out_arr[i, b['p_open']:b['p0']]          = INTERMED_OPEN
+                out_arr[i, b['p0']:b['p1']]              = intermed_ids
+                out_arr[i, b['p1']:b['p_close_end']]     = INTERMED_CLOSE
+            out_arr[i, b['p_close_end']:b['sl0']]        = HIDDEN_OPEN
+            out_arr[i, b['sl0']:b['sl1']]                = slot_ids
+            out_arr[i, b['sl1']:b['mc1']]                = HIDDEN_CLOSE
+            # Always write structural recall tokens
+            y_start = int(rng.integers(0, n_win + 1))
+            y_end   = min(y_start + out_len, seg_len)
+            w_st    = max(0, y_start - warmup_len)
+            wm      = seg[w_st:y_start]
+            if len(wm) < warmup_len:
+                wm = np.concatenate([np.full(warmup_len - len(wm), seg[0], dtype=np.int32), wm])
+            rs = unit['recall_start']
+            out_arr[i, rs:rs+FROM_OPEN_LEN]                    = FROM_OPEN
+            out_arr[i, unit['f0']:unit['f1']]                  = wm
+            out_arr[i, unit['f1']:unit['f1']+FROM_CLOSE_LEN]   = FROM_CLOSE
+            out_arr[i, unit['fc1']:unit['fc1']+CONT_OPEN_LEN]  = CONT_OPEN
+            if k in active_blocks:
+                # Active recall: target any previously-seen block (random)
+                target_k = int(rng.integers(0, k + 1))   # block 0..k
+                seg_r    = segs[target_k]
+                yr_start = int(rng.integers(0, n_win + 1))
+                yr_end   = min(yr_start + out_len, seg_len)
+                wr_st    = max(0, yr_start - warmup_len)
+                wm_r     = seg_r[wr_st:yr_start]
+                if len(wm_r) < warmup_len:
+                    wm_r = np.concatenate([np.full(warmup_len - len(wm_r), seg_r[0], dtype=np.int32), wm_r])
+                # Overwrite warmup with target-block warmup
+                rs_u = unit['recall_start']
+                out_arr[i, unit['f0']:unit['f1']] = wm_r
+                out_arr[i, unit['c0']:unit['c0']+(yr_end-yr_start)] = seg_r[yr_start:yr_end]
+                if rng.random() >= drop_close_prob:
+                    out_arr[i, unit['c1']:unit['c1']+CONT_CLOSE_LEN] = CONT_CLOSE
+            # Inactive recall: y region stays zeros (masked from loss)
+
+    return out_arr, active_c_ranges
+
 
 def make_mask_tag(L_S: int, N: int, L_y: int) -> np.ndarray:
     """

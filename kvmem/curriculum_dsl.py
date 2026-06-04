@@ -51,6 +51,7 @@ _STEPS_RE  = re.compile(r'^(\d+)k?$', re.IGNORECASE)
 _BLOCKS_RE = re.compile(r'^n(\d+)$')
 _ROUTES_RE = re.compile(r'^r(\d+|\[\d+(?:,\d+)*\])$')
 _WINDOW_RE = re.compile(r'^w(-?\d+)$')
+_MODE_RE   = re.compile(r'^m(end|int|acc|mix)$')
 
 
 def _parse_steps(s: str) -> int:
@@ -79,8 +80,9 @@ def _parse_stage(token: str, seq: SeqSpec, defaults: dict) -> dict:
     parts = [p.strip() for p in token.strip().split('/') if p.strip()]
     n_blocks = None
     recall_froms = None
-    n_steps = defaults.get('n_steps', 40000)
+    n_steps    = defaults.get('n_steps', 40000)
     mem_window = defaults.get('mem_window', -1)
+    mode       = defaults.get('mode', 'end')   # end|int|acc|mix
 
     for p in parts:
         if _BLOCKS_RE.match(p):
@@ -89,6 +91,8 @@ def _parse_stage(token: str, seq: SeqSpec, defaults: dict) -> dict:
             recall_froms = _parse_routes(p)
         elif _WINDOW_RE.match(p):
             mem_window = int(_WINDOW_RE.match(p).group(1))
+        elif _MODE_RE.match(p):
+            mode = _MODE_RE.match(p).group(1)
         elif _STEPS_RE.match(p):
             n_steps = _parse_steps(p)
         else:
@@ -96,11 +100,11 @@ def _parse_stage(token: str, seq: SeqSpec, defaults: dict) -> dict:
 
     if n_blocks is None:
         raise ValueError(f'Missing n_blocks (nN) in stage: {token!r}')
-    if recall_froms is None:
-        raise ValueError(f'Missing routes (rK or r[K,...]) in stage: {token!r}')
+    if recall_froms is None and mode not in ('acc',):
+        raise ValueError(f'Missing routes (rK or r[K,...]) in stage: {token!r}  (use macc for ingest-only)')
 
-    # Validate recall_froms against n_blocks
-    rfs = recall_froms if isinstance(recall_froms, list) else [recall_froms]
+    # Validate recall_froms against n_blocks (skip for accumulate-only mode)
+    rfs = recall_froms if isinstance(recall_froms, list) else [recall_froms] if recall_froms is not None else []
     for rf in rfs:
         if rf >= n_blocks:
             raise ValueError(
@@ -115,8 +119,9 @@ def _parse_stage(token: str, seq: SeqSpec, defaults: dict) -> dict:
         out_len=seq.out_len,
         # Stage-specific
         n_blocks=n_blocks,
-        recall_froms=recall_froms,
+        recall_froms=recall_froms if recall_froms is not None else 0,
         mem_window=mem_window,
+        mode=mode,
         n_steps=n_steps,
     )
     # Merge extra defaults (B, dataset_size, etc.)
@@ -266,5 +271,5 @@ if __name__ == '__main__':
     print(f'SeqSpec: {spec}')
     print(f'Curriculum ({len(cur)} stages):')
     for i, s in enumerate(cur):
-        print(f'  s{i}: n={s["n_blocks"]}  rf={s["recall_froms"]}  w={s["mem_window"]}  steps={s["n_steps"]}')
+        print(f'  s{i}: n={s["n_blocks"]}  rf={s["recall_froms"]}  mode={s["mode"]}  w={s["mem_window"]}  steps={s["n_steps"]}')
     print(f'Eval configs: {evals}')

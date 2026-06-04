@@ -140,6 +140,18 @@ seq_spec | stage, stage, stage @eval:eval_spec
 | `r[K,...]` | recall_froms mixed (per-example random draw) | `r[0,1]` |
 | `Xk` | steps | `40k`, `160k` |
 | `wM` | mem_window (-1=full, 1=isolated, N=window) | `w-1`, `w1` |
+| `mMODE` | op sequence mode (see below) | `mint`, `macc`, `mmix` |
+
+**Op sequence modes (`mMODE`):**
+
+| Mode | Pattern per example | Use |
+|------|---------------------|-----|
+| (default) `mend` | `xh xh ... q` | all ingest then one recall |
+| `mint` | `xhq xhq ... xhq` | recall after every block (interleaved) |
+| `macc` | `xh xh ... xh` | ingest only, no recall, no loss |
+| `mmix` | random per example | mix of all patterns — interactive training |
+
+For `mmix`, each batch example randomly picks a pattern: some examples just accumulate, some have end-recall, some have interleaved queries. Trains the model to handle both "new data in" and "user query" interactively.
 
 **`+` overlap:** prefix a stage with `+` to merge into the previous stage's batch distribution:
 ```
@@ -171,17 +183,32 @@ hp['eval_configs'] = eval_configs
 **Removed entirely:** `active_slots`, `slot_style`, `V` — slot_len IS the bottleneck; dedicated indexed tokens always.
 
 ```bash
+# Train:
 python -m kvmem.train --config configs/single_s16.py --device mps
+
+# Eval only (load checkpoint, run eval_configs, exit):
+python -m kvmem.train --config configs/expB_chain_nullkv.py \
+  --eval-only logs/role_<name>/checkpoints/stage0_end.pt --device mps
+
+# Resume (full state: weights + optimizer + rng):
+python -m kvmem.train --config configs/expB_chain_nullkv.py \
+  --resume logs/role_<name>/checkpoints/stage0_end.pt --device mps
+
+# Pretrained weights only (fresh training, warm init):
+python -m kvmem.train --config configs/expB_chain_nullkv.py \
+  --pretrained logs/role_<name>/checkpoints/stage0_end.pt --device mps
 ```
 
 ---
 
 ## Results
 
-| Config | val_bpb | match% | Notes |
-|--------|---------|--------|-------|
+| Config | Best val_bpb | match% | Notes |
+|--------|------------|--------|-------|
 | v1: seg=16, slot=8, active=1 (full-pass TF) | 0.249 | **93.8%** | 40k steps |
-| v2: seg=16, slot=1, intermed=7 (causal) | 0.176 | **98.4%** | 70k steps, ds10k |
+| v2: seg=16, slot=1, intermed=7 | 0.176 | **98.4%** | 70k steps, ds10k |
+| v2 + null_kv=True | **0.157** | **92%** | 26k steps — 1.5-2× faster |
+| v2 mixed routing n=2 (cold start) | 0.252 | **91%** both dirs | 65k/160k — routing works |
 
 v2 architecture: RNN-style tags, learned embeddings, source-first causal layout, no active_slots.
 

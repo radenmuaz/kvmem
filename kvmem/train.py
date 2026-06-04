@@ -62,6 +62,7 @@ from kvmem.data import (
     OUTPUT_OPEN_LEN, OUTPUT_CLOSE_LEN,
     INTERMED_OPEN_LEN, INTERMED_CLOSE_LEN,
     multi_block_positions, make_mask_multi, make_multi_batch,
+    interleaved_positions, make_mask_interleaved, make_interleaved_batch,
 )
 from kvmem.utils import make_test_sequences, cer
 
@@ -276,6 +277,15 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
     torch.manual_seed(seed)
     model = build_model(hp_model, device)
+    _resume_state = None
+    if hp.get('_pretrained_ckpt'):
+        _pt = torch.load(hp['_pretrained_ckpt'], map_location=device)
+        model.load_state_dict(_pt['model'])
+        _log(f'  [pretrained weights from {hp["_pretrained_ckpt"]}]')
+    if hp.get('_resume_ckpt'):
+        _resume_state = torch.load(hp['_resume_ckpt'], map_location=device)
+        model.load_state_dict(_resume_state['model'])
+        _log(f'  [resumed from {hp["_resume_ckpt"]}  stage={_resume_state.get("stage","?")}  step={_resume_state.get("step","?")}]')
     if hp.get('compile', False):
         model = torch.compile(model)
 
@@ -285,6 +295,19 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         rho=hp.get('grok_rho', 0.9), batch_size=curriculum[0]['B'])
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=wd)
+
+    _resume_stage = 0
+    _resume_step  = 0
+    if _resume_state is not None:
+        opt.load_state_dict(_resume_state['opt'])
+        _resume_stage = _resume_state.get('stage', 0)
+        _resume_step  = _resume_state.get('step', 0)
+        if 'rng_np' in _resume_state:
+            rng.bit_generator.state = _resume_state['rng_np']
+        if 'rng_torch' in _resume_state:
+            torch.set_rng_state(_resume_state['rng_torch'])
+        global_step = _resume_state.get('global_step', 0)
+        _log(f'  [rng + opt state restored from checkpoint]')
 
     gc_flag = '  grad_checkpoint=ON' if hp.get('grad_checkpoint') else ''
     _log(f'\n=== kvmem memory-first | run_dir={run_dir} ===')
@@ -318,6 +341,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     global_step = 0
 
     for stage_i, stage in enumerate(curriculum):
+        if stage_i < _resume_stage: continue  # skip completed stages
         seg_len    = stage['seg_len']
         slot_len   = stage.get('slot_len', seg_len)
         warmup_len = stage.get('warmup_len', 16)
@@ -326,6 +350,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         out_len    = stage.get('out_len', 32)
         n_blocks   = stage.get('n_blocks', 1)
         recall_from = stage.get('recall_froms', stage.get('recall_from', 0))
+        seq_mode    = stage.get('mode', 'end')   # end|int|mix
         B          = stage['B']
         n_steps    = stage['n_steps']
         stage_cycle = stage.get('cycle_steps', cycle_steps)
@@ -339,6 +364,13 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 return lr_max
             t = (local - warmup_steps) % _cycle
             return max(lr_max * 1e-2, lr_max * 0.5 * (1 + math.cos(math.pi * t / _cycle)))
+
+        if seq_mode in ('int', 'mix'):
+            pos_int = interleaved_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len)
+            L_total_int = pos_int['L']
+            mask_int_t  = torch.tensor(
+                make_mask_interleaved(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len, mem_window),
+                dtype=torch.float32, device=device)
 
         pos     = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len,
                                         intermed_len)
@@ -382,12 +414,26 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 pg['lr'] = lr
 
             model.train()
-            tokens_np = (pool[(local_step - 1) % ds]
-                         if pool is not None
-                         else make_multi_batch(rng, B, n_blocks, recall_from,
-                                               seg_len, slot_len,
-                                               warmup_len, out_len, drop_close_prob,
-                                               intermed_len))
+            # Pick mode per step for 'mix' (alternates between end and int)
+            _mode_this = seq_mode
+            if seq_mode == 'mix':
+                _mode_this = 'int' if rng.random() < 0.5 else 'end'
+
+            if _mode_this in ('int',):
+                # Interleaved: random query count per batch
+                _q_count = int(rng.integers(1, n_blocks + 1))
+                tokens_np, _active_c = make_interleaved_batch(
+                    rng, B, n_blocks, seg_len, slot_len,
+                    warmup_len, out_len, drop_close_prob, intermed_len, _q_count)
+                _use_interleaved = True
+            else:
+                tokens_np = (pool[(local_step - 1) % ds]
+                             if pool is not None
+                             else make_multi_batch(rng, B, n_blocks, recall_from,
+                                                   seg_len, slot_len,
+                                                   warmup_len, out_len, drop_close_prob,
+                                                   intermed_len))
+                _use_interleaved = False
 
             if use_ocd:
                 _p     = _resolve_ocd_prob(local_step)
@@ -410,18 +456,31 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 loss_val = -(ocd_t * lp).sum(-1).mean()
                 mode = 'ocd'
             else:
-                # Full-pass TF — exact gradients
-                # Supervise only <c> positions; targets there are always data bytes (0-255).
-                # V_out=256 so we gather only on the output region to avoid out-of-range
-                # indices from special token IDs (256+) in other sequence positions.
-                tokens   = torch.tensor(tokens_np, device=device)
                 opt.zero_grad()
-                logits   = model(tokens, mask_t)                    # (B, L, 256)
-                lp_c     = log_probs_fn(logits[:, c0-1:c1-1])       # (B, out_len, 256)
-                tgts_c   = tokens[:, c0:c1]                         # (B, out_len) in [0,255]
-                nll_c    = -lp_c.gather(2, tgts_c.unsqueeze(-1)).squeeze(-1)
-                loss_val = nll_c.mean()
-                mode = 'tf'
+                if _use_interleaved:
+                    # Interleaved: loss on all active <y> regions
+                    _L = tokens_np.shape[1]
+                    tokens  = torch.tensor(tokens_np, device=device)
+                    logits  = model(tokens, mask_int_t)              # (B, _L, 256)
+                    loss_parts = []
+                    _ranges = _active_c if _active_c else [(c0, c1)]  # fallback to end-mode range
+                    for _c0, _c1 in _ranges:
+                        if _c1 > _c0 and _c0 > 0:  # valid range
+                            lp   = log_probs_fn(logits[:, _c0-1:_c1-1])
+                            tgt  = tokens[:, _c0:_c1]
+                            nll  = -lp.gather(2, tgt.unsqueeze(-1)).squeeze(-1)
+                            loss_parts.append(nll.mean())
+                    loss_val = torch.stack(loss_parts).mean() if loss_parts else torch.tensor(0.0, device=device, requires_grad=True)
+                    mode = 'tf-int'
+                else:
+                    # Standard end-mode TF
+                    tokens   = torch.tensor(tokens_np, device=device)
+                    logits   = model(tokens, mask_t)                    # (B, L, 256)
+                    lp_c     = log_probs_fn(logits[:, c0-1:c1-1])
+                    tgts_c   = tokens[:, c0:c1]
+                    nll_c    = -lp_c.gather(2, tgts_c.unsqueeze(-1)).squeeze(-1)
+                    loss_val = nll_c.mean()
+                    mode = 'tf'
 
             loss_val.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -489,7 +548,16 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     break
 
         ckpt = os.path.join(ckpt_dir, f'stage{stage_i}_end.pt')
-        torch.save({'model': model.state_dict(), 'hp': hp, 'stage': stage_i}, ckpt)
+        torch.save({
+            'model':     model.state_dict(),
+            'opt':       opt.state_dict(),
+            'hp':        hp,
+            'stage':     stage_i,
+            'step':      local_step,
+            'global_step': global_step,
+            'rng_np':    rng.bit_generator.state,
+            'rng_torch': torch.get_rng_state(),
+        }, ckpt)
         _log(f'  [ckpt stage {stage_i} end] {ckpt}')
 
 
@@ -572,6 +640,8 @@ if __name__ == '__main__':
     p.add_argument('--stablemax',       action='store_true')
     p.add_argument('--grad-checkpoint', action='store_true',
                    help='Depth-wise gradient checkpointing per block (saves inter-layer activations)')
+    p.add_argument('--null-kv',         action='store_true',
+                   help='Append fixed zero KV before softmax (abstain option)')
     p.add_argument('--n-blocks',        type=int)
     p.add_argument('--recall-from',     type=int)
     p.add_argument('--no-grok',         action='store_true')
@@ -581,6 +651,12 @@ if __name__ == '__main__':
     p.add_argument('--log-dir',         type=str, default='logs')
     p.add_argument('--device',          type=str, default='cpu',
                    choices=['cpu', 'mps', 'cuda'])
+    p.add_argument('--eval-only',       type=str, default=None, metavar='CKPT',
+                   help='Load checkpoint, run eval_configs once, print results and exit')
+    p.add_argument('--resume',          type=str, default=None, metavar='CKPT',
+                   help='Resume training from checkpoint (loads model weights + continues)')
+    p.add_argument('--pretrained',      type=str, default=None, metavar='CKPT',
+                   help='Load pretrained weights only (no optimizer/rng state — fresh training)')
     p.add_argument('--seed',            type=int)
     p.add_argument('--curriculum',      type=str, default='v1',
                    choices=['v1', 'none'])
@@ -618,7 +694,8 @@ if __name__ == '__main__':
     if args.name:                  hp['name'] = args.name
     if args.name_date:             hp['name_date'] = True
     if args.stablemax:             hp['stablemax'] = True
-    if args.grad_checkpoint:       hp['grad_checkpoint'] = True
+    if args.grad_checkpoint:       hp["grad_checkpoint"] = True
+    if args.null_kv:               hp["null_kv"] = True
     if args.no_grok:               hp['grok'] = False
     if args.compile:               hp['compile'] = True
 
@@ -637,5 +714,52 @@ if __name__ == '__main__':
             warmup_len=hp['warmup_len'], out_len=hp['out_len'],
             B=hp['B'], n_steps=hp['n_steps'],
         )]
+
+    if args.eval_only:
+        # Load checkpoint, run eval once, exit
+        import torch
+
+        device = torch.device(args.device)
+        ckpt = torch.load(args.eval_only, map_location=device)
+        # Infer V_in from checkpoint weight shapes (robust to stale hp)
+        sd = ckpt['model']
+        V_in_ckpt  = sd['data_embed.weight'].shape[0] + sd['special_embed.weight'].shape[0]
+        d_ckpt     = sd['data_embed.weight'].shape[1]
+        n_lay_ckpt = sum(1 for k in sd if k.endswith('.norm1.weight'))
+        ckpt_hp = {**hp, **ckpt.get('hp', {}),
+                   'V': V_in_ckpt, 'd': d_ckpt, 'n_layers': n_lay_ckpt,
+                   'd_ff': sd['blocks.0.ffn.W1.weight'].shape[0]}
+        model = build_model(ckpt_hp, device)
+        model.load_state_dict(sd)
+        model.eval()
+        test_seqs = make_test_sequences(hp.get('seg_len', 16))
+        eval_cfgs = hp.get('eval_configs', [(1, 0)])
+        slot_len = ckpt_hp.get('slot_len', hp.get('slot_len', 1))
+        intermed_len = ckpt_hp.get('intermed_len', hp.get('intermed_len', 0))
+        mem_window = hp.get('mem_window', -1)
+        warmup_len = hp.get('warmup_len', 4)
+        out_len = hp.get('out_len', 8)
+        eval_offset = hp.get('eval_offset', 0.25)
+        seg_len = ckpt_hp.get('seg_len', hp.get('seg_len', 16))
+        print(f'Checkpoint: {args.eval_only}  (stage={ckpt.get("stage","?")}  step={ckpt.get("step","?")})')
+        for nb, rf in eval_cfgs:
+            all_c = []
+            f_start = min(int(seg_len * eval_offset), seg_len - warmup_len - out_len)
+            y_start = f_start + warmup_len; y_end = min(y_start + out_len, seg_len)
+            for sname, x_S in test_seqs.items():
+                wm = x_S[max(0, y_start - warmup_len):y_start]
+                if len(wm) < warmup_len: wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
+                g = ar_decode_role(model, x_S, slot_len, wm, y_end - y_start, device,
+                                   n_blocks=nb, recall_from=rf,
+                                   intermed_len=intermed_len, mem_window=mem_window)
+                all_c.append(cer(g, x_S[y_start:y_end]))
+            mean_c = sum(all_c) / len(all_c)
+            print(f'  n={nb} rf={rf}: match={100*(1-mean_c):.1f}%')
+        import sys; sys.exit(0)
+
+    if args.resume:
+        hp['_resume_ckpt'] = args.resume
+    if args.pretrained:
+        hp['_pretrained_ckpt'] = args.pretrained
 
     train_role(hp, log_base=args.log_dir, device_str=args.device)

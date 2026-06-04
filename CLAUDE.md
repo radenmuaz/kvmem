@@ -35,6 +35,56 @@ Self-correction and ground truth are a **means**, not an end. OCD/correction tra
 
 ---
 
+## CLI Reference
+
+```bash
+# Standard training:
+python -m kvmem.train --config configs/expB_chain_nullkv.py --device mps
+
+# Eval only — load checkpoint, run eval_configs, print results, exit:
+python -m kvmem.train --config configs/expB_chain_nullkv.py \
+  --eval-only logs/role_<name>/checkpoints/stage0_end.pt --device mps
+
+# Resume — full state (weights + optimizer + rng, exact continuation):
+python -m kvmem.train --config configs/expB_chain_nullkv.py \
+  --resume logs/role_<name>/checkpoints/stage0_end.pt --device mps
+
+# Pretrained weights only — fresh training with warm init, no optimizer/rng restore:
+python -m kvmem.train --config configs/expB_chain_nullkv.py \
+  --pretrained logs/role_<name>/checkpoints/stage0_end.pt --device mps
+```
+
+**Checkpoint contents (full resume state):**
+`model`, `opt`, `hp`, `stage`, `step`, `global_step`, `rng_np`, `rng_torch`
+
+---
+
+## Monitoring Runs
+
+**Always print the tail command immediately after starting any training run.**
+Task output path: `/private/tmp/claude-501/-Users-muaz-code-kvmem/5692f5ae-ec99-4edc-ac10-e65f033b3e3d/tasks/<task_id>.output`
+
+```bash
+# Live tqdm output (give this cmd every time a run starts):
+tail -f /private/tmp/claude-501/-Users-muaz-code-kvmem/5692f5ae-ec99-4edc-ac10-e65f033b3e3d/tasks/<task_id>.output
+
+# Structured eval metrics only:
+tail -f logs/role_<name>/train.jsonl | python3 -c "
+import sys,json
+for l in sys.stdin:
+    d=json.loads(l)
+    keys=sorted(k for k in d if k.startswith('n') and '_r' in k)
+    if keys: print(f's={d[\"stage\"]} @{d[\"global_step\"]}: ' + '  '.join(f'{k}={d[k]:.0f}%' for k in keys))
+"
+```
+
+Current run: **expB_chain_nullkv** (task: `b0llojhbp`)
+```bash
+tail -f /private/tmp/claude-501/-Users-muaz-code-kvmem/5692f5ae-ec99-4edc-ac10-e65f033b3e3d/tasks/b0llojhbp.output
+```
+
+---
+
 ## Current Status (2026-06-04)
 
 **v2 architecture, Exp 1 results (dataset ablation, seg=16, slot=1, intermed=7):**
@@ -95,6 +145,8 @@ All attention is **pure causal** — no non-causal overrides. `<q>/<y>` are expl
 
 **Dedicated cyclic is the right choice for scaling.** K is the "slot vocab budget" — train with K=8, infer with slot_len=1024 using the same 8 IDs cycling, RoPE carries absolute position. Current code uses dedicated indexed (K=slot_len=1 for now, so no practical difference). `make_hidden_slot_ids(slot_len, cycle_len=slot_len)` — set `cycle_len=8` before scaling.
 
+**null_kv=True (recommended):** appends fixed (K=0, V=0) to every attention head before softmax. Zero-score "abstain" option. Result: 1.5-2× faster convergence, better peak bpb (0.157 vs 0.217 base). Set `null_kv=True` in hp or `--null-kv` CLI flag.
+
 **mem_window:** controls how many prior `<h>` states each new `<h>` can attend to.
 - 0 (default): full history — fast-weight accumulation
 - 1: isolated — each `<h>` compresses only its own block
@@ -107,7 +159,7 @@ All attention is **pure causal** — no non-causal overrides. `<q>/<y>` are expl
 seq_spec | stage, stage @eval:eval_spec
 ```
 
-Stage token: `nN/rK/Xk[/wM]` — n_blocks / recall / steps / mem_window
+Stage token: `nN/rK/Xk[/wM][/mMODE]` — n_blocks / recall / steps / mem_window / op-mode
 
 ```
 "<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k +n2/r0, n2/r[0,1]/80k/w1 @eval:n1/r0,n2/r0,n2/r1"
@@ -119,6 +171,7 @@ Stage token: `nN/rK/Xk[/wM]` — n_blocks / recall / steps / mem_window
 | `r[0,1]` | mixed batch: each example randomly draws recall from list |
 | `+nN/rK` | overlap: merge into previous stage's batch distribution |
 | `wM` | mem_window (-1=full, 1=isolated) |
+| `mMODE` | op pattern: `mend` (default), `mint` (interleaved), `macc` (ingest-only), `mmix` (random mix) |
 | `@eval:nN/rK,...` | eval configs tested every `eval_every` steps (independent of training) |
 
 Eval is independent of curriculum — `@eval:` specifies exactly which (n_blocks, recall_from) pairs are tested at each eval step. If omitted: auto-derived from all stages + `n1/r0` baseline.
@@ -149,8 +202,12 @@ The model must learn to propagate what matters through the chain (vanishing info
 | Exp | Plan | Status |
 |-----|------|--------|
 | Exp 1: Dataset ablation | — | ✓ Done — 100% match on ds20k and ds_random |
-| Exp 2: Multi-turn recall + mem_window | `plan/PLAN_EXP2.md` | 🔄 Running (stage 2/9) |
-| Exp 3: Refine (self-correction) | `plan/PLAN_EXP2.md` §Refine | After Exp 2 stage 3 |
+| Exp 2: Multi-turn routing (sequential) | `plan/PLAN_EXP2.md` | ✓ Done — catastrophic forgetting confirmed |
+| Exp 2b: Mixed routing from cold start | `configs/exp2b_mixed_only.py` | 🔄 Running — 91% both @60k, converging |
+| Exp 2b null_kv: Same + zero KV flag | `configs/exp2b_mixed_nullkv.py` | ✓ Done — 1.5-2× faster convergence, better peak bpb (0.157 vs 0.217) |
+| Exp 3: Refine (self-correction) | `plan/PLAN_EXP2.md` §Refine | After Exp 2b |
+
+**Key finding (2026-06-04):** Cold mixed training (`r[0,1]` from step 0) solves routing — both directions learn simultaneously without forgetting. Sequential curriculum was the cause, not the architecture.
 
 ---
 
@@ -167,6 +224,9 @@ The model must learn to propagate what matters through the chain (vanishing info
 | 2026-06-04 | 2-block recall (from=0 and from=1) each achieves ~98% in isolation |
 | 2026-06-04 | ar_decode_role was broken for multi-block — now uses correct n_blocks eval |
 | 2026-06-04 | Dedicated cyclic IDs (266+(i%K)) is the right scaling design — fixed vocab K, zero data collision, extrapolates to arbitrary slot_len via cycle; looped byte (i%256) also works but collides with data |
+| 2026-06-04 | null_kv=True: 1.5-2× faster convergence, better peak val_bpb (0.157 vs 0.217 base). Should be default for future runs. |
+| 2026-06-04 | Cold mixed routing (r[0,1] from step 0) solves catastrophic forgetting — both directions learn simultaneously, no sequential overwriting |
+| 2026-06-04 | Interleaved mode (mmix): random end/int per step, random query count k∈[1,n], each query targets random prior block — trains interactive "sometimes ingest, sometimes query" |
 
 ---
 
