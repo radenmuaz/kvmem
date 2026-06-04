@@ -382,20 +382,25 @@ def multi_block_positions(n_blocks: int, seg_len: int, slot_len: int,
 
 def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
                     warmup_len: int, out_len: int,
-                    intermed_len: int = 0) -> np.ndarray:
+                    intermed_len: int = 0,
+                    mem_window: int = 0) -> np.ndarray:
     """
     Attention mask for multi-block sequences. Pure causal — no non-causal overrides.
 
-    Block: <s>src</s> [<p>ponder</p>] <m>slots</m>
-      Causal access:
-        <p> sees src only  (src before p; m after p = blocked by causal)
-        <m> sees src + ponder  (both before m)
-      Explicit blocks on recall:
-        <f>/<c> BLOCKED from src and ponder — bottleneck enforced via slots only
-        <c> is write-only
+    Block: <x>src</x> [<z>intermed</z>] <h>slots</h>
+      <z> sees src (causal); <h> sees src + z (causal).
+      <q>/<y> blocked from src and z — bottleneck via <h> slots only.
+      <y> is write-only.
 
-    Cross-block: slots_i blocked from src_j, ponder_j, slots_j (j≠i).
-    active_slots removed — slot_len IS the bottleneck.
+    mem_window: how many <h> states (including itself) each new <h> can attend to.
+      0 (default): no limit — all prior <h> visible (full fast-weight accumulation)
+      1: isolated — <h>_i sees only its own block, no history
+      2: <h>_i sees <h>_{i-1} + itself (1-step Markov update)
+      N: <h>_i sees last N <h> states
+
+    Cross-block: <h>_i blocked from src_j, intermed_j of other blocks (j≠i).
+    For j within mem_window: <h>_i CAN see <h>_j (fast-weight update).
+    For j outside mem_window: <h>_i CANNOT see <h>_j.
     """
     pos    = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len,
                                    intermed_len)
@@ -412,30 +417,38 @@ def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
     is_c_col    = c >= pos['fc1']
     recall_rows = is_f_row | is_c_row
 
-    # All src and ponder col regions across blocks
+    # All src and intermed col regions
     is_any_src    = np.zeros(L, dtype=bool)
-    is_any_ponder = np.zeros(L, dtype=bool)
+    is_any_intermed = np.zeros(L, dtype=bool)
     for b in blocks:
-        is_any_src |= (c >= b['s0']) & (c < b['s1'])
+        is_any_src     |= (c >= b['s0']) & (c < b['s1'])
         if intermed_len > 0:
-            is_any_ponder |= (c >= b['p0']) & (c < b['p1'])
+            is_any_intermed |= (c >= b['p0']) & (c < b['p1'])
 
-    # <c> write-only
+    # <y> write-only
     blocked |= is_c_col[None, :] & ~is_c_row[:, None]
-    # recall rows blocked from src and ponder (forced through slot bottleneck)
+    # recall rows blocked from src and intermed
     blocked |= recall_rows[:, None] & is_any_src[None, :]
-    blocked |= recall_rows[:, None] & is_any_ponder[None, :]
+    blocked |= recall_rows[:, None] & is_any_intermed[None, :]
 
-    # Cross-block slot isolation
+    # Cross-block rules for <h> slots
     for i, b in enumerate(blocks):
         slot_row = (r >= b['sl0']) & (r < b['sl1'])
         for j, bj in enumerate(blocks):
             if j == i:
                 continue
-            cross_col = ((c >= bj['s0'])  & (c < bj['s1']))  | \
-                        ((c >= bj['sl0']) & (c < bj['sl1'])) | \
-                        ((c >= bj['p0'])  & (c < bj['p1']))
-            blocked |= slot_row[:, None] & cross_col[None, :]
+            # Always block cross-block src and intermed
+            cross_src_intermed = ((c >= bj['s0']) & (c < bj['s1'])) | \
+                                 ((c >= bj['p0']) & (c < bj['p1']))
+            blocked |= slot_row[:, None] & cross_src_intermed[None, :]
+            # Block cross-block <h> slots outside mem_window
+            # j < i: prior blocks — allowed if within window, blocked if outside
+            if j < i:
+                outside_window = (mem_window > 0) and ((i - j) >= mem_window)
+                if outside_window:
+                    h_j_col = (c >= bj['sl0']) & (c < bj['sl1'])
+                    blocked |= slot_row[:, None] & h_j_col[None, :]
+            # j > i: future blocks — already blocked by causal, no action needed
 
     visible = causal & ~blocked
     return np.where(visible, 0.0, -1e9).astype(np.float32)

@@ -55,10 +55,12 @@ from kvmem.model import build_model
 from kvmem.data import (
     HIDDEN_OPEN, HIDDEN_CLOSE, INPUT_OPEN, INPUT_CLOSE,
     QUERY_OPEN, QUERY_CLOSE, OUTPUT_OPEN, OUTPUT_CLOSE,
+    INTERMED_OPEN, INTERMED_CLOSE,
     HIDDEN_OPEN_LEN, HIDDEN_CLOSE_LEN,
     INPUT_OPEN_LEN, INPUT_CLOSE_LEN,
     QUERY_OPEN_LEN, QUERY_CLOSE_LEN,
     OUTPUT_OPEN_LEN, OUTPUT_CLOSE_LEN,
+    INTERMED_OPEN_LEN, INTERMED_CLOSE_LEN,
     multi_block_positions, make_mask_multi, make_multi_batch,
 )
 from kvmem.utils import make_test_sequences, cer
@@ -119,35 +121,50 @@ def ocd_rollout_full(model, tokens_batch: np.ndarray,
 
 @torch.no_grad()
 def ar_decode_role(model, x_S: list[int], slot_len: int,
-                   warmup: list[int], out_len: int, device) -> list[int]:
+                   warmup: list[int], out_len: int, device,
+                   n_blocks: int = 1, recall_from: int = 0,
+                   intermed_len: int = 0, mem_window: int = 0,
+                   distractor_seed: int = 99) -> list[int]:
     """
-    Greedy AR decode (eval). Builds a memory-first single-block sequence:
-      <m>slot_0..slot_{N-1}</m><s>x_S</s><f>warmup</f><c>...</c>
-    Returns out_len generated tokens.
+    Greedy AR decode (eval). Builds a n_blocks sequence where x_S is placed
+    in block recall_from; other blocks are filled with random distractors.
+
+    For n_blocks=1: single-block eval (original behaviour).
+    For n_blocks>1: correct multi-block eval — distractor blocks test that
+    the model routes <q> to the right block from anchor content alone.
     """
-    from kvmem.data import make_mem_slot_ids
-    seg_len  = len(x_S)
-    wl       = len(warmup)
-    slot_ids = make_mem_slot_ids(slot_len)
-    pos      = multi_block_positions(1, seg_len, slot_len, wl, out_len)
-    L        = pos['L']
-    mask_t   = torch.tensor(make_mask_multi(1, seg_len, slot_len, wl, out_len, 0),
-                             dtype=torch.float32, device=device)
-    b0       = pos['blocks'][0]
-    tokens   = np.zeros(L, dtype=np.int64)
-    # Source-first: <s>src</s><m>slots</m>
-    tokens[b0['block_start']:b0['s0']]          = INPUT_OPEN
-    tokens[b0['s0']:b0['s1']]                   = x_S
-    tokens[b0['s1']:b0['s_close_end']]          = INPUT_CLOSE
-    tokens[b0['s_close_end']:b0['sl0']]         = HIDDEN_OPEN
-    tokens[b0['sl0']:b0['sl1']]                 = slot_ids
-    tokens[b0['sl1']:b0['mc1']]                 = HIDDEN_CLOSE
+    from kvmem.data import make_hidden_slot_ids, make_intermed_slot_ids, _sample_seg
+    seg_len    = len(x_S)
+    wl         = len(warmup)
+    slot_ids   = make_hidden_slot_ids(slot_len)
+    intermed_ids = make_intermed_slot_ids(intermed_len, slot_len) if intermed_len > 0 else []
+    pos        = multi_block_positions(n_blocks, seg_len, slot_len, wl, out_len, intermed_len)
+    L          = pos['L']
+    mask_t     = torch.tensor(
+        make_mask_multi(n_blocks, seg_len, slot_len, wl, out_len, intermed_len, mem_window),
+        dtype=torch.float32, device=device)
+
+    rng    = np.random.default_rng(distractor_seed)
+    tokens = np.zeros(L, dtype=np.int64)
+
+    for k, b in enumerate(pos['blocks']):
+        src = np.array(x_S) if k == recall_from else _sample_seg(rng, seg_len)
+        tokens[b['block_start']:b['s0']]         = INPUT_OPEN
+        tokens[b['s0']:b['s1']]                  = src
+        tokens[b['s1']:b['s_close_end']]         = INPUT_CLOSE
+        if intermed_len > 0:
+            tokens[b['p_open']:b['p0']]          = INTERMED_OPEN
+            tokens[b['p0']:b['p1']]              = intermed_ids
+            tokens[b['p1']:b['p_close_end']]     = INTERMED_CLOSE
+        tokens[b['p_close_end']:b['sl0']]        = HIDDEN_OPEN
+        tokens[b['sl0']:b['sl1']]                = slot_ids
+        tokens[b['sl1']:b['mc1']]                = HIDDEN_CLOSE
+
     rs = pos['recall_start']
-    tokens[rs:rs+QUERY_OPEN_LEN]                 = QUERY_OPEN
-    tokens[pos['f0']:pos['f1']]                 = warmup
-    tokens[pos['f1']:pos['f1']+QUERY_CLOSE_LEN]  = QUERY_CLOSE
-    fc_end = pos['f1'] + QUERY_CLOSE_LEN
-    tokens[fc_end:fc_end+OUTPUT_OPEN_LEN]         = OUTPUT_OPEN
+    tokens[rs:rs+QUERY_OPEN_LEN]                  = QUERY_OPEN
+    tokens[pos['f0']:pos['f1']]                   = warmup
+    tokens[pos['f1']:pos['f1']+QUERY_CLOSE_LEN]   = QUERY_CLOSE
+    tokens[pos['fc1']:pos['fc1']+OUTPUT_OPEN_LEN]  = OUTPUT_OPEN
 
     tok_t     = torch.tensor(tokens, dtype=torch.long, device=device)
     generated = []
@@ -211,6 +228,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         'slot_len':    hp.get('slot_len', hp['seg_len']),
         'warmup_len':  hp.get('warmup_len', 16),
         'intermed_len':  hp.get('intermed_len', 0),
+        'mem_window':    hp.get('mem_window', 0),
         'out_len':     hp.get('out_len', 32),
         'n_blocks':    hp.get('n_blocks', 1),
         'recall_from': hp.get('recall_from', 0),
@@ -293,14 +311,17 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         slot_len   = stage.get('slot_len', seg_len)
         warmup_len = stage.get('warmup_len', 16)
         intermed_len = stage.get('intermed_len', 0)
+        mem_window   = stage.get('mem_window', 0)
         out_len    = stage.get('out_len', 32)
         n_blocks   = stage.get('n_blocks', 1)
         recall_from = stage.get('recall_from', 0)
         B          = stage['B']
         n_steps    = stage['n_steps']
         stage_cycle = stage.get('cycle_steps', cycle_steps)
+        # -1 = cosine over the full stage; 0 = flat LR
+        _eff_cycle  = n_steps if stage_cycle == -1 else stage_cycle
 
-        def lr_schedule(local, _cycle=stage_cycle):
+        def lr_schedule(local, _cycle=_eff_cycle):
             if warmup_steps > 0 and local < warmup_steps:
                 return lr_max * max(local, 1) / warmup_steps
             if _cycle <= 0:
@@ -314,7 +335,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         c0, c1  = pos['c0'], pos['c1']
         mask_t  = torch.tensor(
             make_mask_multi(n_blocks, seg_len, slot_len, warmup_len, out_len,
-                            intermed_len),
+                            intermed_len, mem_window),
             dtype=torch.float32, device=device)
 
         test_seqs = make_test_sequences(seg_len)
@@ -428,7 +449,11 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         warmup = [x_S[0]] * (warmup_len - len(warmup)) + list(warmup)
                     target  = x_S[y_start:y_end]
                     gen     = ar_decode_role(model, x_S, slot_len,
-                                             warmup, len(target), device)
+                                             warmup, len(target), device,
+                                             n_blocks=n_blocks,
+                                             recall_from=recall_from,
+                                             intermed_len=intermed_len,
+                                             mem_window=mem_window)
                     c = cer(gen, target)
                     all_cer.append(c)
                     ok = '✓' if c == 0.0 else '✗'
@@ -458,6 +483,33 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         ckpt = os.path.join(ckpt_dir, f'stage{stage_i}_end.pt')
         torch.save({'model': model.state_dict(), 'hp': hp, 'stage': stage_i}, ckpt)
         _log(f'  [ckpt stage {stage_i} end] {ckpt}')
+
+        # Cross-config generalisation eval at end of each stage
+        # Tests 1-block + 2-block(from=0) + 2-block(from=1) regardless of training config.
+        # Measures whether the fast-weight algorithm generalises across n_blocks.
+        model.eval()
+        _log(f'\n  [generalisation eval]')
+        gen_results = {}
+        for nb, rf in [(1, 0), (2, 0), (2, 1)]:
+            all_c = []
+            for sname, x_S in test_seqs.items():
+                f_start = min(int(seg_len * eval_offset), seg_len - warmup_len - out_len)
+                y_start = f_start + warmup_len
+                y_end   = min(y_start + out_len, seg_len)
+                wm      = x_S[max(0, y_start - warmup_len):y_start]
+                if len(wm) < warmup_len:
+                    wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
+                tgt = x_S[y_start:y_end]
+                with torch.no_grad():
+                    g = ar_decode_role(model, x_S, slot_len, wm, len(tgt), device,
+                                       n_blocks=nb, recall_from=rf,
+                                       intermed_len=intermed_len, mem_window=mem_window)
+                all_c.append(cer(g, tgt))
+            mean_c = sum(all_c) / len(all_c)
+            key = f'nb{nb}_rf{rf}'
+            gen_results[key] = round(100 * (1 - mean_c), 1)
+            _log(f'    n_blocks={nb} recall_from={rf}  match={100*(1-mean_c):.1f}%')
+        _jlog(dict(global_step=global_step, stage=stage_i, event='gen_eval', **gen_results))
 
     _log(f'\nDone. Total: {time.time()-t0:.0f}s')
     log_f.close(); jlog_f.close()
@@ -501,6 +553,7 @@ DEFAULTS = dict(
     grad_clip=10.0, dataset_size=5000,
     stablemax=False, eval_offset=0.25,
     grad_checkpoint=False,
+    mem_window=0,   # 0=full history; 1=isolated; N=last N h states
     n_blocks=1, recall_from=0,
     compile=False,
     curriculum=CURRICULUM_SURAH,

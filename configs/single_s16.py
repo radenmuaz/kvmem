@@ -23,7 +23,7 @@ hp = dict(
 
     # Training
     B=16, lr_max=3e-4, wd=0.001,
-    warmup_steps=1000, cycle_steps=0,
+    warmup_steps=1000, cycle_steps=-1,  # -1 = cosine over full run,
     n_steps=40000, eval_every=5000, log_every=1000,
 
     # Data
@@ -36,6 +36,7 @@ hp = dict(
     # Misc
     rope=True, yarn=True, grok=False,
     stablemax=False, eval_offset=0.25, grad_clip=10.0,
+    mem_window=0,  # 0=full; 1=isolated; N=window
     compile=False,
     name='single_s16',
     curriculum=None,
