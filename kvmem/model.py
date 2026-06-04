@@ -295,7 +295,7 @@ def build_model(hp: dict, device=None) -> KVMemModel:
         V_in = hp['V']
     else:
         from kvmem.data import compute_vocab_size
-        V_in = compute_vocab_size(hp.get('slot_len', 8), hp.get('ponder_len', 0))
+        V_in = compute_vocab_size(hp.get('slot_len', 8), hp.get('latent_len', 0))
     model = KVMemModel(
         V=V_in, d=hp['d'], n_layers=hp['n_layers'],
         n_heads=hp['n_heads'], d_ff=hp['d_ff'],

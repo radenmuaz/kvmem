@@ -23,7 +23,6 @@ hp = dict(
     B=16, lr_max=3e-4, wd=0.001,
     warmup_steps=1000, cycle_steps=0,
     n_steps=80000, eval_every=5000, log_every=1000,
-    drop_close_prob=0.5,
     dataset_size=10000, seed=42,
 
     ocd=False, ocd_prob=0.01, tf_warmup=0,

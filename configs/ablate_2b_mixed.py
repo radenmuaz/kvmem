@@ -14,7 +14,6 @@ hp = dict(
     B=16, lr_max=3e-4, wd=0.001,
     warmup_steps=1000, cycle_steps=-1,  # -1 = cosine over full run,
     eval_every=5000, log_every=1000,
-    drop_close_prob=0.5, dataset_size=20000, seed=42,
     ocd=False, ocd_prob=0.01, tf_warmup=0,
     rope=True, yarn=True, grok=False,
     stablemax=False, eval_offset=0.25, grad_clip=10.0,
@@ -25,11 +24,11 @@ hp = dict(
     # Two stages: one for each recall target, equal steps
     curriculum=[
         dict(n_blocks=2, recall_from=0,
-             seg_len=16, slot_len=1, intermed_len=7,
+             seg_len=16, slot_len=1, latent_len=7,
              warmup_len=4, out_len=8,
              B=16, n_steps=80000),
         dict(n_blocks=2, recall_from=1,
-             seg_len=16, slot_len=1, intermed_len=7,
+             seg_len=16, slot_len=1, latent_len=7,
              warmup_len=4, out_len=8,
              B=16, n_steps=80000),
     ],

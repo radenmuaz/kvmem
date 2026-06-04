@@ -67,7 +67,7 @@ MEM_OVERHEAD  = MEM_OPEN_LEN + MEM_CLOSE_LEN  # 7
 def make_slot_ids_tag(N: int, style: str = 'seq') -> list[int]:
     """
     Return N slot tokens for tag-based scheme (legacy, kept for compat).
-    Prefer make_mem_slot_ids() / make_ponder_slot_ids() for new code.
+    Prefer make_mem_slot_ids() / make_latent_slot_ids() for new code.
     """
     if style == 'zeros':
         return [0x00] * N
@@ -87,7 +87,7 @@ def make_slot_ids_tag(N: int, style: str = 'seq') -> list[int]:
 # Key slots    : IDs 266–265+hidden_len    (1 per position — unique dedicated ID)
 # Extract slots: IDs 266+hidden_len–…     (1 per position — unique dedicated ID)
 #
-# V = 256 + 10 + hidden_len + intermed_len  (computed by compute_vocab_size)
+# V = 256 + 10 + hidden_len + latent_len  (computed by compute_vocab_size)
 #
 # Sequence layout (source-first, fully causal):
 #   <d> data_bytes </x>
@@ -100,42 +100,47 @@ def make_slot_ids_tag(N: int, style: str = 'seq') -> list[int]:
 # All boundary tags are 1 token; all lengths = 1.
 # ---------------------------------------------------------------------------
 
-# Boundary tag IDs (IDs 256–265)
+# Boundary tag IDs (IDs 256–267)
 HIDDEN_OPEN_ID      = 256   # <k>  key/memory open
 HIDDEN_CLOSE_ID     = 257   # </h>
-INPUT_OPEN_ID     = 258   # <d>  data/source open
-INPUT_CLOSE_ID    = 259   # </x>
-QUERY_OPEN_ID    = 260   # <q>  query/anchor open
-QUERY_CLOSE_ID   = 261   # </q>
-INTERMED_OPEN_ID  = 262   # <e>  extract/ponder open
-INTERMED_CLOSE_ID = 263   # </z>
-OUTPUT_OPEN_ID    = 264   # <v>  value/output open
-OUTPUT_CLOSE_ID   = 265   # </y>
+INPUT_OPEN_ID       = 258   # <d>  data/source open
+INPUT_CLOSE_ID      = 259   # </x>
+QUERY_OPEN_ID       = 260   # <q>  query/anchor open  (user-facing)
+QUERY_CLOSE_ID      = 261   # </q>
+LATENT_OPEN_ID    = 262   # <e>  extract/ponder open
+LATENT_CLOSE_ID   = 263   # </z>
+OUTPUT_OPEN_ID      = 264   # <v>  value/output open  (user-facing final)
+OUTPUT_CLOSE_ID     = 265   # </y>
+REFINE_OPEN_ID      = 266   # <r>  refinement/draft open  (internal chain-of-thought)
+REFINE_CLOSE_ID     = 267   # </r>
 
 # Base ID for key/extract position tokens (dedicated indexed: unique ID per position)
-HIDDEN_SLOT_BASE    = 266   # key slot i → HIDDEN_SLOT_BASE + i
+HIDDEN_SLOT_BASE    = 268   # key slot i → HIDDEN_SLOT_BASE + i
 # extract slot j → HIDDEN_SLOT_BASE + hidden_len + j  (hidden_len known at runtime)
 
-N_BOUNDARY_TAGS  = 10
+N_BOUNDARY_TAGS  = 12   # 10 original + 2 refine tags
 
 # List form for batch builder
 HIDDEN_OPEN     = [HIDDEN_OPEN_ID]
 HIDDEN_CLOSE    = [HIDDEN_CLOSE_ID]
-INPUT_OPEN    = [INPUT_OPEN_ID]
-INPUT_CLOSE   = [INPUT_CLOSE_ID]
-QUERY_OPEN   = [QUERY_OPEN_ID]
-QUERY_CLOSE  = [QUERY_CLOSE_ID]
-INTERMED_OPEN  = [INTERMED_OPEN_ID]
-INTERMED_CLOSE = [INTERMED_CLOSE_ID]
-OUTPUT_OPEN   = [OUTPUT_OPEN_ID]
-OUTPUT_CLOSE  = [OUTPUT_CLOSE_ID]
+INPUT_OPEN      = [INPUT_OPEN_ID]
+INPUT_CLOSE     = [INPUT_CLOSE_ID]
+QUERY_OPEN      = [QUERY_OPEN_ID]
+QUERY_CLOSE     = [QUERY_CLOSE_ID]
+LATENT_OPEN   = [LATENT_OPEN_ID]
+LATENT_CLOSE  = [LATENT_CLOSE_ID]
+OUTPUT_OPEN     = [OUTPUT_OPEN_ID]
+OUTPUT_CLOSE    = [OUTPUT_CLOSE_ID]
+REFINE_OPEN     = [REFINE_OPEN_ID]
+REFINE_CLOSE    = [REFINE_CLOSE_ID]
 
 # All tag lengths = 1
 HIDDEN_OPEN_LEN = HIDDEN_CLOSE_LEN         = 1
-INPUT_OPEN_LEN = INPUT_CLOSE_LEN       = 1
-QUERY_OPEN_LEN = QUERY_CLOSE_LEN     = 1
-INTERMED_OPEN_LEN = INTERMED_CLOSE_LEN = 1
-OUTPUT_OPEN_LEN = OUTPUT_CLOSE_LEN     = 1
+INPUT_OPEN_LEN = INPUT_CLOSE_LEN           = 1
+QUERY_OPEN_LEN = QUERY_CLOSE_LEN           = 1
+LATENT_OPEN_LEN = LATENT_CLOSE_LEN     = 1
+OUTPUT_OPEN_LEN = OUTPUT_CLOSE_LEN         = 1
+REFINE_OPEN_LEN = REFINE_CLOSE_LEN         = 1
 
 # Backward-compat aliases (old names → new)
 MEM_OPEN_LEN = MEM_CLOSE_LEN     = 1  # <k>
@@ -147,7 +152,7 @@ CONT_OPEN_LEN = CONT_CLOSE_LEN   = 1  # <v>
 MEM_OPEN = HIDDEN_OPEN;   MEM_CLOSE = HIDDEN_CLOSE
 SRC_OPEN = INPUT_OPEN;  SRC_CLOSE = INPUT_CLOSE
 FROM_OPEN = QUERY_OPEN; FROM_CLOSE = QUERY_CLOSE
-PONDER_OPEN = INTERMED_OPEN; PONDER_CLOSE = INTERMED_CLOSE
+PONDER_OPEN = LATENT_OPEN; PONDER_CLOSE = LATENT_CLOSE
 CONT_OPEN = OUTPUT_OPEN; CONT_CLOSE = OUTPUT_CLOSE
 
 ROLE_OVERHEAD = (HIDDEN_OPEN_LEN + HIDDEN_CLOSE_LEN +
@@ -156,9 +161,9 @@ ROLE_OVERHEAD = (HIDDEN_OPEN_LEN + HIDDEN_CLOSE_LEN +
                  OUTPUT_OPEN_LEN + OUTPUT_CLOSE_LEN)
 
 
-def compute_vocab_size(hidden_len: int, intermed_len: int = 0) -> int:
-    """V = 256 (data) + 10 (boundary tags) + hidden_len + intermed_len."""
-    return 256 + N_BOUNDARY_TAGS + hidden_len + intermed_len
+def compute_vocab_size(hidden_len: int, latent_len: int = 0) -> int:
+    """V = 256 (data) + 12 (boundary tags) + hidden_len + latent_len."""
+    return 256 + N_BOUNDARY_TAGS + hidden_len + latent_len
 
 
 def make_hidden_slot_ids(hidden_len: int, cycle_len: int = 0) -> list[int]:
@@ -184,13 +189,13 @@ def make_hidden_slot_ids(hidden_len: int, cycle_len: int = 0) -> list[int]:
 make_mem_slot_ids = make_hidden_slot_ids
 
 
-def make_intermed_slot_ids(intermed_len: int, hidden_len: int) -> list[int]:
+def make_latent_slot_ids(latent_len: int, hidden_len: int) -> list[int]:
     """extract slot j = HIDDEN_SLOT_BASE + hidden_len + j"""
     base = HIDDEN_SLOT_BASE + hidden_len
-    return [base + j for j in range(intermed_len)]
+    return [base + j for j in range(latent_len)]
 
 # backward-compat alias
-make_ponder_slot_ids = make_intermed_slot_ids
+make_latent_slot_ids = make_latent_slot_ids
 
 
 def make_mask_role(L_S: int, N: int, L_f: int, L_c: int,
@@ -329,7 +334,7 @@ def _sample_seg(rng: np.random.Generator, seg_len: int) -> np.ndarray:
 
 def multi_block_positions(n_blocks: int, seg_len: int, slot_len: int,
                           warmup_len: int, out_len: int,
-                          intermed_len: int = 0) -> dict:
+                          latent_len: int = 0) -> dict:
     """
     Absolute token positions for a multi-block sequence.
 
@@ -344,17 +349,17 @@ def multi_block_positions(n_blocks: int, seg_len: int, slot_len: int,
     Recall region:  <f>warmup</f> <c>output</c>
         <f>/<c> blocked from src AND ponder (explicit) — bottleneck via slots only.
 
-    intermed_len=0: block is just <s>src</s><m>slots</m>  (no ponder tags written)
+    latent_len=0: block is just <s>src</s><m>slots</m>  (no ponder tags written)
 
     Returns a dict with:
       blocks[i]    : {block_start, s0, s1, s_close_end,
-                      p_open, p0, p1, p_close_end,  (p* same as s_close_end when intermed_len==0)
+                      p_open, p0, p1, p_close_end,  (p* same as s_close_end when latent_len==0)
                       sl0, sl1, mc1}
       recall_start, f0, f1, fc1, c0, c1, L
       mc1  : last block </m> end (kvcache prefix split)
     """
     # Per-block length depends on whether ponder is included
-    EXTRACT_BLOCK = (INTERMED_OPEN_LEN + intermed_len + INTERMED_CLOSE_LEN) if intermed_len > 0 else 0
+    EXTRACT_BLOCK = (LATENT_OPEN_LEN + latent_len + LATENT_CLOSE_LEN) if latent_len > 0 else 0
     BLOCK_LEN = (INPUT_OPEN_LEN + seg_len + INPUT_CLOSE_LEN +
                  EXTRACT_BLOCK +
                  MEM_OPEN_LEN + slot_len + MEM_CLOSE_LEN)
@@ -365,10 +370,10 @@ def multi_block_positions(n_blocks: int, seg_len: int, slot_len: int,
         s1          = s0 + seg_len
         s_close_end = s1 + SRC_CLOSE_LEN
         # Optional ponder region inside encoding block
-        if intermed_len > 0:
+        if latent_len > 0:
             p_open      = s_close_end
             p0          = p_open + PONDER_OPEN_LEN
-            p1          = p0 + intermed_len
+            p1          = p0 + latent_len
             p_close_end = p1 + PONDER_CLOSE_LEN
         else:
             p_open = p0 = p1 = p_close_end = s_close_end
@@ -397,7 +402,7 @@ def multi_block_positions(n_blocks: int, seg_len: int, slot_len: int,
 
 def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
                     warmup_len: int, out_len: int,
-                    intermed_len: int = 0,
+                    latent_len: int = 0,
                     mem_window: int = -1) -> np.ndarray:
     """
     Attention mask for multi-block sequences. Pure causal — no non-causal overrides.
@@ -418,7 +423,7 @@ def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
     For j outside mem_window: <h>_i CANNOT see <h>_j.
     """
     pos    = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len,
-                                   intermed_len)
+                                   latent_len)
     L      = pos['L']
     blocks = pos['blocks']
     r      = np.arange(L)
@@ -437,7 +442,7 @@ def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
     is_any_intermed = np.zeros(L, dtype=bool)
     for b in blocks:
         is_any_src     |= (c >= b['s0']) & (c < b['s1'])
-        if intermed_len > 0:
+        if latent_len > 0:
             is_any_intermed |= (c >= b['p0']) & (c < b['p1'])
 
     # <y> write-only
@@ -469,12 +474,46 @@ def make_mask_multi(n_blocks: int, seg_len: int, slot_len: int,
     return np.where(visible, 0.0, -1e9).astype(np.float32)
 
 
+def make_mask_old_memory(recall_from: int,
+                         n_blocks: int, seg_len: int, slot_len: int,
+                         warmup_len: int, out_len: int,
+                         latent_len: int = 0,
+                         mem_window: int = -1) -> np.ndarray:
+    """
+    Like make_mask_multi but recall region can only attend to blocks 0..recall_from.
+    Blocks recall_from+1..n_blocks-1 are invisible to <q>/<y> — as if the later
+    ingestion steps haven't happened yet.
+
+    Used for the temporal margin loss: NLL under old memory (only first recall_from+1
+    blocks visible) vs NLL under full memory (all blocks visible). The margin
+    loss rewards updates that strictly improve recall.
+    """
+    pos    = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len,
+                                   latent_len)
+    # Start from full mask, then additionally block later <h> slots from recall region
+    mask = make_mask_multi(n_blocks, seg_len, slot_len, warmup_len, out_len,
+                           latent_len, mem_window)
+    blocked_extra = np.zeros(mask.shape, dtype=bool)
+    L = pos['L']
+    r = np.arange(L)
+    c = np.arange(L)
+    blocks = pos['blocks']
+
+    is_recall_row = r >= pos['recall_start']
+    # Block recall rows from <h> slots of blocks later than recall_from
+    for i in range(recall_from + 1, n_blocks):
+        b = blocks[i]
+        h_col = (c >= b['sl0']) & (c < b['sl1'])
+        blocked_extra |= is_recall_row[:, None] & h_col[None, :]
+
+    return np.where((mask == 0.0) & ~blocked_extra, 0.0, -1e9).astype(np.float32)
+
+
 def make_multi_batch(rng: np.random.Generator, B: int,
                      n_blocks: int, recall_from,
                      seg_len: int, slot_len: int,
                      warmup_len: int, out_len: int,
-                     drop_close_prob: float = 0.5,
-                     intermed_len: int = 0) -> np.ndarray:
+                     latent_len: int = 0) -> np.ndarray:
     """
     recall_from: int OR list[int].
     If list, each example in the batch independently draws a random recall_from
@@ -484,7 +523,7 @@ def make_multi_batch(rng: np.random.Generator, B: int,
     if isinstance(recall_from, (list, tuple)):
         recall_froms = list(recall_from)
         choices = rng.integers(0, len(recall_froms), size=B)
-        pos = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len)
+        pos = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len)
         L   = pos['L']
         out_arr = np.zeros((B, L), dtype=np.int64)
         for i, rf in enumerate(recall_froms):
@@ -492,27 +531,20 @@ def make_multi_batch(rng: np.random.Generator, B: int,
             if mask.any():
                 sub = make_multi_batch(rng, int(mask.sum()), n_blocks, rf,
                                        seg_len, slot_len, warmup_len, out_len,
-                                       drop_close_prob, intermed_len)
+                                        latent_len)
                 out_arr[mask] = sub
         return out_arr
     """
     Build one multi-block batch. Slot tokens use dedicated indexed scheme — unique ID per position.
 
-    Each block:  <m> slot_0 slot_1 ... slot_{N-1} </m> <s> src </s>
-    Recall:      <f> warmup </f> [<p> ponder_0 ... </p>] <c> output </c>
-
-    Memory slots: dedicated token IDs SLOT_BASE+i (no data collision, unique V).
-    Ponder slots: dedicated token IDs SLOT_BASE+slot_len+j (unique per position).
-    Source bytes: regular data bytes 0–255 (unchanged).
-
     recall_from: which block index (0-based) the <f><c> pair queries.
     n_blocks=1, recall_from=0 is the single-block degenerate case.
     """
     pos        = multi_block_positions(n_blocks, seg_len, slot_len,
-                                       warmup_len, out_len, intermed_len)
+                                       warmup_len, out_len, latent_len)
     L          = pos['L']
     slot_ids   = make_hidden_slot_ids(slot_len)
-    ponder_ids = make_intermed_slot_ids(intermed_len, slot_len) if intermed_len > 0 else []
+    ponder_ids = make_latent_slot_ids(latent_len, slot_len) if latent_len > 0 else []
     out        = np.zeros((B, L), dtype=np.int64)
     n_win      = max(1, seg_len - out_len)
 
@@ -525,7 +557,7 @@ def make_multi_batch(rng: np.random.Generator, B: int,
             out[i, b['block_start']:b['s0']]             = SRC_OPEN
             out[i, b['s0']:b['s1']]                      = seg
             out[i, b['s1']:b['s_close_end']]             = SRC_CLOSE
-            if intermed_len > 0:
+            if latent_len > 0:
                 out[i, b['p_open']:b['p0']]              = PONDER_OPEN
                 out[i, b['p0']:b['p1']]                  = ponder_ids
                 out[i, b['p1']:b['p_close_end']]         = PONDER_CLOSE
@@ -548,10 +580,294 @@ def make_multi_batch(rng: np.random.Generator, B: int,
         out[i, pos['f1']:pos['f1']+FROM_CLOSE_LEN]       = FROM_CLOSE
         out[i, pos['fc1']:pos['fc1']+CONT_OPEN_LEN]      = CONT_OPEN
         out[i, pos['c0']:pos['c0']+(y_end-y_start)]      = seg_r[y_start:y_end]
-        if rng.random() >= drop_close_prob:
-            out[i, pos['c1']:pos['c1']+CONT_CLOSE_LEN]  = CONT_CLOSE
+        out[i, pos['c1']:pos['c1']+CONT_CLOSE_LEN]       = CONT_CLOSE
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Refine mode — iterative memory correction
+#
+# Sequence: n_blocks × block  +  warmup  +  n_attempts × (output + correction)  +  final
+#
+#   [<x>src</x>[<z>z</z>]<h>h</h>] × n_blocks   ← encoding block(s)
+#   <r>wm</r>                                      ← warmup anchor, ONCE (like <q>)
+#   <y>attempt_1</y>                               ← attempt 1 (noisy gt)
+#   [<z>z</z>]<h>h</h>                             ← correction: reads h_prev + attempt_1
+#   <y>attempt_2</y>                               ← attempt 2 (less noisy)
+#   [<z>z</z>]<h>h</h>
+#   ...
+#   <y>final</y>                                   ← final (clean gt, loss, trains copy)
+#
+# n_attempts=0: <r>wm</r><y>final</y> — identical to standard <q>wm</q><y>final</y>
+#               (same L, same structure; only tag differs)
+#
+# Inference: stop after last attempt, don't generate final.
+# Stopping criterion: consecutive <y> outputs converge (no new vocab needed).
+#
+# Mask: all rows after encoding blocked from <x>/<z_enc>. Pure causal otherwise.
+# Correction <z>/<h> sees prior <y> causally — no special rules needed.
+# ---------------------------------------------------------------------------
+
+def refine_positions(n_attempts: int, n_blocks: int, seg_len: int,
+                     slot_len: int, warmup_len: int, out_len: int,
+                     latent_len: int = 0) -> dict:
+    """
+    Positions for the refine sequence.
+
+    n_attempts=0: [encoding] <r>wm</r><y>final</y>  — identical to standard <q><y>, L same
+    n_attempts=N: [encoding] <r>wm</r>
+                             (<y>attempt_k</y> [<z>z</z><h>h</h>]) × N
+                             <y>final</y>
+
+    'attempts' list: attempt turns 0..N-1 (noisy).
+    'final': the last clean output (noise=0, trains copy mechanism).
+    At inference: stop after last attempt (attempts[-1]), don't generate final.
+    """
+    base = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len)
+    encoding_end = base['recall_start']   # position right after all encoding blocks
+
+    # Warmup: <r>wm</r>
+    r_open  = encoding_end
+    r0      = r_open + REFINE_OPEN_LEN
+    r1      = r0 + warmup_len
+    r_close = r1
+    rc1     = r_close + REFINE_CLOSE_LEN
+    pos_cur = rc1
+
+    # Per-attempt unit: <y>out</y> <z>z</z><h>h</h>
+    OUTPUT_UNIT = OUTPUT_OPEN_LEN + out_len + OUTPUT_CLOSE_LEN
+    CORR_UNIT   = (LATENT_OPEN_LEN + latent_len + LATENT_CLOSE_LEN +
+                   HIDDEN_OPEN_LEN + slot_len + HIDDEN_CLOSE_LEN)
+
+    attempts = []
+    for _ in range(n_attempts):
+        c0  = pos_cur + OUTPUT_OPEN_LEN
+        c1  = c0 + out_len
+        cl1 = c1 + OUTPUT_CLOSE_LEN
+        # Correction block: <z><h> after output
+        p0  = cl1 + LATENT_OPEN_LEN
+        p1  = p0  + latent_len
+        pc1 = p1  + LATENT_CLOSE_LEN
+        sl0 = pc1 + HIDDEN_OPEN_LEN
+        sl1 = sl0 + slot_len
+        mc1 = sl1 + HIDDEN_CLOSE_LEN
+        attempts.append(dict(c0=c0, c1=c1, cl1=cl1, p0=p0, p1=p1, pc1=pc1,
+                             sl0=sl0, sl1=sl1, mc1=mc1))
+        pos_cur = mc1
+
+    # Copy turn: <y>clean</y>  (no noise — trains copy mechanism, inference stops here)
+    fc0  = pos_cur + OUTPUT_OPEN_LEN
+    fc1  = fc0 + out_len
+    fcl1 = fc1 + OUTPUT_CLOSE_LEN
+    pos_cur = fcl1
+
+    # Final correction: <z><h> after copy turn (updates h_final from clean output)
+    gp0  = pos_cur + LATENT_OPEN_LEN
+    gp1  = gp0 + latent_len
+    gpc1 = gp1 + LATENT_CLOSE_LEN
+    gsl0 = gpc1 + HIDDEN_OPEN_LEN
+    gsl1 = gsl0 + slot_len
+    gmc1 = gsl1 + HIDDEN_CLOSE_LEN
+    pos_cur = gmc1
+
+    # Post-refine query: <q>wm</q><y>clean</y>  (loss here, must match 100%)
+    qr_open = pos_cur
+    qr0     = qr_open + QUERY_OPEN_LEN
+    qr1     = qr0 + warmup_len
+    qrc1    = qr1 + QUERY_CLOSE_LEN
+    qc0     = qrc1 + OUTPUT_OPEN_LEN
+    qc1     = qc0 + out_len
+    qcl1    = qc1 + OUTPUT_CLOSE_LEN
+    L       = qcl1
+
+    return dict(
+        base=base, attempts=attempts, L=L,
+        n_attempts=n_attempts,
+        encoding_end=encoding_end,
+        r0=r0, r1=r1, rc1=rc1,
+        r_open=r_open,
+        copy_c0=fc0, copy_c1=fc1, copy_cl1=fcl1,
+        final=dict(p0=gp0, p1=gp1, pc1=gpc1, sl0=gsl0, sl1=gsl1, mc1=gmc1),
+        query_open=qr_open, qr0=qr0, qr1=qr1, qrc1=qrc1,
+        query_c0=qc0, query_c1=qc1, query_cl1=qcl1,
+        blocks=base['blocks'],
+    )
+
+
+def make_mask_refine(n_attempts: int, n_blocks: int, seg_len: int,
+                     slot_len: int, warmup_len: int, out_len: int,
+                     latent_len: int = 0,
+                     mem_window: int = -1) -> np.ndarray:
+    """
+    Attention mask for refine sequences.
+
+    Standard rules (all rows after encoding):
+      - blocked from <x> and encoding <z>
+
+    Post-refine query rows (<q><y> at end) — strict bottleneck:
+      - can ONLY see final <h> (the last h state) and own <q><y> tokens
+      - blocked from: <r> anchor, all <y> attempts, all <z> corrections,
+        all encoding <h>, all attempt correction <h>
+      - forces recall to route through final <h> only, eliminating copy shortcuts
+    """
+    pos    = refine_positions(n_attempts, n_blocks, seg_len, slot_len,
+                              warmup_len, out_len, latent_len)
+    L      = pos['L']
+    blocks = pos['blocks']
+    enc_end = pos['encoding_end']
+    final   = pos['final']
+
+    r = np.arange(L)
+    c = np.arange(L)
+    causal  = c[None, :] <= r[:, None]
+    blocked = np.zeros((L, L), dtype=bool)
+
+    # Source and encoding-latent column masks
+    is_any_src     = np.zeros(L, dtype=bool)
+    is_any_enc_lat = np.zeros(L, dtype=bool)
+    for b in blocks:
+        is_any_src     |= (c >= b['s0']) & (c < b['s1'])
+        if latent_len > 0:
+            is_any_enc_lat |= (c >= b['p0']) & (c < b['p1'])
+
+    # All rows after encoding end blocked from src and encoding-latent
+    recall_rows = r >= enc_end
+    blocked |= recall_rows[:, None] & is_any_src[None, :]
+    blocked |= recall_rows[:, None] & is_any_enc_lat[None, :]
+
+    # Cross-block encoding <h> isolation (same as make_mask_multi)
+    for i, b in enumerate(blocks):
+        slot_row = (r >= b['sl0']) & (r < b['sl1'])
+        for j, bj in enumerate(blocks):
+            if j == i:
+                continue
+            cross = ((c >= bj['s0']) & (c < bj['s1'])) | \
+                    ((c >= bj['p0']) & (c < bj['p1']))
+            blocked |= slot_row[:, None] & cross[None, :]
+            if j < i:
+                outside_window = (mem_window != -1) and ((i - j) >= mem_window)
+                if outside_window:
+                    blocked |= slot_row[:, None] & ((c >= bj['sl0']) & (c < bj['sl1']))[None, :]
+
+    # Post-refine query rows: can only see final <h> and own tokens
+    # final <h> region: [final['pc1'], final['mc1'])
+    is_query_row = r >= pos['query_open']
+    final_h_col  = (c >= final['pc1']) & (c < final['mc1'])   # final <h> open+slots+</h>
+    own_col      = c >= pos['query_open']                       # own <q><y> tokens (causal)
+    allowed_for_query = final_h_col | own_col
+    blocked |= is_query_row[:, None] & ~allowed_for_query[None, :]
+
+    visible = causal & ~blocked
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
+
+
+def make_refine_batch(rng: np.random.Generator, B: int,
+                      n_attempts: int, noise_schedule,
+                      n_blocks: int, recall_from: int,
+                      seg_len: int, slot_len: int,
+                      warmup_len: int, out_len: int,
+                      latent_len: int = 0) -> np.ndarray:
+    """
+    Build refine batch.
+
+    n_attempts: number of attempt turns (each with noisy output + correction block).
+    noise_schedule: list of length n_attempts; noise level per attempt.
+      - float: fixed rate  - (lo, hi): sampled from Uniform(lo, hi) per example
+    Final turn: always noise=0 (clean ground truth), trains the copy mechanism.
+
+    n_attempts=0: sequence identical to standard single-pass recall, just <r> tag.
+
+    Returns (B, L) int64.
+    """
+    assert len(noise_schedule) == n_attempts
+    pos      = refine_positions(n_attempts, n_blocks, seg_len, slot_len,
+                                warmup_len, out_len, latent_len)
+    L        = pos['L']
+    base     = pos['base']
+    attempts = pos['attempts']
+    slot_ids = make_hidden_slot_ids(slot_len)
+    corr_ponder_ids = make_latent_slot_ids(latent_len, slot_len) if latent_len > 0 else []
+    n_win    = max(1, seg_len - out_len)
+    out_arr  = np.zeros((B, L), dtype=np.int64)
+
+    for i in range(B):
+        segs = [_sample_seg(rng, seg_len) for _ in range(n_blocks)]
+
+        # Encoding blocks
+        for k, b in enumerate(base['blocks']):
+            seg = segs[k]
+            out_arr[i, b['block_start']:b['s0']]  = SRC_OPEN
+            out_arr[i, b['s0']:b['s1']]            = seg
+            out_arr[i, b['s1']:b['s_close_end']]   = SRC_CLOSE
+            if latent_len > 0:
+                out_arr[i, b['p_open']:b['p0']]    = PONDER_OPEN
+                out_arr[i, b['p0']:b['p1']]        = corr_ponder_ids
+                out_arr[i, b['p1']:b['p_close_end']] = PONDER_CLOSE
+            out_arr[i, b['p_close_end']:b['sl0']]  = MEM_OPEN
+            out_arr[i, b['sl0']:b['sl1']]           = slot_ids
+            out_arr[i, b['sl1']:b['mc1']]           = MEM_CLOSE
+
+        # Ground truth
+        seg_r    = segs[recall_from]
+        y_start  = int(rng.integers(0, n_win + 1))
+        y_end    = min(y_start + out_len, seg_len)
+        alen     = y_end - y_start
+        w_st     = max(0, y_start - warmup_len)
+        wm       = seg_r[w_st:y_start]
+        if len(wm) < warmup_len:
+            wm = np.concatenate([np.full(warmup_len - len(wm), seg_r[0], dtype=np.int32), wm])
+        y_ref    = seg_r[y_start:y_end]
+
+        # Warmup: <r>wm</r>
+        out_arr[i, pos['r_open']:pos['r0']] = REFINE_OPEN
+        out_arr[i, pos['r0']:pos['r1']]     = wm
+        out_arr[i, pos['r1']:pos['rc1']]    = REFINE_CLOSE
+
+        # Attempt turns: <y>noisy</y> <z><h>
+        for k, att in enumerate(attempts):
+            p = noise_schedule[k]
+            if isinstance(p, (list, tuple)):
+                p = float(rng.uniform(p[0], p[1]))
+            y_out = y_ref.copy()
+            if p > 0.0:
+                nm = rng.random(alen) < p
+                y_out[nm] = rng.integers(0, 256, size=int(nm.sum())).astype(np.int32)
+            out_arr[i, att['c0'] - OUTPUT_OPEN_LEN : att['c0']]     = OUTPUT_OPEN
+            out_arr[i, att['c0']:att['c0'] + alen]                   = y_out
+            out_arr[i, att['c1']:att['cl1']]                         = OUTPUT_CLOSE
+            if latent_len > 0:
+                out_arr[i, att['cl1']:att['p0']]                     = PONDER_OPEN
+                out_arr[i, att['p0']:att['p1']]                      = corr_ponder_ids
+                out_arr[i, att['p1']:att['pc1']]                     = PONDER_CLOSE
+            out_arr[i, att['pc1']:att['sl0']]                        = MEM_OPEN
+            out_arr[i, att['sl0']:att['sl1']]                        = slot_ids
+            out_arr[i, att['sl1']:att['mc1']]                        = MEM_CLOSE
+
+        # Copy turn: <y>clean</y>  (no noise, trains copy mechanism)
+        out_arr[i, pos['copy_c0'] - OUTPUT_OPEN_LEN : pos['copy_c0']] = OUTPUT_OPEN
+        out_arr[i, pos['copy_c0']:pos['copy_c0'] + alen]               = y_ref
+        out_arr[i, pos['copy_c1']:pos['copy_cl1']]                     = OUTPUT_CLOSE
+
+        # Final correction: <z><h>  (updates h_final from clean copy output)
+        g = pos['final']
+        if latent_len > 0:
+            out_arr[i, g['p0'] - LATENT_OPEN_LEN : g['p0']] = PONDER_OPEN
+            out_arr[i, g['p0']:g['p1']]                        = corr_ponder_ids
+            out_arr[i, g['p1']:g['pc1']]                       = PONDER_CLOSE
+        out_arr[i, g['pc1']:g['sl0']]  = MEM_OPEN
+        out_arr[i, g['sl0']:g['sl1']]  = slot_ids
+        out_arr[i, g['sl1']:g['mc1']]  = MEM_CLOSE
+
+        # Post-refine query: <q>wm</q><y>clean</y>  (loss target, must match 100%)
+        out_arr[i, pos['query_open']:pos['qr0']] = QUERY_OPEN
+        out_arr[i, pos['qr0']:pos['qr1']]         = wm
+        out_arr[i, pos['qr1']:pos['qrc1']]         = QUERY_CLOSE
+        out_arr[i, pos['qrc1']:pos['query_c0']]    = OUTPUT_OPEN
+        out_arr[i, pos['query_c0']:pos['query_c0'] + alen] = y_ref
+        out_arr[i, pos['query_c1']:pos['query_cl1']]       = OUTPUT_CLOSE
+
+    return out_arr
 
 
 # ---------------------------------------------------------------------------
@@ -563,12 +879,12 @@ def make_multi_batch(rng: np.random.Generator, B: int,
 
 def interleaved_positions(n_blocks: int, seg_len: int, slot_len: int,
                           warmup_len: int, out_len: int,
-                          intermed_len: int = 0) -> dict:
+                          latent_len: int = 0) -> dict:
     """
     Positions for interleaved sequence: N × (block + recall).
     Each sub-unit = <x>src</x>[<z>z</z>]<h>h</h><q>wm</q><y>out</y>
     """
-    sub = multi_block_positions(1, seg_len, slot_len, warmup_len, out_len, intermed_len)
+    sub = multi_block_positions(1, seg_len, slot_len, warmup_len, out_len, latent_len)
     unit_len = sub['L']   # length of one (block + recall) unit
     L = unit_len * n_blocks
 
@@ -586,19 +902,19 @@ def interleaved_positions(n_blocks: int, seg_len: int, slot_len: int,
 
     return dict(units=units, unit_len=unit_len, L=L, n_blocks=n_blocks,
                 seg_len=seg_len, slot_len=slot_len, warmup_len=warmup_len,
-                out_len=out_len, intermed_len=intermed_len)
+                out_len=out_len, latent_len=latent_len)
 
 
 def make_mask_interleaved(n_blocks: int, seg_len: int, slot_len: int,
                           warmup_len: int, out_len: int,
-                          intermed_len: int = 0,
+                          latent_len: int = 0,
                           mem_window: int = -1) -> np.ndarray:
     """
     Attention mask for interleaved sequences.
     Same rules as make_mask_multi: q/y blocked from x/z; y write-only;
     cross-block h isolation; h can see prior q/y (interactive).
     """
-    pos = interleaved_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len)
+    pos = interleaved_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len)
     L = pos['L']
     r = np.arange(L)
     c = np.arange(L)
@@ -612,7 +928,7 @@ def make_mask_interleaved(n_blocks: int, seg_len: int, slot_len: int,
     for k, unit in enumerate(pos['units']):
         b = unit['blocks'][0]
         all_x |= (c >= b['s0']) & (c < b['s1'])
-        if intermed_len > 0:
+        if latent_len > 0:
             all_intermed |= (c >= b['p0']) & (c < b['p1'])
         # y write-only
         c0, c1 = unit['c0'], unit['c1']
@@ -665,8 +981,7 @@ def make_mask_interleaved(n_blocks: int, seg_len: int, slot_len: int,
 def make_interleaved_batch(rng: np.random.Generator, B: int,
                            n_blocks: int, seg_len: int, slot_len: int,
                            warmup_len: int, out_len: int,
-                           drop_close_prob: float = 0.5,
-                           intermed_len: int = 0,
+                           latent_len: int = 0,
                            q_count: int = -1) -> tuple:
     """
     Build interleaved batch: full layout [block_k recall_k] × n_blocks.
@@ -682,10 +997,10 @@ def make_interleaved_batch(rng: np.random.Generator, B: int,
       active_c_ranges: list of (c0, c1) output ranges with real targets
                        (one per active query per example — same for all B)
     """
-    pos      = interleaved_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len)
+    pos      = interleaved_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len)
     L        = pos['L']
     slot_ids = make_hidden_slot_ids(slot_len)
-    intermed_ids = make_intermed_slot_ids(intermed_len, slot_len) if intermed_len > 0 else []
+    intermed_ids = make_latent_slot_ids(latent_len, slot_len) if latent_len > 0 else []
     out_arr  = np.zeros((B, L), dtype=np.int64)
     n_win    = max(1, seg_len - out_len)
 
@@ -705,10 +1020,10 @@ def make_interleaved_batch(rng: np.random.Generator, B: int,
             out_arr[i, b['block_start']:b['s0']]         = INPUT_OPEN
             out_arr[i, b['s0']:b['s1']]                  = seg
             out_arr[i, b['s1']:b['s_close_end']]         = INPUT_CLOSE
-            if intermed_len > 0:
-                out_arr[i, b['p_open']:b['p0']]          = INTERMED_OPEN
+            if latent_len > 0:
+                out_arr[i, b['p_open']:b['p0']]          = LATENT_OPEN
                 out_arr[i, b['p0']:b['p1']]              = intermed_ids
-                out_arr[i, b['p1']:b['p_close_end']]     = INTERMED_CLOSE
+                out_arr[i, b['p1']:b['p_close_end']]     = LATENT_CLOSE
             out_arr[i, b['p_close_end']:b['sl0']]        = HIDDEN_OPEN
             out_arr[i, b['sl0']:b['sl1']]                = slot_ids
             out_arr[i, b['sl1']:b['mc1']]                = HIDDEN_CLOSE
@@ -738,8 +1053,7 @@ def make_interleaved_batch(rng: np.random.Generator, B: int,
                 rs_u = unit['recall_start']
                 out_arr[i, unit['f0']:unit['f1']] = wm_r
                 out_arr[i, unit['c0']:unit['c0']+(yr_end-yr_start)] = seg_r[yr_start:yr_end]
-                if rng.random() >= drop_close_prob:
-                    out_arr[i, unit['c1']:unit['c1']+CONT_CLOSE_LEN] = CONT_CLOSE
+                out_arr[i, unit['c1']:unit['c1']+CONT_CLOSE_LEN]   = CONT_CLOSE
             # Inactive recall: y region stays zeros (masked from loss)
 
     return out_arr, active_c_ranges

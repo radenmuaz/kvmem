@@ -51,7 +51,7 @@ _STEPS_RE  = re.compile(r'^(\d+)k?$', re.IGNORECASE)
 _BLOCKS_RE = re.compile(r'^n(\d+)$')
 _ROUTES_RE = re.compile(r'^r(\d+|\[\d+(?:,\d+)*\])$')
 _WINDOW_RE = re.compile(r'^w(-?\d+)$')
-_MODE_RE   = re.compile(r'^m(end|int|acc|mix)$')
+_MODE_RE   = re.compile(r'^m(end|int|acc|mix|ref)$')
 
 
 def _parse_steps(s: str) -> int:
@@ -82,7 +82,7 @@ def _parse_stage(token: str, seq: SeqSpec, defaults: dict) -> dict:
     recall_froms = None
     n_steps    = defaults.get('n_steps', 40000)
     mem_window = defaults.get('mem_window', -1)
-    mode       = defaults.get('mode', 'end')   # end|int|acc|mix
+    mode       = defaults.get('mode', 'end')   # end|int|acc|mix|ref
 
     for p in parts:
         if _BLOCKS_RE.match(p):
@@ -111,20 +111,17 @@ def _parse_stage(token: str, seq: SeqSpec, defaults: dict) -> dict:
                 f'recall_from={rf} out of range for n_blocks={n_blocks} in stage {token!r}')
 
     stage = dict(
-        # Sequence params from SeqSpec (shared across all stages)
         seg_len=seq.seg_len,
         slot_len=seq.slot_len,
-        intermed_len=seq.intermed_len,
+        latent_len=seq.latent_len,
         warmup_len=seq.warmup_len,
         out_len=seq.out_len,
-        # Stage-specific
         n_blocks=n_blocks,
         recall_froms=recall_froms if recall_froms is not None else 0,
         mem_window=mem_window,
         mode=mode,
         n_steps=n_steps,
     )
-    # Merge extra defaults (B, dataset_size, etc.)
     for k, v in defaults.items():
         if k not in stage:
             stage[k] = v

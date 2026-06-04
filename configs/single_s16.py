@@ -1,7 +1,7 @@
 """
 Single-block recall, seg=16.
 
-Bottleneck: slot_len=1, ponder_len=7  (matches v1 active_slots=1 with slot_len=8)
+Bottleneck: slot_len=1, latent_len=7  (matches v1 active_slots=1 with slot_len=8)
 active_slots=0 — no masking needed; slot_len IS the bottleneck directly.
 Ponder tokens see src + slots, providing productive extra compute vs inactive slots.
 
@@ -15,7 +15,7 @@ Run:
 hp = dict(
     # Sequence layout — slot_len IS the bottleneck, no active_slots masking
     n_blocks=1, recall_from=0,
-    seg_len=16, slot_len=1, ponder_len=7, active_slots=0,
+    seg_len=16, slot_len=1, latent_len=7, active_slots=0,
     warmup_len=4, out_len=8,
 
     # Model
@@ -27,7 +27,6 @@ hp = dict(
     n_steps=40000, eval_every=5000, log_every=1000,
 
     # Data
-    drop_close_prob=0.5,
     dataset_size=10000, seed=42,
 
     # OCD

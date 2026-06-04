@@ -12,7 +12,7 @@ Run:
 
 hp = dict(
     n_blocks=2, recall_from=1,
-    seg_len=16, slot_len=1, intermed_len=7,
+    seg_len=16, slot_len=1, latent_len=7,
     warmup_len=4, out_len=8,
 
     d=64, n_layers=4, n_heads=4, d_ff=256,
@@ -21,7 +21,6 @@ hp = dict(
     warmup_steps=1000, cycle_steps=-1,  # -1 = cosine over full run,
     n_steps=80000, eval_every=5000, log_every=1000,
 
-    drop_close_prob=0.5,
     dataset_size=20000, seed=42,
 
     ocd=False, ocd_prob=0.01, tf_warmup=0,

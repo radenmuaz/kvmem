@@ -55,14 +55,17 @@ from kvmem.model import build_model
 from kvmem.data import (
     HIDDEN_OPEN, HIDDEN_CLOSE, INPUT_OPEN, INPUT_CLOSE,
     QUERY_OPEN, QUERY_CLOSE, OUTPUT_OPEN, OUTPUT_CLOSE,
-    INTERMED_OPEN, INTERMED_CLOSE,
+    LATENT_OPEN, LATENT_CLOSE,
+    REFINE_OPEN, REFINE_CLOSE,
     HIDDEN_OPEN_LEN, HIDDEN_CLOSE_LEN,
     INPUT_OPEN_LEN, INPUT_CLOSE_LEN,
     QUERY_OPEN_LEN, QUERY_CLOSE_LEN,
     OUTPUT_OPEN_LEN, OUTPUT_CLOSE_LEN,
-    INTERMED_OPEN_LEN, INTERMED_CLOSE_LEN,
+    LATENT_OPEN_LEN, LATENT_CLOSE_LEN,
     multi_block_positions, make_mask_multi, make_multi_batch,
     interleaved_positions, make_mask_interleaved, make_interleaved_batch,
+    refine_positions, make_mask_refine, make_refine_batch,
+    make_mask_old_memory,
 )
 from kvmem.utils import make_test_sequences, cer
 
@@ -124,7 +127,7 @@ def ocd_rollout_full(model, tokens_batch: np.ndarray,
 def ar_decode_role(model, x_S: list[int], slot_len: int,
                    warmup: list[int], out_len: int, device,
                    n_blocks: int = 1, recall_from: int = 0,
-                   intermed_len: int = 0, mem_window: int = 0,
+                   latent_len: int = 0, mem_window: int = 0,
                    distractor_seed: int = 99) -> list[int]:
     """
     Greedy AR decode (eval). Builds a n_blocks sequence where x_S is placed
@@ -134,15 +137,15 @@ def ar_decode_role(model, x_S: list[int], slot_len: int,
     For n_blocks>1: correct multi-block eval — distractor blocks test that
     the model routes <q> to the right block from anchor content alone.
     """
-    from kvmem.data import make_hidden_slot_ids, make_intermed_slot_ids, _sample_seg
+    from kvmem.data import make_hidden_slot_ids, make_latent_slot_ids, _sample_seg
     seg_len    = len(x_S)
     wl         = len(warmup)
     slot_ids   = make_hidden_slot_ids(slot_len)
-    intermed_ids = make_intermed_slot_ids(intermed_len, slot_len) if intermed_len > 0 else []
-    pos        = multi_block_positions(n_blocks, seg_len, slot_len, wl, out_len, intermed_len)
+    intermed_ids = make_latent_slot_ids(latent_len, slot_len) if latent_len > 0 else []
+    pos        = multi_block_positions(n_blocks, seg_len, slot_len, wl, out_len, latent_len)
     L          = pos['L']
     mask_t     = torch.tensor(
-        make_mask_multi(n_blocks, seg_len, slot_len, wl, out_len, intermed_len, mem_window),
+        make_mask_multi(n_blocks, seg_len, slot_len, wl, out_len, latent_len, mem_window),
         dtype=torch.float32, device=device)
 
     rng    = np.random.default_rng(distractor_seed)
@@ -153,10 +156,10 @@ def ar_decode_role(model, x_S: list[int], slot_len: int,
         tokens[b['block_start']:b['s0']]         = INPUT_OPEN
         tokens[b['s0']:b['s1']]                  = src
         tokens[b['s1']:b['s_close_end']]         = INPUT_CLOSE
-        if intermed_len > 0:
-            tokens[b['p_open']:b['p0']]          = INTERMED_OPEN
+        if latent_len > 0:
+            tokens[b['p_open']:b['p0']]          = LATENT_OPEN
             tokens[b['p0']:b['p1']]              = intermed_ids
-            tokens[b['p1']:b['p_close_end']]     = INTERMED_CLOSE
+            tokens[b['p1']:b['p_close_end']]     = LATENT_CLOSE
         tokens[b['p_close_end']:b['sl0']]        = HIDDEN_OPEN
         tokens[b['sl0']:b['sl1']]                = slot_ids
         tokens[b['sl1']:b['mc1']]                = HIDDEN_CLOSE
@@ -177,6 +180,86 @@ def ar_decode_role(model, x_S: list[int], slot_len: int,
     return generated
 
 
+@torch.no_grad()
+def ar_decode_refine(model, x_S: list[int], slot_len: int,
+                     warmup: list[int], out_len: int, device,
+                     n_attempts: int = 1,
+                     latent_len: int = 0,
+                     mem_window: int = -1) -> tuple[list[list[int]], list[int]]:
+    """
+    AR decode for new refine architecture.
+
+    Generates n_attempts attempt outputs (each followed by a correction <z><h> block),
+    then stops. Does NOT generate the final turn (inference stopping point).
+
+    Stopping: compare consecutive attempts; stop early if they converge.
+
+    Returns (attempts, last_attempt):
+      attempts    : list of n_attempts lists (model's <y> at each step)
+      last_attempt: the final generated output (= attempts[-1])
+    """
+    from kvmem.data import (make_hidden_slot_ids, make_latent_slot_ids,
+                             refine_positions, make_mask_refine)
+    seg_len    = len(x_S)
+    wl         = len(warmup)
+    slot_ids   = make_hidden_slot_ids(slot_len)
+    ponder_ids = make_latent_slot_ids(latent_len, slot_len) if latent_len > 0 else []
+    pos        = refine_positions(n_attempts, 1, seg_len, slot_len, wl, out_len, latent_len)
+    L          = pos['L']
+    mask_t     = torch.tensor(
+        make_mask_refine(n_attempts, 1, seg_len, slot_len, wl, out_len, latent_len, mem_window),
+        dtype=torch.float32, device=device)
+
+    tokens = np.zeros(L, dtype=np.int64)
+    b = pos['blocks'][0]
+    tokens[b['block_start']:b['s0']]   = INPUT_OPEN
+    tokens[b['s0']:b['s1']]             = x_S
+    tokens[b['s1']:b['s_close_end']]    = INPUT_CLOSE
+    if latent_len > 0:
+        tokens[b['p_open']:b['p0']]     = LATENT_OPEN
+        tokens[b['p0']:b['p1']]         = ponder_ids
+        tokens[b['p1']:b['p_close_end']]= LATENT_CLOSE
+    tokens[b['p_close_end']:b['sl0']]   = HIDDEN_OPEN
+    tokens[b['sl0']:b['sl1']]            = slot_ids
+    tokens[b['sl1']:b['mc1']]            = HIDDEN_CLOSE
+
+    # Write <r> warmup
+    tokens[pos['r_open']:pos['r0']] = REFINE_OPEN
+    tokens[pos['r0']:pos['r1']]     = warmup
+    tokens[pos['r1']:pos['rc1']]    = REFINE_CLOSE
+
+    all_attempts = []
+    prev_gen     = None
+
+    for k, att in enumerate(pos['attempts']):
+        # Write <y> open tag
+        tokens[att['c0'] - OUTPUT_OPEN_LEN : att['c0']] = OUTPUT_OPEN
+        tok_t = torch.tensor(tokens, dtype=torch.long, device=device)
+        gen = []
+        for j in range(out_len):
+            logits   = model(tok_t, mask_t)
+            next_tok = int(logits[att['c0'] + j - 1].argmax())
+            gen.append(next_tok)
+            tok_t[att['c0'] + j] = next_tok
+        # Write output + close tag + correction block into tokens
+        tokens[att['c0']:att['c1']]   = gen
+        tokens[att['c1']:att['cl1']]  = OUTPUT_CLOSE
+        if latent_len > 0:
+            tokens[att['cl1']:att['p0']]  = LATENT_OPEN
+            tokens[att['p0']:att['p1']]   = ponder_ids
+            tokens[att['p1']:att['pc1']]  = LATENT_CLOSE
+        tokens[att['pc1']:att['sl0']]     = HIDDEN_OPEN
+        tokens[att['sl0']:att['sl1']]     = slot_ids
+        tokens[att['sl1']:att['mc1']]     = HIDDEN_CLOSE
+
+        all_attempts.append(gen)
+        if prev_gen is not None and gen == prev_gen:
+            break  # converged early
+        prev_gen = gen
+
+    return all_attempts, all_attempts[-1] if all_attempts else []
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -193,7 +276,6 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     eval_every  = hp['eval_every']
     log_every   = hp['log_every']
     # slot_style removed — learned embeddings use make_mem_slot_ids()
-    drop_close_prob = hp['drop_close_prob']
     warmup_steps = hp['warmup_steps']
     cycle_steps  = hp.get('cycle_steps', 0)
     seed         = hp['seed']
@@ -229,7 +311,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         'seg_len':     hp['seg_len'],
         'slot_len':    hp.get('slot_len', hp['seg_len']),
         'warmup_len':  hp.get('warmup_len', 16),
-        'intermed_len':  hp.get('intermed_len', 0),
+        'latent_len':  hp.get('latent_len', 0),
         'mem_window':    hp.get('mem_window', -1),
         'out_len':     hp.get('out_len', 32),
         'n_blocks':    hp.get('n_blocks', 1),
@@ -263,16 +345,38 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         jlog_f.write(json.dumps(
             {k: round(v, 5) if k in _R5 else v for k, v in d.items()}) + '\n')
 
+    def _resolve_out_len(st):
+        ol = st.get('out_len', 128)
+        return st['seg_len'] if ol == -1 else ol
+
     max_stage = max(curriculum, key=lambda s: s['seg_len'])
     max_nb    = max_stage.get('n_blocks', 1)
     max_pos   = multi_block_positions(max_nb, max_stage['seg_len'],
                                       max_stage.get('slot_len', max_stage['seg_len']),
                                       max_stage.get('warmup_len', 32),
-                                      max_stage.get('out_len', 128),
-                                      max_stage.get('intermed_len', 0))
+                                      _resolve_out_len(max_stage),
+                                      max_stage.get('latent_len', 0))
     L_max_seq = max_pos['L']
+    # Joint mode may have refine trajectories that are longer than standard sequences
+    for _st in curriculum:
+        if _st.get('mode') == 'joint':
+            for _jm in _st.get('joint_mix', []):
+                _jnb = _jm.get('n_blocks', 1)
+                _jla = _st.get('latent_len', 0)
+                _jsl = _st.get('slot_len', _st['seg_len'])
+                _jsg = _st['seg_len']
+                _jwl = _st.get('warmup_len', 16)
+                _jol = _resolve_out_len(_st)
+                if _jm['traj'] == 'ref':
+                    _jp = refine_positions(_jm.get('n_attempts', 5), _jnb, _jsg, _jsl, _jwl, _jol, _jla)
+                elif _jm['traj'] == 'int':
+                    _jp = interleaved_positions(_jnb, _jsg, _jsl, _jwl, _jol, _jla)
+                else:
+                    _jp = multi_block_positions(_jnb, _jsg, _jsl, _jwl, _jol, _jla)
+                L_max_seq = max(L_max_seq, _jp['L'])
     hp_model  = dict(hp, seg_len=max_stage['seg_len'],
                      slot_len=max_stage.get('slot_len', max_stage['seg_len']),
+                     latent_len=max_stage.get('latent_len', hp.get('latent_len', 0)),
                      L_train=L_max_seq, L_max=L_max_seq * 4)
 
     torch.manual_seed(seed)
@@ -316,7 +420,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     _log(f'  Model: d={hp["d"]}  n_layers={hp["n_layers"]}  params={params:,}'
          f'  device={device}{gc_flag}')
     _log(f'  rope={hp.get("rope",False)}  yarn={hp.get("yarn",False)}'
-         f'  drop_close={drop_close_prob}  layout=memory-first'
+         f'  layout=memory-first'
          + (f'  OCD prob={_ocd_prob}' if use_ocd else '  TF-only'))
     _log(f'  Curriculum: {len(curriculum)} stages')
     for i, st in enumerate(curriculum):
@@ -325,8 +429,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         p  = multi_block_positions(nb, st['seg_len'],
                                    st.get('slot_len', st['seg_len']),
                                    st.get('warmup_len', 16), st.get('out_len', 32),
-                                   st.get('intermed_len', 0))
-        pl = st.get('intermed_len', 0)
+                                   st.get('latent_len', 0))
+        pl = st.get('latent_len', 0)
         _log(f'    stage {i}: n_blocks={nb} recall_from={rf}'
              f'  seg={st["seg_len"]}  slot={st.get("slot_len",st["seg_len"])}'
              f'  wl={st.get("warmup_len",16)}'
@@ -345,12 +449,14 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         seg_len    = stage['seg_len']
         slot_len   = stage.get('slot_len', seg_len)
         warmup_len = stage.get('warmup_len', 16)
-        intermed_len = stage.get('intermed_len', 0)
+        latent_len = stage.get('latent_len', 0)
         mem_window   = stage.get('mem_window', -1)
         out_len    = stage.get('out_len', 32)
+        if out_len == -1:
+            out_len = seg_len  # -1 = full segment recall
         n_blocks   = stage.get('n_blocks', 1)
         recall_from = stage.get('recall_froms', stage.get('recall_from', 0))
-        seq_mode    = stage.get('mode', 'end')   # end|int|mix
+        seq_mode    = stage.get('mode', 'end')   # end|int|mix|ref
         B          = stage['B']
         n_steps    = stage['n_steps']
         stage_cycle = stage.get('cycle_steps', cycle_steps)
@@ -366,35 +472,132 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             return max(lr_max * 1e-2, lr_max * 0.5 * (1 + math.cos(math.pi * t / _cycle)))
 
         if seq_mode in ('int', 'mix'):
-            pos_int = interleaved_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len)
+            pos_int = interleaved_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len)
             L_total_int = pos_int['L']
             mask_int_t  = torch.tensor(
-                make_mask_interleaved(n_blocks, seg_len, slot_len, warmup_len, out_len, intermed_len, mem_window),
+                make_mask_interleaved(n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len, mem_window),
                 dtype=torch.float32, device=device)
 
+        # Refine mode: k ~ Uniform(0, n_attempts_max) attempts per step + always 1 final clean
+        # n_attempts=0: identical to standard recall with <r> tag instead of <q>
+        # noise descends linearly: attempt 0 = noise_hi, attempt N-1 = noise_lo, final = 0
+        _n_attempts_max = stage.get('n_attempts', stage.get('n_draft_turns', 1))
+        _noise_hi       = stage.get('noise_hi', 0.8)
+        _noise_lo       = stage.get('noise_lo', 0.05)
+        _rand_turns     = stage.get('rand_turns', False)
+        _noise_schedule = stage.get('noise_schedule', None)
+
+        def _make_noise_schedule(k):
+            """Linear: attempt 0 = noise_hi, attempt k-1 = noise_lo, final <y> always 0."""
+            if _noise_schedule is not None and len(_noise_schedule) == k:
+                return _noise_schedule
+            if k == 0:
+                return []
+            if k == 1:
+                return [_noise_hi]
+            return [_noise_hi - (_noise_hi - _noise_lo) * j / (k - 1) for j in range(k)]
+
+        if seq_mode == 'ref':
+            # Precompute pos/mask for k=0..n_attempts_max
+            _ref_cache = {}
+            for k in range(_n_attempts_max + 1):
+                _p = refine_positions(k, n_blocks, seg_len, slot_len,
+                                      warmup_len, out_len, latent_len)
+                _m = torch.tensor(
+                    make_mask_refine(k, n_blocks, seg_len, slot_len,
+                                     warmup_len, out_len, latent_len, mem_window),
+                    dtype=torch.float32, device=device)
+                _ref_cache[k] = (_p, _m)
+            pos_ref, mask_ref_t = _ref_cache[_n_attempts_max]
+            _ref_c0 = pos_ref['query_c0']   # loss on post-refine query (must match 100%)
+            _ref_c1 = pos_ref['query_c1']
+            _log(f'  refine mode: n_attempts_max={_n_attempts_max}  rand_turns={_rand_turns}'
+                 f'  noise_hi={_noise_hi}  noise_lo={_noise_lo}'
+                 + f'  L_max={pos_ref["L"]}'
+                 + f'  (n=0 same as standard recall with <r> tag)')
+
+        # Joint mode: per-step trajectory sampling from a weighted mixture
+        _joint_cache   = []
+        _joint_weights = None
+        _has_ref_joint = False
+        if seq_mode == 'joint':
+            _jmix = stage.get('joint_mix', [])
+            _jw   = np.array([jm['weight'] for jm in _jmix], dtype=np.float32)
+            _joint_weights = _jw / _jw.sum()
+            for jm in _jmix:
+                jtraj = jm['traj']          # 'end' | 'ref' | 'int'
+                jnb   = jm.get('n_blocks', 1)
+                jrf   = jm.get('recall_from', 0)
+                j_noise_hi = jm.get('noise_hi', _noise_hi)
+                j_noise_lo = jm.get('noise_lo', _noise_lo)
+                j_n_att    = jm.get('n_attempts', _n_attempts_max)
+                if jtraj == 'ref':
+                    j_ref_cache = {}
+                    for k in range(j_n_att + 1):
+                        _p = refine_positions(k, jnb, seg_len, slot_len,
+                                              warmup_len, out_len, latent_len)
+                        _m = torch.tensor(
+                            make_mask_refine(k, jnb, seg_len, slot_len,
+                                             warmup_len, out_len, latent_len, mem_window),
+                            dtype=torch.float32, device=device)
+                        j_ref_cache[k] = (_p, _m)
+                    _joint_cache.append(dict(traj='ref', n_blocks=jnb, recall_from=jrf,
+                                             ref_cache=j_ref_cache, n_attempts=j_n_att,
+                                             noise_lo=j_noise_lo, noise_hi=j_noise_hi))
+                    _has_ref_joint = True
+                elif jtraj == 'int':
+                    jp  = interleaved_positions(jnb, seg_len, slot_len, warmup_len, out_len, latent_len)
+                    jmt = torch.tensor(
+                        make_mask_interleaved(jnb, seg_len, slot_len, warmup_len, out_len, latent_len, mem_window),
+                        dtype=torch.float32, device=device)
+                    _joint_cache.append(dict(traj='int', n_blocks=jnb, recall_from=jrf, pos=jp, mask=jmt))
+                else:  # 'end'
+                    jp  = multi_block_positions(jnb, seg_len, slot_len, warmup_len, out_len, latent_len)
+                    jmt = torch.tensor(
+                        make_mask_multi(jnb, seg_len, slot_len, warmup_len, out_len, latent_len, mem_window),
+                        dtype=torch.float32, device=device)
+                    _joint_cache.append(dict(traj='end', n_blocks=jnb, recall_from=jrf, pos=jp, mask=jmt))
+            _log(f'  joint mode: {len(_jmix)} trajectory types'
+                 + ''.join(f'\n    {jm["traj"]} nb={jm.get("n_blocks",1)} rf={jm.get("recall_from",0)} w={jm["weight"]:.0%}'
+                           for jm in _jmix))
+
         pos     = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len,
-                                        intermed_len)
+                                        latent_len)
         L_total = pos['L']
         c0, c1  = pos['c0'], pos['c1']
         mask_t  = torch.tensor(
             make_mask_multi(n_blocks, seg_len, slot_len, warmup_len, out_len,
-                            intermed_len, mem_window),
+                            latent_len, mem_window),
             dtype=torch.float32, device=device)
 
         test_seqs = make_test_sequences(seg_len)
         val_np    = make_multi_batch(
             np.random.default_rng(seed + stage_i + 1),
             B, n_blocks, recall_from, seg_len, slot_len,
-            warmup_len, out_len, drop_close_prob=0.0, intermed_len=intermed_len)
+            warmup_len, out_len, latent_len=latent_len)
         pool_rng  = np.random.default_rng(seed + stage_i + 1000)
         ds   = dataset_size if dataset_size > 0 else None
         pool = (np.stack([make_multi_batch(pool_rng, B, n_blocks, recall_from,
                                            seg_len, slot_len,
-                                           warmup_len, out_len, drop_close_prob,
-                                           intermed_len)
+                                           warmup_len, out_len,
+                                           latent_len)
                           for _ in range(ds)])
                 if ds else None)
         _log(f'  dataset: {"infinite" if ds is None else f"{ds} batches ({ds*B} examples)"}')
+
+        # Refine val batch (for refine mode: measure NLL on final <y> turn)
+        val_ref_np = None
+        if seq_mode == 'ref':
+            val_ref_np = make_refine_batch(
+                np.random.default_rng(seed + stage_i + 2),
+                B, _n_attempts_max, _make_noise_schedule(_n_attempts_max),
+                n_blocks, recall_from if isinstance(recall_from, int) else 0,
+                seg_len, slot_len, warmup_len, out_len, latent_len)
+
+        def _fmt_elapsed(s):
+            h, rem = divmod(int(s), 3600)
+            m, sec = divmod(rem, 60)
+            return f'{h:02d}:{m:02d}:{sec:02d}'
 
         if hp['grok']:
             for pg in opt.param_groups:
@@ -414,23 +617,63 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 pg['lr'] = lr
 
             model.train()
-            # Batch generation: int mode = interleaved with random k; end mode = standard
+            # Batch generation: int mode = interleaved; ref mode = refine; end mode = standard
             if seq_mode in ('int', 'mix'):
                 # Single unified mode: k ~ Uniform(1, n_blocks) per step
                 # end is a special case (k=1, last block) — not needed separately
                 _q_count = int(rng.integers(1, n_blocks + 1))
                 tokens_np, _active_c = make_interleaved_batch(
                     rng, B, n_blocks, seg_len, slot_len,
-                    warmup_len, out_len, drop_close_prob, intermed_len, _q_count)
+                    warmup_len, out_len, latent_len, _q_count)
                 _use_interleaved = True
+                _use_refine = False
+                _use_joint = False
+            elif seq_mode == 'ref':
+                _k = int(rng.integers(0, _n_attempts_max + 1)) if _rand_turns else _n_attempts_max
+                _pos_k, _mask_k = _ref_cache[_k]
+                _ref_c0 = _pos_k['query_c0']
+                _ref_c1 = _pos_k['query_c1']
+                tokens_np = make_refine_batch(
+                    rng, B, _k, _make_noise_schedule(_k),
+                    n_blocks, recall_from if isinstance(recall_from, int) else 0,
+                    seg_len, slot_len, warmup_len, out_len, latent_len)
+                _use_interleaved = False
+                _use_refine = True
+                _use_joint = False
+            elif seq_mode == 'joint':
+                _type_idx = int(rng.choice(len(_joint_cache), p=_joint_weights))
+                _jc = _joint_cache[_type_idx]
+                if _jc['traj'] == 'ref':
+                    _jk = int(rng.integers(0, _jc['n_attempts'] + 1))
+                    _jpos_k, _jmask_k = _jc['ref_cache'][_jk]
+                    # Flat noise: all turns same U(lo, hi) range
+                    _jnoise = [(_jc['noise_lo'], _jc['noise_hi'])] * _jk
+                    tokens_np = make_refine_batch(
+                        rng, B, _jk, _jnoise,
+                        _jc['n_blocks'], _jc['recall_from'],
+                        seg_len, slot_len, warmup_len, out_len, latent_len)
+                elif _jc['traj'] == 'int':
+                    _jq_count = int(rng.integers(1, _jc['n_blocks'] + 1))
+                    tokens_np, _active_c = make_interleaved_batch(
+                        rng, B, _jc['n_blocks'], seg_len, slot_len,
+                        warmup_len, out_len, latent_len, _jq_count)
+                else:  # 'end'
+                    tokens_np = make_multi_batch(
+                        rng, B, _jc['n_blocks'], _jc['recall_from'],
+                        seg_len, slot_len, warmup_len, out_len, latent_len)
+                _use_interleaved = False
+                _use_refine = False
+                _use_joint = True
             else:   # 'end' (default) or 'acc'
                 tokens_np = (pool[(local_step - 1) % ds]
                              if pool is not None
                              else make_multi_batch(rng, B, n_blocks, recall_from,
                                                    seg_len, slot_len,
-                                                   warmup_len, out_len, drop_close_prob,
-                                                   intermed_len))
+                                                   warmup_len, out_len,
+                                                   latent_len))
                 _use_interleaved = False
+                _use_refine = False
+                _use_joint = False
 
             if use_ocd:
                 _p     = _resolve_ocd_prob(local_step)
@@ -469,6 +712,59 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                             loss_parts.append(nll.mean())
                     loss_val = torch.stack(loss_parts).mean() if loss_parts else torch.tensor(0.0, device=device, requires_grad=True)
                     mode = 'tf-int'
+                elif _use_refine:
+                    # Refine mode: loss on final <y> + monotonic improvement penalty on drafts
+                    tokens = torch.tensor(tokens_np, device=device)
+                    logits = model(tokens, _mask_k)
+                    # Final turn loss
+                    lp_c     = log_probs_fn(logits[:, _ref_c0-1:_ref_c1-1])
+                    tgts_c   = tokens[:, _ref_c0:_ref_c1]
+                    nll_c    = -lp_c.gather(2, tgts_c.unsqueeze(-1)).squeeze(-1)
+                    loss_val = nll_c.mean()
+                    # Monotonic improvement penalty across attempt turns:
+                    # NLL on each draft turn vs ground truth; penalize if turn k+1 > turn k
+                    _mono_penalty = hp.get('mono_penalty', 0.0)
+                    if _k > 0 and _mono_penalty > 0.0:
+                        turn_nlls = []
+                        for _t in _pos_k['attempts']:  # attempt turns (before final)
+                            _lp = log_probs_fn(logits[:, _t['c0']-1:_t['c1']-1])
+                            _tgt = tokens[:, _t['c0']:_t['c1']]
+                            _nll = -_lp.gather(2, _tgt.unsqueeze(-1)).squeeze(-1).mean()
+                            turn_nlls.append(_nll)
+                        turn_nlls.append(nll_c.mean())  # final turn
+                        mono_loss = sum(F.relu(turn_nlls[k+1] - turn_nlls[k])
+                                        for k in range(len(turn_nlls)-1))
+                        loss_val = loss_val + _mono_penalty * mono_loss
+                    mode = 'tf-ref'
+                elif _use_joint:
+                    tokens = torch.tensor(tokens_np, device=device)
+                    if _jc['traj'] == 'ref':
+                        logits = model(tokens, _jmask_k)
+                        _jc0, _jc1 = _jpos_k['query_c0'], _jpos_k['query_c1']
+                        lp_c   = log_probs_fn(logits[:, _jc0-1:_jc1-1])
+                        tgts_c = tokens[:, _jc0:_jc1]
+                        nll_c  = -lp_c.gather(2, tgts_c.unsqueeze(-1)).squeeze(-1)
+                        loss_val = nll_c.mean()
+                        mode = f'tf-jref(k={_jk})'
+                    elif _jc['traj'] == 'int':
+                        logits = model(tokens, _jc['mask'])
+                        loss_parts = []
+                        for _jc0, _jc1 in _active_c:
+                            if _jc1 > _jc0 and _jc0 > 0:
+                                lp  = log_probs_fn(logits[:, _jc0-1:_jc1-1])
+                                tgt = tokens[:, _jc0:_jc1]
+                                nll = -lp.gather(2, tgt.unsqueeze(-1)).squeeze(-1)
+                                loss_parts.append(nll.mean())
+                        loss_val = torch.stack(loss_parts).mean() if loss_parts else torch.tensor(0.0, device=device, requires_grad=True)
+                        mode = 'tf-jint'
+                    else:  # end
+                        logits = model(tokens, _jc['mask'])
+                        _jc0, _jc1 = _jc['pos']['c0'], _jc['pos']['c1']
+                        lp_c   = log_probs_fn(logits[:, _jc0-1:_jc1-1])
+                        tgts_c = tokens[:, _jc0:_jc1]
+                        nll_c  = -lp_c.gather(2, tgts_c.unsqueeze(-1)).squeeze(-1)
+                        loss_val = nll_c.mean()
+                        mode = 'tf-jend'
                 else:
                     # Standard end-mode TF
                     tokens   = torch.tensor(tokens_np, device=device)
@@ -485,9 +781,12 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
             loss_f = float(loss_val.detach())
             pbar.set_postfix(loss=f'{loss_f:.3f}', lr=f'{lr:.1e}', mode=mode, refresh=False)
+
             if local_step % log_every == 0:
+                elapsed = time.time() - t0
                 _jlog(dict(global_step=global_step, stage=stage_i,
-                           loss=loss_f, bpb=loss_f/math.log(2), lr=lr, mode=mode))
+                           loss=loss_f, bpb=loss_f/math.log(2), lr=lr, mode=mode,
+                           elapsed_s=round(elapsed, 1), elapsed=_fmt_elapsed(elapsed)))
                 log_f.write(str(pbar) + '\n')
                 print()
 
@@ -501,9 +800,22 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     val_nll  = -val_lp_c.gather(2, val_tgt.unsqueeze(-1)).squeeze(-1)
                     val_loss = float(val_nll.mean())
                     val_bpb  = val_loss / math.log(2)
+                    # Refine mode: also measure correction NLL on refine val batch
+                    val_ref_bpb = None
+                    if val_ref_np is not None:
+                        vr_tok = torch.tensor(val_ref_np, device=device)
+                        vr_log = model(vr_tok, mask_ref_t)
+                        _vr_c0 = pos_ref['query_c0']
+                        _vr_c1 = pos_ref['query_c1']
+                        vr_lp  = F.log_softmax(vr_log[:, _vr_c0-1:_vr_c1-1], dim=-1)
+                        vr_tgt = vr_tok[:, _vr_c0:_vr_c1]
+                        vr_nll = -vr_lp.gather(2, vr_tgt.unsqueeze(-1)).squeeze(-1)
+                        val_ref_bpb = float(vr_nll.mean()) / math.log(2)
                 elapsed = time.time() - t0
+                _ref_bpb_str = f'  val_ref_bpb={val_ref_bpb:.3f}' if val_ref_bpb is not None else ''
                 _log(f'\n--- stage={stage_i} step={local_step}/{n_steps}  g={global_step}'
-                     f'  loss={loss_f:.4f}  val_bpb={val_bpb:.3f}  lr={lr:.2e}  {elapsed:.0f}s ---')
+                     f'  loss={loss_f:.4f}  val_bpb={val_bpb:.3f}{_ref_bpb_str}  lr={lr:.2e}'
+                     f'  {_fmt_elapsed(elapsed)} ---')
 
                 # Multi-config eval: test all eval_configs at every eval step
                 def _tok_hex(seq):
@@ -512,29 +824,82 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 y_start = f_start + warmup_len
                 y_end   = min(y_start + out_len, seg_len)
 
+                _verbose_eval = hp.get('verbose_eval', False)
+                _verbose_n    = hp.get('verbose_eval_n', 2)
+
+                def _fmt_bytes(seq):
+                    return ' '.join(f'{t:02x}' for t in seq)
+
                 cfg_results = {}
                 perfect_all = True
                 for eval_nb, eval_rf in eval_configs:
                     all_c = []
+                    # per-turn CER lists for refine mode: all_drafts[k] = CER list for draft turn k
+                    # Eval with n_eval_attempts = max_train + 2 to test extrapolation
+                    _n_eval_attempts = _n_attempts_max + 2
+                    _use_ref_eval = seq_mode == 'ref' or (seq_mode == 'joint' and _has_ref_joint)
+                    all_drafts = [[] for _ in range(_n_eval_attempts)] if _use_ref_eval else []
+                    verbose_examples = []   # (sname, wm, tgt, drafts_or_None, g)
                     for sname, x_S in test_seqs.items():
                         wm = x_S[max(0, y_start - warmup_len):y_start]
                         if len(wm) < warmup_len:
                             wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
                         tgt = x_S[y_start:y_end]
                         with torch.no_grad():
-                            g = ar_decode_role(model, x_S, slot_len, wm, len(tgt), device,
-                                               n_blocks=eval_nb, recall_from=eval_rf,
-                                               intermed_len=intermed_len, mem_window=mem_window)
+                            if _use_ref_eval:
+                                drafts, g = ar_decode_refine(
+                                    model, x_S, slot_len, wm, len(tgt), device,
+                                    n_attempts=_n_eval_attempts,
+                                    latent_len=latent_len, mem_window=mem_window)
+                                for k, d in enumerate(drafts):
+                                    if k < len(all_drafts):
+                                        all_drafts[k].append(cer(d, tgt))
+                            else:
+                                drafts = None
+                                g = ar_decode_role(model, x_S, slot_len, wm, len(tgt), device,
+                                                   n_blocks=eval_nb, recall_from=eval_rf,
+                                                   latent_len=latent_len, mem_window=mem_window)
                         all_c.append(cer(g, tgt))
+                        if _verbose_eval and len(verbose_examples) < _verbose_n:
+                            verbose_examples.append((sname, list(wm), list(tgt), drafts, list(g)))
                     mean_c = sum(all_c) / len(all_c)
                     key = f'n{eval_nb}_r{eval_rf}'
                     cfg_results[key] = round(100 * (1 - mean_c), 1)
                     ok = '✓' if mean_c == 0.0 else '✗'
                     if mean_c != 0.0: perfect_all = False
-                    _log(f'  {ok} n={eval_nb} rf={eval_rf}  match={100*(1-mean_c):.1f}%')
+                    if all_drafts:
+                        # Per-turn match% and monotonicity check
+                        turn_matches = [round(100*(1 - sum(c)/len(c)), 1) for c in all_drafts]
+                        final_match  = round(100*(1 - mean_c), 1)
+                        all_matches  = turn_matches + [final_match]
+                        monotonic    = all(all_matches[i] <= all_matches[i+1]
+                                           for i in range(len(all_matches)-1))
+                        mono_flag    = '↑' if monotonic else '⚠'
+                        for k, m in enumerate(turn_matches):
+                            cfg_results[f'{key}_t{k+1}'] = m
+                        step_str = '  '.join(f't{k+1}={m:.1f}%' for k,m in enumerate(turn_matches))
+                        delta    = round(final_match - turn_matches[0], 1)
+                        _log(f'  {ok} {mono_flag} n={eval_nb} rf={eval_rf}'
+                             f'  {step_str}  final={final_match:.1f}%  Δ={delta:+.1f}%')
+                    else:
+                        _log(f'  {ok} n={eval_nb} rf={eval_rf}  match={100*(1-mean_c):.1f}%')
+                    if _verbose_eval:
+                        for sname, wm, tgt, drafts, g in verbose_examples:
+                            _log(f'    [{sname}] wm={_fmt_bytes(wm)}  gt={_fmt_bytes(tgt)}')
+                            if drafts:
+                                for k, d in enumerate(drafts):
+                                    _match = round(100*(1-cer(d, tgt)), 1)
+                                    _log(f'      t{k+1}: {_fmt_bytes(d)}  ({_match}%)')
+                            _match = round(100*(1-cer(g, tgt)), 1)
+                            _log(f'      fin: {_fmt_bytes(g)}  ({_match}%)')
 
-                _jlog(dict(global_step=global_step, stage=stage_i, loss=loss_f,
-                           val_loss=val_loss, val_bpb=val_bpb, **cfg_results))
+                _jlog_d = dict(global_step=global_step, stage=stage_i, loss=loss_f,
+                               val_loss=val_loss, val_bpb=val_bpb,
+                               elapsed_s=round(elapsed, 1), elapsed=_fmt_elapsed(elapsed),
+                               **cfg_results)
+                if val_ref_bpb is not None:
+                    _jlog_d['val_ref_bpb'] = round(val_ref_bpb, 5)
+                _jlog(_jlog_d)
 
                 if perfect_all:
                     _log(f'\n★ PERFECT (all eval configs) at stage {stage_i} step={local_step}!')
@@ -559,7 +924,9 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
 
 
-    _log(f'\nDone. Total: {time.time()-t0:.0f}s')
+    _total = time.time() - t0
+    h, rem = divmod(int(_total), 3600); m, s = divmod(rem, 60)
+    _log(f'\nDone. Total: {h:02d}:{m:02d}:{s:02d} ({_total:.0f}s)')
     log_f.close(); jlog_f.close()
     return model, run_dir
 
@@ -596,7 +963,7 @@ DEFAULTS = dict(
     n_steps=10000, eval_every=5000, log_every=1000,
     warmup_len=8, out_len=8,
     rope=True, yarn=True, grok=False, seed=42,
-    drop_close_prob=0.5,
+    
     ocd=False, ocd_prob=0.01, tf_warmup=0,
     grad_clip=10.0, dataset_size=5000,
     stablemax=False, eval_offset=0.25,
@@ -628,7 +995,6 @@ if __name__ == '__main__':
     p.add_argument('--warmup-steps',    type=int)
     p.add_argument('--cycle-steps',     type=int)
     p.add_argument('--slot-style',      type=str)
-    p.add_argument('--drop-close',      type=float)
     p.add_argument('--ocd',             action='store_true')
     p.add_argument('--ocd-prob',        type=str)
     p.add_argument('--grad-clip',       type=float)
@@ -683,7 +1049,6 @@ if __name__ == '__main__':
     if args.seg_len and not args.slot_len: hp['slot_len'] = args.seg_len
     if args.d:                     hp['d'] = args.d; hp['d_ff'] = args.d * 4
     if args.lr:                    hp['lr_max'] = args.lr
-    if args.drop_close is not None: hp['drop_close_prob'] = args.drop_close
     if args.ocd:                   hp['ocd'] = True
     if args.ocd_prob is not None:
         try:    hp['ocd_prob'] = json.loads(args.ocd_prob)
@@ -723,35 +1088,57 @@ if __name__ == '__main__':
         V_in_ckpt  = sd['data_embed.weight'].shape[0] + sd['special_embed.weight'].shape[0]
         d_ckpt     = sd['data_embed.weight'].shape[1]
         n_lay_ckpt = sum(1 for k in sd if k.endswith('.norm1.weight'))
+        _cur0 = hp.get('curriculum', [{}])[0]
+        latent_len = _cur0.get('latent_len', hp.get('latent_len', hp.get('latent_len', 0)))
         ckpt_hp = {**hp, **ckpt.get('hp', {}),
                    'V': V_in_ckpt, 'd': d_ckpt, 'n_layers': n_lay_ckpt,
-                   'd_ff': sd['blocks.0.ffn.W1.weight'].shape[0]}
+                   'd_ff': sd['blocks.0.ffn.W1.weight'].shape[0],
+                   'latent_len': latent_len}
         model = build_model(ckpt_hp, device)
         model.load_state_dict(sd)
         model.eval()
-        test_seqs = make_test_sequences(hp.get('seg_len', 16))
-        eval_cfgs = hp.get('eval_configs', [(1, 0)])
-        slot_len = ckpt_hp.get('slot_len', hp.get('slot_len', 1))
-        intermed_len = ckpt_hp.get('intermed_len', hp.get('intermed_len', 0))
-        mem_window = hp.get('mem_window', -1)
-        warmup_len = hp.get('warmup_len', 4)
-        out_len = hp.get('out_len', 8)
+        seg_len    = _cur0.get('seg_len',    hp.get('seg_len', 16))
+        slot_len   = _cur0.get('slot_len',   hp.get('slot_len', 1))
+        warmup_len = _cur0.get('warmup_len', hp.get('warmup_len', 4))
+        out_len    = _cur0.get('out_len',    hp.get('out_len', 8))
+        mem_window = _cur0.get('mem_window', hp.get('mem_window', -1))
         eval_offset = hp.get('eval_offset', 0.25)
-        seg_len = ckpt_hp.get('seg_len', hp.get('seg_len', 16))
+        eval_cfgs  = hp.get('eval_configs', [(1, 0)])
+        test_seqs  = make_test_sequences(seg_len)
+        _eval_mode = 'ref' if any(s.get('mode') == 'ref'
+                                   for s in hp.get('curriculum', [])) else 'end'
+        _n_attempts_eval = _cur0.get('n_attempts', _cur0.get('n_draft_turns', 1)) + 2
         print(f'Checkpoint: {args.eval_only}  (stage={ckpt.get("stage","?")}  step={ckpt.get("step","?")})')
         for nb, rf in eval_cfgs:
             all_c = []
+            all_drafts = [[] for _ in range(_n_attempts_eval)] if _eval_mode == 'ref' else []
             f_start = min(int(seg_len * eval_offset), seg_len - warmup_len - out_len)
             y_start = f_start + warmup_len; y_end = min(y_start + out_len, seg_len)
             for sname, x_S in test_seqs.items():
                 wm = x_S[max(0, y_start - warmup_len):y_start]
                 if len(wm) < warmup_len: wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
-                g = ar_decode_role(model, x_S, slot_len, wm, y_end - y_start, device,
-                                   n_blocks=nb, recall_from=rf,
-                                   intermed_len=intermed_len, mem_window=mem_window)
-                all_c.append(cer(g, x_S[y_start:y_end]))
+                tgt = x_S[y_start:y_end]
+                if _eval_mode == 'ref':
+                    drafts, g = ar_decode_refine(model, x_S, slot_len, wm, y_end - y_start,
+                                                 device, n_attempts=_n_attempts_eval,
+                                                 latent_len=latent_len, mem_window=mem_window)
+                    for k, d in enumerate(drafts):
+                        if k < len(all_drafts): all_drafts[k].append(cer(d, tgt))
+                else:
+                    g = ar_decode_role(model, x_S, slot_len, wm, y_end - y_start, device,
+                                       n_blocks=nb, recall_from=rf,
+                                       latent_len=latent_len, mem_window=mem_window)
+                all_c.append(cer(g, tgt))
             mean_c = sum(all_c) / len(all_c)
-            print(f'  n={nb} rf={rf}: match={100*(1-mean_c):.1f}%')
+            if all_drafts:
+                turn_m = [round(100*(1-sum(c)/len(c)),1) for c in all_drafts]
+                final_m = round(100*(1-mean_c), 1)
+                step_str = '  '.join(f't{k+1}={m}%' for k,m in enumerate(turn_m))
+                mono = '↑' if all(turn_m[i]<=turn_m[i+1] if i+1<len(turn_m) else turn_m[-1]<=final_m
+                                   for i in range(len(turn_m))) else '⚠'
+                print(f'  {mono} n={nb} rf={rf}  {step_str}  final={final_m}%  Δ={final_m-turn_m[0]:+.1f}%')
+            else:
+                print(f'  n={nb} rf={rf}: match={100*(1-mean_c):.1f}%')
         import sys; sys.exit(0)
 
     if args.resume:

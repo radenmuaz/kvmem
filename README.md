@@ -208,6 +208,7 @@ python -m kvmem.train --config configs/expB_chain_nullkv.py \
 | v2: seg=16, slot=1, intermed=7 | 0.176 | **98.4%** | 70k steps, ds10k |
 | v2 + null_kv=True | **0.157** | **92%** | 26k steps — 1.5-2× faster |
 | v2 mixed routing n=2 (cold start) | 0.252 | **91%** both dirs | 65k/160k — routing works |
+| **Exp B: n=1,2,3 trained, n=4,5 eval** | — | **n4=95%, n5=91-94%** | extrapolation: algorithm generalises |
 
 v2 architecture: RNN-style tags, learned embeddings, source-first causal layout, no active_slots.
 

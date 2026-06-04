@@ -28,7 +28,6 @@ hp = dict(
     n_steps=80000, eval_every=5000, log_every=1000,
 
     # Data
-    drop_close_prob=0.5,
     dataset_size=10000, seed=42,
 
     # OCD

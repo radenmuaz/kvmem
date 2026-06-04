@@ -158,7 +158,7 @@ def parse_seq(spec: str) -> 'SeqSpec':
 
     return SeqSpec(
         n_blocks=n_blocks, slot_len=slot_len, seg_len=seg_len,
-        warmup_len=q_len, out_len=y_len, intermed_len=p_len,
+        warmup_len=q_len, out_len=y_len, latent_len=p_len,
         recall_from=recall_from, active_slots=active_slots,
     )
 
@@ -189,12 +189,12 @@ class SeqSpec:
     def __init__(self, n_blocks: int, slot_len: int, seg_len: int,
                  warmup_len: int, out_len: int,
                  recall_from: int = 0, active_slots: int = 0,
-                 intermed_len: int = 0):
+                 latent_len: int = 0):
         self.n_blocks     = n_blocks
         self.slot_len     = slot_len
         self.seg_len      = seg_len
         self.warmup_len   = warmup_len
-        self.intermed_len  = intermed_len
+        self.latent_len  = latent_len
         self.out_len      = out_len
         self.recall_from  = recall_from
         self.active_slots = active_slots
@@ -209,7 +209,7 @@ class SeqSpec:
         if self._pos is None:
             self._pos = multi_block_positions(
                 self.n_blocks, self.seg_len, self.slot_len,
-                self.warmup_len, self.out_len, self.intermed_len)
+                self.warmup_len, self.out_len, self.latent_len)
         return self._pos
 
     def make_mask(self, active_slots: int | None = None) -> np.ndarray:
@@ -217,19 +217,15 @@ class SeqSpec:
         a = self.active_slots if active_slots is None else active_slots
         return make_mask_multi(
             self.n_blocks, self.seg_len, self.slot_len,
-            self.warmup_len, self.out_len, a, self.intermed_len)
+            self.warmup_len, self.out_len, a, self.latent_len)
 
-    def make_batch(self, rng: np.random.Generator, B: int,
-                   slot_style: str = 'seq',
-                   drop_close_prob: float = 0.5) -> np.ndarray:
-        """
-        Build one batch of shape (B, L).
-        <p> region is filled with zeros (model pondering is unsupervised).
-        """
+    def make_batch(self, rng: np.random.Generator, B: int) -> np.ndarray:
+        """Build one batch of shape (B, L). Close tags always written."""
         return make_multi_batch(
             rng, B, self.n_blocks, self.recall_from,
-            self.seg_len, self.slot_len, slot_style,
-            self.warmup_len, self.out_len, drop_close_prob, self.intermed_len)
+            self.seg_len, self.slot_len,
+            self.warmup_len, self.out_len,
+            latent_len=self.latent_len)
 
     def to_hp(self, **overrides) -> dict:
         """
@@ -248,7 +244,7 @@ class SeqSpec:
             slot_len=self.slot_len,
             active_slots=self.active_slots,
             warmup_len=self.warmup_len,
-            ponder_len=self.intermed_len,
+            latent_len=self.latent_len,
             out_len=self.out_len,
             curriculum=None,
         )
@@ -274,7 +270,7 @@ class SeqSpec:
                f'<f>[{rs},{pos["f0"]})  '
                f'w[{pos["f0"]},{pos["f1"]})  '
                f'</f>[{pos["f1"]},{pos["fc1"]})')
-        if self.intermed_len > 0:
+        if self.latent_len > 0:
             rec += (f'  <p>[{pos["fc1"]},{pos["p0"]})  '
                     f'ponder[{pos["p0"]},{pos["p1"]})  '
                     f'</p>[{pos["p1"]},{pos["pc1"]})')
@@ -287,13 +283,13 @@ class SeqSpec:
     def to_spec_str(self) -> str:
         """Round-trip to canonical spec string (sequence order: x z h q y)."""
         frm = f',from={self.recall_from}' if self.recall_from else ''
-        ext = f'<z:{self.intermed_len}>'   if self.intermed_len  else ''
+        ext = f'<z:{self.latent_len}>'   if self.latent_len  else ''
         block = f'<x:{self.seg_len}>{ext}<h:{self.slot_len}>'
         return f'{block * self.n_blocks}<q:{self.warmup_len}><y:{self.out_len}{frm}>'
 
     def __repr__(self) -> str:
         frm = f',from={self.recall_from}' if self.recall_from else ''
-        ext = f'<z:{self.intermed_len}>'   if self.intermed_len  else ''
+        ext = f'<z:{self.latent_len}>'   if self.latent_len  else ''
         block = f'<x:{self.seg_len}>{ext}<h:{self.slot_len}>'
         return (f'SeqSpec  {(block + " ") * self.n_blocks}'
                 f'<q:{self.warmup_len}><y:{self.out_len}{frm}>  '
