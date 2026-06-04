@@ -269,6 +269,22 @@ def _stablemax_log_probs(logits: torch.Tensor) -> torch.Tensor:
     return (s / s.sum(dim=-1, keepdim=True)).log()
 
 
+def _positional_ls_nll(lp: torch.Tensor, tgt: torch.Tensor, ls_max: float) -> torch.Tensor:
+    """
+    NLL with positional label smoothing: ε=0 at position 0, ε=ls_max at position N-1.
+    lp:  (B, out_len, V)  log-probs
+    tgt: (B, out_len)     target token IDs
+    Returns (B, out_len) per-token NLL.
+    """
+    out_len = lp.shape[1]
+    nll_hard = -lp.gather(2, tgt.unsqueeze(-1)).squeeze(-1)          # (B, out_len)
+    if ls_max <= 0.0:
+        return nll_hard
+    eps = torch.linspace(0.0, ls_max, out_len, device=lp.device)    # (out_len,)
+    nll_soft = -lp.mean(dim=-1)                                       # (B, out_len)
+    return (1.0 - eps) * nll_hard + eps * nll_soft
+
+
 def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     device      = torch.device(device_str)
     lr_max      = hp['lr_max']
@@ -286,7 +302,10 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     # active_slots removed — slot_len IS the bottleneck
     log_probs_fn = _stablemax_log_probs if hp['stablemax'] else \
                    lambda x: F.log_softmax(x, dim=-1)
-    eval_offset  = hp['eval_offset']
+    eval_offset    = hp['eval_offset']
+    _ls_max_init   = hp.get('ls_max', 0.0)          # positional label smoothing max ε
+    _ls_anneal     = hp.get('ls_anneal_steps', 0)    # steps over which ε decays to 0
+    _noise_skew    = hp.get('noise_skew', False)     # skew draft noise toward end of seq
 
     def _resolve_ocd_prob(local_step):
         if isinstance(_ocd_prob, (int, float)):
@@ -615,6 +634,9 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             lr = lr_schedule(local_step)
             for pg in opt.param_groups:
                 pg['lr'] = lr
+            # Positional label smoothing: ε_max anneals linearly to 0 over ls_anneal_steps
+            _cur_ls = (_ls_max_init * max(0.0, 1.0 - local_step / _ls_anneal)
+                       if _ls_anneal > 0 else _ls_max_init)
 
             model.train()
             # Batch generation: int mode = interleaved; ref mode = refine; end mode = standard
@@ -636,7 +658,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 tokens_np = make_refine_batch(
                     rng, B, _k, _make_noise_schedule(_k),
                     n_blocks, recall_from if isinstance(recall_from, int) else 0,
-                    seg_len, slot_len, warmup_len, out_len, latent_len)
+                    seg_len, slot_len, warmup_len, out_len, latent_len,
+                    noise_skew=_noise_skew)
                 _use_interleaved = False
                 _use_refine = True
                 _use_joint = False
@@ -651,7 +674,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     tokens_np = make_refine_batch(
                         rng, B, _jk, _jnoise,
                         _jc['n_blocks'], _jc['recall_from'],
-                        seg_len, slot_len, warmup_len, out_len, latent_len)
+                        seg_len, slot_len, warmup_len, out_len, latent_len,
+                        noise_skew=_noise_skew)
                 elif _jc['traj'] == 'int':
                     _jq_count = int(rng.integers(1, _jc['n_blocks'] + 1))
                     tokens_np, _active_c = make_interleaved_batch(
@@ -716,10 +740,10 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     # Refine mode: loss on final <y> + monotonic improvement penalty on drafts
                     tokens = torch.tensor(tokens_np, device=device)
                     logits = model(tokens, _mask_k)
-                    # Final turn loss
+                    # Final turn loss with positional label smoothing (ε=0 at start, ε_max at end)
                     lp_c     = log_probs_fn(logits[:, _ref_c0-1:_ref_c1-1])
                     tgts_c   = tokens[:, _ref_c0:_ref_c1]
-                    nll_c    = -lp_c.gather(2, tgts_c.unsqueeze(-1)).squeeze(-1)
+                    nll_c    = _positional_ls_nll(lp_c, tgts_c, _cur_ls)
                     loss_val = nll_c.mean()
                     # Monotonic improvement penalty across attempt turns:
                     # NLL on each draft turn vs ground truth; penalize if turn k+1 > turn k
@@ -743,7 +767,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         _jc0, _jc1 = _jpos_k['query_c0'], _jpos_k['query_c1']
                         lp_c   = log_probs_fn(logits[:, _jc0-1:_jc1-1])
                         tgts_c = tokens[:, _jc0:_jc1]
-                        nll_c  = -lp_c.gather(2, tgts_c.unsqueeze(-1)).squeeze(-1)
+                        nll_c  = _positional_ls_nll(lp_c, tgts_c, _cur_ls)
                         loss_val = nll_c.mean()
                         mode = f'tf-jref(k={_jk})'
                     elif _jc['traj'] == 'int':

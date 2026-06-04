@@ -32,6 +32,10 @@ hp = dict(
     compile=False,
     verbose_eval=True,
     verbose_eval_n=2,
+    # Diffusion-style denoising:
+    noise_skew=True,          # draft noise: linear ramp 0→2p (low at start, high at end)
+    ls_max=0.2,               # positional label smoothing: ε=0 at pos 0, ε=0.2 at pos N-1
+    ls_anneal_steps=40000,    # ε decays linearly to 0 over first half of training
     name='refine_joint',
     seed=42,
     curriculum=[dict(

@@ -767,7 +767,8 @@ def make_refine_batch(rng: np.random.Generator, B: int,
                       n_blocks: int, recall_from: int,
                       seg_len: int, slot_len: int,
                       warmup_len: int, out_len: int,
-                      latent_len: int = 0) -> np.ndarray:
+                      latent_len: int = 0,
+                      noise_skew: bool = False) -> np.ndarray:
     """
     Build refine batch.
 
@@ -824,6 +825,9 @@ def make_refine_batch(rng: np.random.Generator, B: int,
         out_arr[i, pos['r0']:pos['r1']]     = wm
         out_arr[i, pos['r1']:pos['rc1']]    = REFINE_CLOSE
 
+        # Positional noise weights: linear ramp 0→2 so average = 1.0 (preserves mean noise)
+        _pos_weights = np.linspace(0.0, 2.0, alen) if (noise_skew and alen > 1) else np.ones(alen)
+
         # Attempt turns: <y>noisy</y> <z><h>
         for k, att in enumerate(attempts):
             p = noise_schedule[k]
@@ -831,7 +835,8 @@ def make_refine_batch(rng: np.random.Generator, B: int,
                 p = float(rng.uniform(p[0], p[1]))
             y_out = y_ref.copy()
             if p > 0.0:
-                nm = rng.random(alen) < p
+                per_pos_p = np.clip(p * _pos_weights, 0.0, 1.0)
+                nm = rng.random(alen) < per_pos_p
                 y_out[nm] = rng.integers(0, 256, size=int(nm.sum())).astype(np.int32)
             out_arr[i, att['c0'] - OUTPUT_OPEN_LEN : att['c0']]     = OUTPUT_OPEN
             out_arr[i, att['c0']:att['c0'] + alen]                   = y_out
