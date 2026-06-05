@@ -36,6 +36,10 @@ hp = dict(
     noise_skew=True,          # draft noise: linear ramp 0→2p (low at start, high at end)
     ls_max=0.2,               # positional label smoothing: ε=0 at pos 0, ε=0.2 at pos N-1
     ls_anneal_steps=40000,    # ε decays linearly to 0 over first half of training
+    # Correction supervision: direct NLL loss on each attempt turn vs clean GT
+    # Fixes "ignore draft and regenerate" sawtooth by giving gradient through correction path
+    aux_attempt_loss=0.3,
+    mono_penalty=0.05,
     name='refine_joint',
     seed=42,
     curriculum=[dict(

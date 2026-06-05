@@ -604,14 +604,35 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 if ds else None)
         _log(f'  dataset: {"infinite" if ds is None else f"{ds} batches ({ds*B} examples)"}')
 
-        # Refine val batch (for refine mode: measure NLL on final <y> turn)
-        val_ref_np = None
+        # Refine val batch: measure NLL on post-refine query <q><y>
+        # Used for both seq_mode='ref' and seq_mode='joint' (if any ref traj in mix)
+        val_ref_np  = None
+        val_ref_pos = None
+        val_ref_mask = None
+        _val_ref_n_att = _n_attempts_max  # number of attempts in val refine batch
         if seq_mode == 'ref':
             val_ref_np = make_refine_batch(
                 np.random.default_rng(seed + stage_i + 2),
                 B, _n_attempts_max, _make_noise_schedule(_n_attempts_max),
                 n_blocks, recall_from if isinstance(recall_from, int) else 0,
-                seg_len, slot_len, warmup_len, out_len, latent_len)
+                seg_len, slot_len, warmup_len, out_len, latent_len,
+                noise_skew=_noise_skew)
+            val_ref_pos  = refine_positions(_n_attempts_max, n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len)
+            val_ref_mask = torch.tensor(
+                make_mask_refine(_n_attempts_max, n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len, mem_window),
+                dtype=torch.float32, device=device)
+        elif seq_mode == 'joint' and _has_ref_joint:
+            # Use the first ref trajectory's config for the val refine batch
+            _jref = next(jm for jm in _joint_cache if jm['traj'] == 'ref')
+            _val_ref_n_att = _jref['n_attempts']
+            _jnoise_val = [(_jref['noise_lo'], _jref['noise_hi'])] * _val_ref_n_att
+            val_ref_np = make_refine_batch(
+                np.random.default_rng(seed + stage_i + 2),
+                B, _val_ref_n_att, _jnoise_val,
+                _jref['n_blocks'], _jref['recall_from'],
+                seg_len, slot_len, warmup_len, out_len, latent_len,
+                noise_skew=_noise_skew)
+            val_ref_pos, val_ref_mask = _jref['ref_cache'][_val_ref_n_att]
 
         def _fmt_elapsed(s):
             h, rem = divmod(int(s), 3600)
@@ -737,28 +758,31 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     loss_val = torch.stack(loss_parts).mean() if loss_parts else torch.tensor(0.0, device=device, requires_grad=True)
                     mode = 'tf-int'
                 elif _use_refine:
-                    # Refine mode: loss on final <y> + monotonic improvement penalty on drafts
                     tokens = torch.tensor(tokens_np, device=device)
                     logits = model(tokens, _mask_k)
-                    # Final turn loss with positional label smoothing (ε=0 at start, ε_max at end)
+                    # Post-refine query loss (primary)
                     lp_c     = log_probs_fn(logits[:, _ref_c0-1:_ref_c1-1])
                     tgts_c   = tokens[:, _ref_c0:_ref_c1]
                     nll_c    = _positional_ls_nll(lp_c, tgts_c, _cur_ls)
                     loss_val = nll_c.mean()
-                    # Monotonic improvement penalty across attempt turns:
-                    # NLL on each draft turn vs ground truth; penalize if turn k+1 > turn k
+                    # Auxiliary loss: each attempt turn vs clean GT
+                    # Gives direct gradient through correction path; fixes "ignore draft" sawtooth
+                    _aux_w = hp.get('aux_attempt_loss', 0.0)
                     _mono_penalty = hp.get('mono_penalty', 0.0)
-                    if _k > 0 and _mono_penalty > 0.0:
+                    if _k > 0 and (_aux_w > 0.0 or _mono_penalty > 0.0):
+                        gt_clean  = tokens[:, _pos_k['copy_c0']:_pos_k['copy_c1']]
                         turn_nlls = []
-                        for _t in _pos_k['attempts']:  # attempt turns (before final)
-                            _lp = log_probs_fn(logits[:, _t['c0']-1:_t['c1']-1])
-                            _tgt = tokens[:, _t['c0']:_t['c1']]
-                            _nll = -_lp.gather(2, _tgt.unsqueeze(-1)).squeeze(-1).mean()
-                            turn_nlls.append(_nll)
-                        turn_nlls.append(nll_c.mean())  # final turn
-                        mono_loss = sum(F.relu(turn_nlls[k+1] - turn_nlls[k])
-                                        for k in range(len(turn_nlls)-1))
-                        loss_val = loss_val + _mono_penalty * mono_loss
+                        for _t in _pos_k['attempts']:
+                            _att_lp  = log_probs_fn(logits[:, _t['c0']-1:_t['c1']-1])
+                            _att_nll = _positional_ls_nll(_att_lp, gt_clean, _cur_ls)
+                            turn_nlls.append(_att_nll.mean())
+                        if _aux_w > 0.0:
+                            loss_val = loss_val + _aux_w * torch.stack(turn_nlls).mean()
+                        if _mono_penalty > 0.0:
+                            turn_nlls.append(nll_c.mean())
+                            mono_loss = sum(F.relu(turn_nlls[i+1] - turn_nlls[i])
+                                            for i in range(len(turn_nlls)-1))
+                            loss_val = loss_val + _mono_penalty * mono_loss
                     mode = 'tf-ref'
                 elif _use_joint:
                     tokens = torch.tensor(tokens_np, device=device)
@@ -769,6 +793,22 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         tgts_c = tokens[:, _jc0:_jc1]
                         nll_c  = _positional_ls_nll(lp_c, tgts_c, _cur_ls)
                         loss_val = nll_c.mean()
+                        _aux_w = hp.get('aux_attempt_loss', 0.0)
+                        _mono_penalty = hp.get('mono_penalty', 0.0)
+                        if _jk > 0 and (_aux_w > 0.0 or _mono_penalty > 0.0):
+                            gt_clean  = tokens[:, _jpos_k['copy_c0']:_jpos_k['copy_c1']]
+                            turn_nlls = []
+                            for _t in _jpos_k['attempts']:
+                                _att_lp  = log_probs_fn(logits[:, _t['c0']-1:_t['c1']-1])
+                                _att_nll = _positional_ls_nll(_att_lp, gt_clean, _cur_ls)
+                                turn_nlls.append(_att_nll.mean())
+                            if _aux_w > 0.0:
+                                loss_val = loss_val + _aux_w * torch.stack(turn_nlls).mean()
+                            if _mono_penalty > 0.0:
+                                turn_nlls.append(nll_c.mean())
+                                mono_loss = sum(F.relu(turn_nlls[i+1] - turn_nlls[i])
+                                                for i in range(len(turn_nlls)-1))
+                                loss_val = loss_val + _mono_penalty * mono_loss
                         mode = f'tf-jref(k={_jk})'
                     elif _jc['traj'] == 'int':
                         logits = model(tokens, _jc['mask'])
@@ -824,13 +864,13 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     val_nll  = -val_lp_c.gather(2, val_tgt.unsqueeze(-1)).squeeze(-1)
                     val_loss = float(val_nll.mean())
                     val_bpb  = val_loss / math.log(2)
-                    # Refine mode: also measure correction NLL on refine val batch
+                    # Refine val: NLL on post-refine query <q><y> (works for both ref and joint mode)
                     val_ref_bpb = None
-                    if val_ref_np is not None:
+                    if val_ref_np is not None and val_ref_pos is not None:
                         vr_tok = torch.tensor(val_ref_np, device=device)
-                        vr_log = model(vr_tok, mask_ref_t)
-                        _vr_c0 = pos_ref['query_c0']
-                        _vr_c1 = pos_ref['query_c1']
+                        vr_log = model(vr_tok, val_ref_mask)
+                        _vr_c0 = val_ref_pos['query_c0']
+                        _vr_c1 = val_ref_pos['query_c1']
                         vr_lp  = F.log_softmax(vr_log[:, _vr_c0-1:_vr_c1-1], dim=-1)
                         vr_tgt = vr_tok[:, _vr_c0:_vr_c1]
                         vr_nll = -vr_lp.gather(2, vr_tgt.unsqueeze(-1)).squeeze(-1)

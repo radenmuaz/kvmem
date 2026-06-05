@@ -78,36 +78,40 @@ for l in sys.stdin:
 "
 ```
 
-Current run: **none** (Exp 3b done, Exp 3c not started)
+Current run: **none** (Exp 3c done)
 ```bash
-tail -f /Users/muaz/code/kvmem/logs/role_refine_multiturn/train.log
-
-# Refine metrics:
-tail -f logs/role_refine_multiturn/train.jsonl | python3 -c "
+# Joint refine metrics:
+tail -f logs/role_refine_joint/train.jsonl | python3 -c "
 import sys,json
 for l in sys.stdin:
     d=json.loads(l)
     if 'val_ref_bpb' in d:
-        gap=round(d['val_bpb']-d['val_ref_bpb'],3)
-        print(f'@{d[\"global_step\"]}: val_bpb={d[\"val_bpb\"]:.3f} val_ref_bpb={d[\"val_ref_bpb\"]:.3f} gap={gap:+.3f} n1_r0={d.get(\"n1_r0\",\"?\")}% {d[\"elapsed\"]}')
+        t_keys=sorted(k for k in d if k.startswith('n1_r0_t'))
+        tstr=' '.join(f'{k}={d[k]}%' for k in t_keys)
+        print(f'@{d[\"global_step\"]}: val_bpb={d[\"val_bpb\"]:.3f} val_ref_bpb={d[\"val_ref_bpb\"]:.3f} n1_r0={d.get(\"n1_r0\",\"?\")}% {tstr} {d[\"elapsed\"]}')
 "
 ```
 
+**Performance note — eval overhead:**
+AR decode eval (7 attempts × 16 tokens × 3 configs × N test seqs) takes ~10 min per checkpoint on MPS.
+Pure training: 41 it/s → 80k steps ≈ 32 min. Total with eval every 2000 steps: **6h43m**.
+Fix for future runs: set `eval_every=10000` or omit verbose AR decode — `val_ref_bpb` alone is sufficient signal.
+
 ---
 
-## Current Status (2026-06-04)
+## Current Status (2026-06-05)
 
-**Exp 3: Refine Stage A running** — `configs/refine_denoise.py`, 80k steps, ~28k complete.
+**Exp 3c done** — `configs/refine_joint.py`, 80k steps, 6h43m total.
 
 | Metric | Value | Meaning |
 |--------|-------|---------|
-| val_ref_bpb | ~0.37 | NLL on final `<y>` given noisy `<r>` — near-perfect |
-| val_bpb | ~12 | Single-turn NLL (out-of-distribution, expected) |
-| draft match% | ~3% | Model's own first pass — nearly random |
-| final match% | ~56% | After seeing draft, corrects using `<h>` |
-| Δ | +54% | Correction gain per step |
+| val_ref_bpb | **0.025** | NLL on post-refine `<q><y>` — better than Exp 3a (0.063) |
+| val_bpb | 0.14 | IQ recall — no regression from joint training |
+| t1 match% | ~77% | First AR attempt — memory encoding working |
+| t2 match% | ~77% | Second attempt ≥ t1 — correction is helping |
+| t3 match% | ~81% | Third attempt — monotonically improving |
 
-`val_bpb >> 8` (entropy) is expected: model trained to expect `<r>` context, single-turn eval is OOD. The correction working from a 3% draft proves `<h>` is being used, not just `<r>` copying.
+Sawtooth (t1→t2 collapse) **fixed** at step 32k by `aux_attempt_loss`. Monotonic t1≤t2≤t3 holds at convergence. Joint training preserved IQ (val_bpb=0.14) while learning refine.
 
 ---
 
@@ -297,7 +301,7 @@ The model must learn to propagate what matters through the chain (vanishing info
 | **Exp B: Chain extrapolation** | ✓ Done | **n=4 95%, n=5 91-94% trained only on n=1,2,3. Best overall: all ≥91%** |
 | **Exp 3a: Refine Stage A** | ✓ Done | draft 1.6% → final 92.2% Δ+90.6%. val_ref_bpb=0.063. Sawtooth fails (75%). |
 | **Exp 3b: Refine multi-turn** | ✓ Done | FAILED: 17.2% final (vs 92.2% Exp 3a). Train-eval dist mismatch. See findings. |
-| **Exp 3c: Joint trajectory mix** | ⏳ Next | flat noise, joint I-Q/I-R/I-I-Q training, no regression + extrapolation goals |
+| **Exp 3c: Joint trajectory mix** | ✓ Done | **val_ref_bpb=0.025, n1_r0=82%, monotonic t1≤t2≤t3 from step 32k. IQ no regression.** |
 | Exp 4: Natural language corpus | ⏳ Future | replace random bytes with text+line numbers |
 
 Full results: `reports/EXP_RESULTS_SUMMARY.md`
@@ -307,7 +311,9 @@ Full results: `reports/EXP_RESULTS_SUMMARY.md`
 - null_kv=True — always use, 1.5-2× faster  
 - **Chain extrapolation** — training on n=1,2,3 gives 88-95% on n=4,5 (phase transition at 2k steps into n=3 training)
 - mmix mode (k~Uniform(1,n) queries) — trains interactive ingestion+query patterns
-- **Refine working** — model corrects from terrible first draft (3%) to 56% using `<h>`. val_bpb>>8 (expected: model requires `<r>` context). val_ref_bpb≈0.37 (near-perfect in-distribution).
+- **Refine working (Exp 3c)** — val_ref_bpb=0.025, n1_r0=82%, t1≤t2≤t3 monotonic. aux_attempt_loss fixed sawtooth. Joint training preserved IQ.
+- **aux_attempt_loss** — direct NLL supervision on each attempt vs clean GT is essential; without it, model learns "ignore draft and regenerate" sawtooth pattern
+- **Eval overhead** — AR decode eval dominates runtime: 32 min training vs 6h43m total for 80k steps at eval_every=2000. Use eval_every=10000 and rely on val_ref_bpb signal.
 
 ---
 
@@ -329,7 +335,7 @@ Generalisation requirements:
 |---|---|---|
 | `I Q` | baseline recall | ✓ Exp 1 |
 | `I R` | single-block refine (1 turn) | ✓ Exp 3a |
-| `I R` (k=1..5 rand) | multi-turn refine | ✓ Exp 3b (failed — see below) |
+| `I R Q` (k=1..5 rand) | multi-turn refine + verify | ✓ Exp 3c (joint, 82%) |
 | `I Q Q` | consistency: same block twice | ✗ |
 | `I Q R` | query then self-correct | ✗ |
 | `I R Q` | refine then verify correction | ✗ |
@@ -414,12 +420,11 @@ Progression of refine experiments following the SRS (Spaced Repetition System) h
 
 **Exp 3b** (done, failed) — k~Uniform(1,5), descending noise. 17.2% final. Root cause: train-eval distribution mismatch — later drafts get near-zero synthetic noise during training (U(0, noise_hi*(K-j)/K)), but model's own AR-decoded drafts at eval time are still very noisy (≈15%). Model learns "5th draft is clean, just copy" but sees noisy 5th draft at eval. Fix: flat noise schedule — same noise range for all draft turns.
 
-**Exp 3c** (next) — Joint trajectory mix with flat noise:
-- Mix I Q, I R (flat noise k~1..5), I I Q₀, I I R₁ Q₀, I Q₀ I Q₀ per step
-- Goals: no regression on I Q (92%+), extrapolation to k>5, retention
-- Two-block SRS trajectory: ingest x1, ingest x2, refine x2 (k turns), query x0
-- Requires: extending sequence layout to support trailing Q₀ after refine turn
-- Config: `configs/refine_joint.py`
+**Exp 3c** (done) — Joint trajectory mix with flat noise, `configs/refine_joint.py`, 80k steps.
+- Mix: 30% I Q, 20% I R Q (k~0..5 flat noise), 20% I I Q₀, 30% interleaved n=2
+- New: `mode='joint'` per-step trajectory sampling, `out_len=-1` (full recall), `aux_attempt_loss=0.3`, `mono_penalty=0.05`, `noise_skew=True`, positional label smoothing `ls_max=0.2`
+- Result: val_ref_bpb=0.025, n1_r0=82%, monotonic at 80k. IQ val_bpb=0.14 (no regression).
+- Key fix: `aux_attempt_loss` gave direct gradient to correction path — without it, sawtooth (t1=50%→t2=5%) persisted indefinitely.
 
 **Key constraint for all future refine experiments:**
 - Flat noise: all draft turns use same U(lo, hi) range — keeps training drafts at same quality distribution as model's own eval outputs
@@ -451,6 +456,12 @@ Progression of refine experiments following the SRS (Spaced Repetition System) h
 | 2026-06-04 | **Exp 3b failed**: descending noise (turn j of K gets U(0, noise_hi*(K-j)/K)) causes train-eval distribution mismatch. Later training drafts are near-clean; AR eval drafts are still noisy. Model learns to copy clean drafts, fails on noisy eval. Fix: flat noise schedule, same range all turns. |
 | 2026-06-04 | Joint training required: training only on I R breaks I Q (model expects `<r>` context). Must mix trajectory types per step. Simple trajectories in mix prevent regression. |
 | 2026-06-04 | Trajectory generalisation goals: (1) no regression at k < trained max, (2) extrapolation at k > trained max (same mechanism as Exp B chain extrapolation). Both require rand_turns + flat noise + trajectory mixing. |
+| 2026-06-05 | **Exp 3c complete**: val_ref_bpb=0.025 (better than Exp 3a 0.063), n1_r0=82%, monotonic t1≤t2≤t3 at 80k steps. Joint training (30% IQ + 20% IRQ + 20% IIQ₀ + 30% int) preserved IQ (val_bpb=0.14). |
+| 2026-06-05 | **aux_attempt_loss** is essential for multi-turn refine. Without it, model learns "ignore draft and regenerate fresh" (sawtooth: t1=50%→t2=5%). Direct NLL supervision on each attempt vs clean GT forces gradient through the correction path. Fixed by step 32k. |
+| 2026-06-05 | Sawtooth mechanism: model has no gradient on attempt turns (loss only on post-refine query). Correction blocks see training drafts (random noise) vs eval drafts (AR accumulated errors) — model learns to ignore context and regenerate. Fix: aux_attempt_loss + mono_penalty. |
+| 2026-06-05 | Eval overhead: AR decode with 7 attempts × 16 tokens × 3 configs takes ~10 min per checkpoint on MPS. Training itself is 41 it/s (32 min for 80k). Total 6h43m with eval_every=2000. Recommend eval_every=10000 for future runs; val_ref_bpb is sufficient live signal. |
+| 2026-06-05 | `mode='joint'` added to train.py: per-step trajectory sampling from weighted mixture of {end, ref, int} types with different n_blocks/recall_from. val_ref_bpb now computed in joint mode. `out_len=-1` resolves to seg_len (full recall). |
+| 2026-06-05 | Positional noise skew (noise_skew=True): draft noise ramps 0→2p left→right. Positional label smoothing (ls_max=0.2 annealing over 40k steps): ε=0 at sequence start, ε=ls_max at end. Both mimic AR error distribution — errors compound toward sequence end. |
 
 ---
 
@@ -461,6 +472,8 @@ Progression of refine experiments following the SRS (Spaced Repetition System) h
 | Exp 1 results | `reports/EXP1_DATASET_ABLATION.md` |
 | Exp 2 live tracking | `reports/EXP2_MULTITURN_TRACKING.md` |
 | Exp 2 plan + refine plan | `plan/PLAN_EXP2.md` |
+| Exp 3c checkpoint | `logs/role_refine_joint/checkpoints/stage0_end.pt` |
+| Exp 3c config | `configs/refine_joint.py` |
 | Tag naming rationale | `reports/tag_naming.md` |
 | KV dimension tables | `reports/kv_dims.md` |
 | v1 results and findings | `reports/v1/` |
