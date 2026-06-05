@@ -51,6 +51,53 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    _MPL = True
+except ImportError:
+    _MPL = False
+
+
+def _save_plot(jsonl_path: str) -> None:
+    """Read train.jsonl and save three plot PNGs alongside it. Silent on any error.
+
+    Saves:
+      *_plot.png       — combined (all panels)
+      *_plot_train.png — train-only: bpb + 4 separate component losses
+      *_plot_val.png   — val-only: loss curves + match% + per-turn bar
+    """
+    if not _MPL:
+        return
+    try:
+        # Delegate to the standalone script's build functions (shared logic)
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            '_plot_mod',
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), 'scripts', 'plot_train.py'))
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+
+        rows = []
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        pass
+        if not rows:
+            return
+
+        _mod.build_combined(rows, jsonl_path)
+        _mod.build_train_metrics(rows, jsonl_path)
+        _mod.build_val_metrics(rows, jsonl_path)
+    except Exception:
+        pass
+
 from kvmem.model import build_model
 from kvmem.data import (
     HIDDEN_OPEN, HIDDEN_CLOSE, INPUT_OPEN, INPUT_CLOSE,
@@ -65,6 +112,7 @@ from kvmem.data import (
     multi_block_positions, make_mask_multi, make_multi_batch,
     interleaved_positions, make_mask_interleaved, make_interleaved_batch,
     refine_positions, make_mask_refine, make_refine_batch,
+    extract_multi_batch,
     make_mask_old_memory,
 )
 from kvmem.utils import make_test_sequences, cer
@@ -185,17 +233,20 @@ def ar_decode_refine(model, x_S: list[int], slot_len: int,
                      warmup: list[int], out_len: int, device,
                      n_attempts: int = 1,
                      latent_len: int = 0,
-                     mem_window: int = -1) -> tuple[list[list[int]], list[int]]:
+                     mem_window: int = -1,
+                     target: list[int] | None = None,
+                     stop_early: bool = True) -> tuple[list[list[int]], list[int]]:
     """
     AR decode for new refine architecture.
 
-    Generates n_attempts attempt outputs (each followed by a correction <z><h> block),
-    then stops. Does NOT generate the final turn (inference stopping point).
+    Generates up to n_attempts attempt outputs (each followed by a correction <z><h> block).
 
-    Stopping: compare consecutive attempts; stop early if they converge.
+    stop_early=True (default): stop when target matched or two consecutive identical outputs.
+    stop_early=False: always run all n_attempts turns — use this to observe the full
+      correction trajectory even after convergence (reveals divergence or stability).
 
     Returns (attempts, last_attempt):
-      attempts    : list of n_attempts lists (model's <y> at each step)
+      attempts    : list of generated outputs (always n_attempts long when stop_early=False)
       last_attempt: the final generated output (= attempts[-1])
     """
     from kvmem.data import (make_hidden_slot_ids, make_latent_slot_ids,
@@ -253,11 +304,46 @@ def ar_decode_refine(model, x_S: list[int], slot_len: int,
         tokens[att['sl1']:att['mc1']]     = HIDDEN_CLOSE
 
         all_attempts.append(gen)
-        if prev_gen is not None and gen == prev_gen:
-            break  # converged early
+        if target is not None and gen == list(target):
+            break  # 100% match — stop
+        # No convergence stop: always run all n_attempts turns so we can observe
+        # whether a stuck model eventually breaks out or stays fixed.
         prev_gen = gen
 
-    return all_attempts, all_attempts[-1] if all_attempts else []
+    # --- Post-refine query: AR decode <q>wm</q><y> after all attempt turns ---
+    # Fill copy turn (last attempt as stand-in for clean GT at inference),
+    # final correction block, then AR decode the query output.
+    # The query rows can only see the final <h> (mask enforces bottleneck).
+    query_gen = []
+    if all_attempts:
+        last = all_attempts[-1]
+        alen = min(len(last), out_len)
+        # Copy turn: <y>last_attempt</y>
+        tokens[pos['copy_c0'] - OUTPUT_OPEN_LEN : pos['copy_c0']] = OUTPUT_OPEN
+        tokens[pos['copy_c0']:pos['copy_c0'] + alen]               = last[:alen]
+        tokens[pos['copy_c1']:pos['copy_cl1']]                     = OUTPUT_CLOSE
+        # Final correction block: <z><h>
+        g = pos['final']
+        if latent_len > 0:
+            tokens[g['p0'] - LATENT_OPEN_LEN : g['p0']] = LATENT_OPEN
+            tokens[g['p0']:g['p1']]                      = ponder_ids
+            tokens[g['p1']:g['pc1']]                     = LATENT_CLOSE
+        tokens[g['pc1']:g['sl0']] = HIDDEN_OPEN
+        tokens[g['sl0']:g['sl1']] = slot_ids
+        tokens[g['sl1']:g['mc1']] = HIDDEN_CLOSE
+        # Post-refine query warmup: <q>wm</q><y>
+        tokens[pos['query_open']:pos['qr0']] = QUERY_OPEN
+        tokens[pos['qr0']:pos['qr1']]        = warmup
+        tokens[pos['qr1']:pos['qrc1']]       = QUERY_CLOSE
+        tokens[pos['qrc1']:pos['query_c0']]  = OUTPUT_OPEN
+        tok_t = torch.tensor(tokens, dtype=torch.long, device=device)
+        for j in range(out_len):
+            logits   = model(tok_t, mask_t)
+            next_tok = int(logits[pos['query_c0'] + j - 1].argmax())
+            query_gen.append(next_tok)
+            tok_t[pos['query_c0'] + j] = next_tok
+
+    return all_attempts, all_attempts[-1] if all_attempts else [], query_gen
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +369,86 @@ def _positional_ls_nll(lp: torch.Tensor, tgt: torch.Tensor, ls_max: float) -> to
     eps = torch.linspace(0.0, ls_max, out_len, device=lp.device)    # (out_len,)
     nll_soft = -lp.mean(dim=-1)                                       # (B, out_len)
     return (1.0 - eps) * nll_hard + eps * nll_soft
+
+
+def compute_teacher_trajectory(model, tokens_t, mask_t, h_positions,
+                                ntp_c0, ntp_c1, log_probs_fn, cur_ls,
+                                n_targets, max_iter=50, teacher_lr=3e-4,
+                                loss_threshold=0.01):
+    """
+    Fresh-optimizer oracle teacher: overfit a clone on this batch, collect h trajectory.
+
+    Algorithm:
+      1. Clone model with fresh AdamW (max_iter steps, lr=teacher_lr).
+      2. Run until IQ NTP loss < loss_threshold or max_iter exhausted.
+      3. Record h activations after every step → full trajectory of length T.
+      4. Subsample T → n_targets evenly spaced checkpoints.
+         Turn t is paired with the checkpoint at position t in the subsampled trajectory.
+         Last checkpoint = fully overfit h (oracle ideal).
+
+    Targets are stop-gradiented; no gradients accumulate in model or main optimizer.
+    n_targets=0: returns empty list (used when k=0, i.e. standard IQ step).
+    """
+    import copy
+
+    if n_targets == 0:
+        return []
+
+    clone = copy.deepcopy(model)
+    clone.train()
+    opt_clone = torch.optim.AdamW(clone.parameters(), lr=teacher_lr, weight_decay=0.0)
+
+    trajectory   = []   # h activations after each optimizer step
+    broke_early  = False
+    stop_loss    = float('inf')
+    actual_iters = 0
+
+    for _step in range(max_iter):
+        actual_iters = _step + 1
+        opt_clone.zero_grad()
+        logits = clone(tokens_t, mask_t)
+        lp   = log_probs_fn(logits[:, ntp_c0-1:ntp_c1-1])
+        tgt  = tokens_t[:, ntp_c0:ntp_c1]
+        loss = _positional_ls_nll(lp, tgt, cur_ls).mean()
+        loss.backward()
+        opt_clone.step()
+        with torch.no_grad():
+            _, x_new = clone(tokens_t, mask_t, return_features=True)
+            trajectory.append(x_new[:, h_positions, :].detach())
+            stop_loss = float(loss)
+            # Stop when argmax is correct for every token in every example
+            pred = logits[:, ntp_c0-1:ntp_c1-1].argmax(-1)
+            if (pred == tgt).all():
+                broke_early = True
+                break
+
+    del clone, opt_clone
+
+    T = len(trajectory)
+    if T == 0:
+        return [], False, float('inf'), 0
+
+    # Subsample: pick n_targets evenly spaced indices across the trajectory
+    if n_targets == 1:
+        indices = [T - 1]
+    elif n_targets >= T:
+        indices = list(range(T)) + [T - 1] * (n_targets - T)
+    else:
+        indices = [round(i * (T - 1) / (n_targets - 1)) for i in range(n_targets)]
+
+    return [trajectory[i] for i in indices], broke_early, stop_loss, actual_iters
+
+
+# Keep old name as alias for backward compat
+def compute_teacher_h(model, tokens_t, mask_t, h_positions,
+                       ntp_c0, ntp_c1, lr_h, log_probs_fn, cur_ls,
+                       diff=False, n_h_steps=1, opt=None, clone_opt_state=True):
+    """Legacy single-gradient-step teacher. Prefer compute_teacher_trajectory."""
+    targets, _, _, _ = compute_teacher_trajectory(
+        model, tokens_t, mask_t, h_positions, ntp_c0, ntp_c1,
+        log_probs_fn, cur_ls, n_targets=n_h_steps,
+        max_iter=n_h_steps, teacher_lr=lr_h)
+    return targets
 
 
 def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
@@ -351,7 +517,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     ts     = datetime.now().strftime('%m%d_%H%M')
     name   = hp.get('name')
     suffix = f'{name}_{ts}' if (name and hp.get('name_date')) else (name or ts)
-    run_dir  = os.path.join(log_base, f'role_{suffix}')
+    run_dir  = os.path.join(log_base, suffix)
     ckpt_dir = os.path.join(run_dir, 'checkpoints')
     os.makedirs(ckpt_dir, exist_ok=True)
     with open(os.path.join(run_dir, 'hparams.json'), 'w') as f:
@@ -364,14 +530,20 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         jlog_f.write(json.dumps(
             {k: round(v, 5) if k in _R5 else v for k, v in d.items()}) + '\n')
 
+    def _st_seg(st):
+        """Resolve src_len/seg_len from a stage dict (src_len takes priority)."""
+        return st.get('src_len', st.get('seg_len', 128))
+
     def _resolve_out_len(st):
         ol = st.get('out_len', 128)
-        return st['seg_len'] if ol == -1 else ol
+        if ol == -1:
+            return _st_seg(st) - st.get('warmup_len', 0)
+        return ol
 
-    max_stage = max(curriculum, key=lambda s: s['seg_len'])
+    max_stage = max(curriculum, key=lambda s: _st_seg(s))
     max_nb    = max_stage.get('n_blocks', 1)
-    max_pos   = multi_block_positions(max_nb, max_stage['seg_len'],
-                                      max_stage.get('slot_len', max_stage['seg_len']),
+    max_pos   = multi_block_positions(max_nb, _st_seg(max_stage),
+                                      max_stage.get('slot_len', _st_seg(max_stage)),
                                       max_stage.get('warmup_len', 32),
                                       _resolve_out_len(max_stage),
                                       max_stage.get('latent_len', 0))
@@ -382,19 +554,19 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             for _jm in _st.get('joint_mix', []):
                 _jnb = _jm.get('n_blocks', 1)
                 _jla = _st.get('latent_len', 0)
-                _jsl = _st.get('slot_len', _st['seg_len'])
-                _jsg = _st['seg_len']
+                _jsl = _st.get('slot_len', _st_seg(_st))
+                _jsg = _st_seg(_st)
                 _jwl = _st.get('warmup_len', 16)
                 _jol = _resolve_out_len(_st)
-                if _jm['traj'] == 'ref':
+                if _jm['traj'] in ('ref', 'online_ref'):
                     _jp = refine_positions(_jm.get('n_attempts', 5), _jnb, _jsg, _jsl, _jwl, _jol, _jla)
                 elif _jm['traj'] == 'int':
                     _jp = interleaved_positions(_jnb, _jsg, _jsl, _jwl, _jol, _jla)
                 else:
                     _jp = multi_block_positions(_jnb, _jsg, _jsl, _jwl, _jol, _jla)
                 L_max_seq = max(L_max_seq, _jp['L'])
-    hp_model  = dict(hp, seg_len=max_stage['seg_len'],
-                     slot_len=max_stage.get('slot_len', max_stage['seg_len']),
+    hp_model  = dict(hp, seg_len=_st_seg(max_stage),
+                     slot_len=max_stage.get('slot_len', _st_seg(max_stage)),
                      latent_len=max_stage.get('latent_len', hp.get('latent_len', 0)),
                      L_train=L_max_seq, L_max=L_max_seq * 4)
 
@@ -443,18 +615,19 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
          + (f'  OCD prob={_ocd_prob}' if use_ocd else '  TF-only'))
     _log(f'  Curriculum: {len(curriculum)} stages')
     for i, st in enumerate(curriculum):
-        nb = st.get('n_blocks', 1)
-        rf = st.get('recall_from', 0)
-        p  = multi_block_positions(nb, st['seg_len'],
-                                   st.get('slot_len', st['seg_len']),
-                                   st.get('warmup_len', 16), st.get('out_len', 32),
+        nb    = st.get('n_blocks', 1)
+        rf    = st.get('recall_from', 0)
+        _slen = _st_seg(st)
+        p  = multi_block_positions(nb, _slen,
+                                   st.get('slot_len', _slen),
+                                   st.get('warmup_len', 16), _resolve_out_len(st),
                                    st.get('latent_len', 0))
         pl = st.get('latent_len', 0)
         _log(f'    stage {i}: n_blocks={nb} recall_from={rf}'
-             f'  seg={st["seg_len"]}  slot={st.get("slot_len",st["seg_len"])}'
+             f'  src={_slen}  slot={st.get("slot_len",_slen)}'
              f'  wl={st.get("warmup_len",16)}'
              + (f'  ponder={pl}' if pl else '')
-             + f'  out={st.get("out_len",32)}'
+             + f'  out={_resolve_out_len(st)}'
              + f'  B={st["B"]}  steps={st["n_steps"]}  L={p["L"]}')
 
     rng  = np.random.default_rng(seed)
@@ -463,16 +636,18 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     t0          = time.time()
     global_step = 0
 
+    # Running teacher iter count: doubles when clone fails to overfit, caps at max_max
+    _teacher_iters     = None   # set per stage from joint_mix config
+    _teacher_max_iters = None
+
     for stage_i, stage in enumerate(curriculum):
         if stage_i < _resume_stage: continue  # skip completed stages
-        seg_len    = stage['seg_len']
+        seg_len    = _st_seg(stage)
         slot_len   = stage.get('slot_len', seg_len)
         warmup_len = stage.get('warmup_len', 16)
         latent_len = stage.get('latent_len', 0)
         mem_window   = stage.get('mem_window', -1)
-        out_len    = stage.get('out_len', 32)
-        if out_len == -1:
-            out_len = seg_len  # -1 = full segment recall
+        out_len    = _resolve_out_len(stage)
         n_blocks   = stage.get('n_blocks', 1)
         recall_from = stage.get('recall_froms', stage.get('recall_from', 0))
         seq_mode    = stage.get('mode', 'end')   # end|int|mix|ref
@@ -564,6 +739,29 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                              ref_cache=j_ref_cache, n_attempts=j_n_att,
                                              noise_lo=j_noise_lo, noise_hi=j_noise_hi))
                     _has_ref_joint = True
+                elif jtraj == 'online_ref':
+                    j_ref_cache = {}
+                    for k in range(j_n_att + 1):
+                        _p = refine_positions(k, jnb, seg_len, slot_len,
+                                              warmup_len, out_len, latent_len)
+                        _m = torch.tensor(
+                            make_mask_refine(k, jnb, seg_len, slot_len,
+                                             warmup_len, out_len, latent_len, mem_window),
+                            dtype=torch.float32, device=device)
+                        j_ref_cache[k] = (_p, _m)
+                    # I Q pos/mask for teacher h computation
+                    _iq_pos = multi_block_positions(jnb, seg_len, slot_len,
+                                                    warmup_len, out_len, latent_len)
+                    _iq_mask = torch.tensor(
+                        make_mask_multi(jnb, seg_len, slot_len, warmup_len, out_len,
+                                        latent_len, mem_window),
+                        dtype=torch.float32, device=device)
+                    _joint_cache.append(dict(traj='online_ref', n_blocks=jnb, recall_from=jrf,
+                                             ref_cache=j_ref_cache, n_attempts=j_n_att,
+                                             h_lr=jm.get('h_lr', 1.0),
+                                             h_loss_w=jm.get('h_loss_w', 0.5),
+                                             iq_pos=_iq_pos, iq_mask=_iq_mask))
+                    _has_ref_joint = True
                 elif jtraj == 'int':
                     jp  = interleaved_positions(jnb, seg_len, slot_len, warmup_len, out_len, latent_len)
                     jmt = torch.tensor(
@@ -595,14 +793,30 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             B, n_blocks, recall_from, seg_len, slot_len,
             warmup_len, out_len, latent_len=latent_len)
         pool_rng  = np.random.default_rng(seed + stage_i + 1000)
-        ds   = dataset_size if dataset_size > 0 else None
+        # dataset_size: -1 = unbounded stream (new default); 0 is invalid; >0 = fixed pool
+        if dataset_size == 0:
+            raise ValueError('dataset_size=0 is invalid. Use -1 for unbounded or >0 for fixed pool.')
+        ds   = None if dataset_size < 0 else dataset_size
         pool = (np.stack([make_multi_batch(pool_rng, B, n_blocks, recall_from,
                                            seg_len, slot_len,
                                            warmup_len, out_len,
                                            latent_len)
                           for _ in range(ds)])
                 if ds else None)
-        _log(f'  dataset: {"infinite" if ds is None else f"{ds} batches ({ds*B} examples)"}')
+        _log(f'  dataset: {"unbounded stream" if ds is None else f"fixed pool {ds} batches ({ds*B} examples)"}')
+
+        # Overfit sanity check: extract first 2 examples from pool[0] as fixed targets.
+        # A well-trained model should reach 100% match on these.
+        _overfit_examples = []
+        if pool is not None:
+            _ov_pos = multi_block_positions(n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len)
+            for _ov_i in range(min(2, B)):
+                _ov_tok = pool[0][_ov_i]                              # first batch, first 2 rows
+                _ov_xS  = list(_ov_tok[_ov_pos['blocks'][0]['s0']:_ov_pos['blocks'][0]['s1']])
+                _ov_wm  = list(_ov_tok[_ov_pos['f0']:_ov_pos['f1']])
+                _ov_tgt = list(_ov_tok[_ov_pos['c0']:_ov_pos['c1']])
+                _overfit_examples.append((_ov_xS, _ov_wm, _ov_tgt))
+            _log(f'  overfit check: {len(_overfit_examples)} fixed examples from pool[0]')
 
         # Refine val batch: measure NLL on post-refine query <q><y>
         # Used for both seq_mode='ref' and seq_mode='joint' (if any ref traj in mix)
@@ -622,17 +836,22 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 make_mask_refine(_n_attempts_max, n_blocks, seg_len, slot_len, warmup_len, out_len, latent_len, mem_window),
                 dtype=torch.float32, device=device)
         elif seq_mode == 'joint' and _has_ref_joint:
-            # Use the first ref trajectory's config for the val refine batch
-            _jref = next(jm for jm in _joint_cache if jm['traj'] == 'ref')
-            _val_ref_n_att = _jref['n_attempts']
-            _jnoise_val = [(_jref['noise_lo'], _jref['noise_hi'])] * _val_ref_n_att
-            val_ref_np = make_refine_batch(
-                np.random.default_rng(seed + stage_i + 2),
-                B, _val_ref_n_att, _jnoise_val,
-                _jref['n_blocks'], _jref['recall_from'],
-                seg_len, slot_len, warmup_len, out_len, latent_len,
-                noise_skew=_noise_skew)
-            val_ref_pos, val_ref_mask = _jref['ref_cache'][_val_ref_n_att]
+            # Use first ref/online_ref trajectory's config for the val refine batch.
+            # online_ref uses zero noise (teacher force) to match its training distribution.
+            _jref = next((jm for jm in _joint_cache if jm['traj'] in ('ref', 'online_ref')), None)
+            if _jref is not None:
+                _val_ref_n_att = _jref['n_attempts']
+                if _jref['traj'] == 'online_ref':
+                    _jnoise_val = [0.0] * _val_ref_n_att
+                else:
+                    _jnoise_val = [(_jref['noise_lo'], _jref['noise_hi'])] * _val_ref_n_att
+                val_ref_np = make_refine_batch(
+                    np.random.default_rng(seed + stage_i + 2),
+                    B, _val_ref_n_att, _jnoise_val,
+                    _jref['n_blocks'], _jref['recall_from'],
+                    seg_len, slot_len, warmup_len, out_len, latent_len,
+                    noise_skew=(_noise_skew if _jref['traj'] == 'ref' else False))
+                val_ref_pos, val_ref_mask = _jref['ref_cache'][_val_ref_n_att]
 
         def _fmt_elapsed(s):
             h, rem = divmod(int(s), 3600)
@@ -697,6 +916,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         _jc['n_blocks'], _jc['recall_from'],
                         seg_len, slot_len, warmup_len, out_len, latent_len,
                         noise_skew=_noise_skew)
+                elif _jc['traj'] == 'online_ref':
+                    tokens_np = None  # batch built inside loss block (needs teacher h)
                 elif _jc['traj'] == 'int':
                     _jq_count = int(rng.integers(1, _jc['n_blocks'] + 1))
                     tokens_np, _active_c = make_interleaved_batch(
@@ -742,6 +963,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 mode = 'ocd'
             else:
                 opt.zero_grad()
+                _online_stats = None  # populated only on online_ref steps
                 if _use_interleaved:
                     # Interleaved: loss on all active <y> regions
                     _L = tokens_np.shape[1]
@@ -785,7 +1007,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                             loss_val = loss_val + _mono_penalty * mono_loss
                     mode = 'tf-ref'
                 elif _use_joint:
-                    tokens = torch.tensor(tokens_np, device=device)
+                    if tokens_np is not None:
+                        tokens = torch.tensor(tokens_np, device=device)
                     if _jc['traj'] == 'ref':
                         logits = model(tokens, _jmask_k)
                         _jc0, _jc1 = _jpos_k['query_c0'], _jpos_k['query_c1']
@@ -810,6 +1033,135 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                                 for i in range(len(turn_nlls)-1))
                                 loss_val = loss_val + _mono_penalty * mono_loss
                         mode = f'tf-jref(k={_jk})'
+                    elif _jc['traj'] == 'online_ref':
+                        # --- I Q pass → teacher h ---
+                        tokens_iq = make_multi_batch(
+                            rng, B, _jc['n_blocks'], _jc['recall_from'],
+                            seg_len, slot_len, warmup_len, out_len, latent_len)
+                        tokens_iq_t = torch.tensor(tokens_iq, device=device)
+                        # Extract segments/warmup/target so I R Q shares same content
+                        segs, wm_np, tgt_np = extract_multi_batch(
+                            tokens_iq, _jc['iq_pos'], _jc['n_blocks'])
+                        # H positions = last encoding block's h slots
+                        _iq_h_pos = list(range(
+                            _jc['iq_pos']['blocks'][-1]['sl0'],
+                            _jc['iq_pos']['blocks'][-1]['sl1']))
+                        _jc_diff = (_jc.get('h_target', 'direct') == 'diff')
+                        # Sample k from fixed choices (e.g. [0, 4, 8]).
+                        # k=0 → standard I Q (no refine turns).
+                        # k>0 → run k teacher gradient steps + k refine turns,
+                        #        pairing turn t with h_teachers[t].
+                        _k_choices = _jc.get('n_attempts_choices',
+                                              list(range(_jc['n_attempts'] + 1)))
+                        _jk = int(rng.choice(_k_choices))
+                        _jpos_k, _jmask_k = _jc['ref_cache'][_jk]
+
+                        if _jk > 0:
+                            # Lazy-init running iter state from first online_ref jc seen
+                            if _teacher_iters is None:
+                                _teacher_iters     = _jc.get('teacher_max_iter', 100)
+                                _teacher_max_iters = _jc.get('teacher_max_max_iter', 1600)
+                            _teacher_lr       = _jc.get('teacher_lr', lr_max)
+                            _teacher_loss_thr = _jc.get('teacher_loss_threshold', 0.01)
+                            h_teachers, _broke, _stop_loss, _actual_iters = compute_teacher_trajectory(
+                                model, tokens_iq_t, _jc['iq_mask'],
+                                _iq_h_pos,
+                                _jc['iq_pos']['c0'], _jc['iq_pos']['c1'],
+                                log_probs_fn, _cur_ls,
+                                n_targets=_jk,
+                                max_iter=_teacher_iters,
+                                teacher_lr=_teacher_lr,
+                                loss_threshold=_teacher_loss_thr)
+                            _converged = '✓' if _broke else '✗'
+                            _log(f'  [teacher] k={_jk} iters={_actual_iters}/{_teacher_iters} loss={_stop_loss:.4f} {_converged}')
+                            # If clone didn't overfit, double max_iter for next batch
+                            if not _broke:
+                                _teacher_iters = min(_teacher_iters * 2, _teacher_max_iters)
+                                if _teacher_iters == _teacher_max_iters:
+                                    _log(f'  [teacher] hit max_iter ceiling {_teacher_max_iters}')
+                        else:
+                            h_teachers = []
+                            _stop_loss  = 0.0
+
+                        tokens_ref = make_refine_batch(
+                            rng, B, _jk, [0.0] * _jk,
+                            _jc['n_blocks'], _jc['recall_from'],
+                            seg_len, slot_len, warmup_len, out_len, latent_len,
+                            segs_batch=segs, wm_batch=wm_np, tgt_batch=tgt_np)
+                        tokens_ref_t = torch.tensor(tokens_ref, device=device)
+
+                        # Forward on I R Q, expose residual stream for h MSE loss
+                        logits_ref, x_ref = model(tokens_ref_t, _jmask_k,
+                                                   return_features=True)
+
+                        # NTP on post-refine query (primary loss, same as 'ref')
+                        _jc0, _jc1 = _jpos_k['query_c0'], _jpos_k['query_c1']
+                        lp_c   = log_probs_fn(logits_ref[:, _jc0-1:_jc1-1])
+                        tgts_c = tokens_ref_t[:, _jc0:_jc1]
+                        nll_c  = _positional_ls_nll(lp_c, tgts_c, _cur_ls)
+                        _l_ntp  = nll_c.mean()
+                        loss_val = _l_ntp
+                        _l_aux = _l_mono = _l_h = torch.zeros(1, device=device)[0]
+
+                        # Auxiliary NTP + monotonic penalty per attempt turn.
+                        # Each turn's y NLL vs clean GT must be non-increasing.
+                        _aux_w  = hp.get('aux_attempt_loss', 0.0)
+                        _mono_w = hp.get('mono_penalty', 0.0)
+                        if _jk > 0 and (_aux_w > 0.0 or _mono_w > 0.0):
+                            gt_clean  = tokens_ref_t[:, _jpos_k['copy_c0']:_jpos_k['copy_c1']]
+                            turn_nlls = []
+                            for _att in _jpos_k['attempts']:
+                                _att_lp  = log_probs_fn(logits_ref[:, _att['c0']-1:_att['c1']-1])
+                                _att_nll = _positional_ls_nll(_att_lp, gt_clean, _cur_ls)
+                                turn_nlls.append(_att_nll.mean())
+                            if _aux_w > 0.0:
+                                _l_aux = torch.stack(turn_nlls).mean()
+                                loss_val = loss_val + _aux_w * _l_aux
+                            if _mono_w > 0.0:
+                                turn_nlls_all = turn_nlls + [_l_ntp]
+                                _l_mono = sum(F.relu(turn_nlls_all[i+1] - turn_nlls_all[i])
+                                              for i in range(len(turn_nlls_all) - 1))
+                                loss_val = loss_val + _mono_w * _l_mono
+
+                        # MSE on h at each correction turn + final correction h.
+                        # Turn t is paired with h_teachers[min(t, n_h_steps-1)]:
+                        #   turn 0 → h_1* (after 1 gradient step)
+                        #   turn 1 → h_2* (after 2 gradient steps)
+                        #   ...
+                        # This enforces monotonic improvement: each turn aims at a
+                        # progressively better target in h-space.
+                        # direct: MSE(h_corr_t, h_t*)
+                        # diff:   MSE(h_enc + h_corr_t, h_t*) — residual add.
+                        _h_loss_w = _jc['h_loss_w']
+                        if _jk > 0 and _h_loss_w > 0.0:
+                            h_losses = []
+                            _enc_sl = _jpos_k['blocks'][0]
+                            h_enc_ref = (x_ref[:, _enc_sl['sl0']:_enc_sl['sl1'], :]
+                                         .detach() if _jc_diff else None)
+                            for _t, _att in enumerate(_jpos_k['attempts']):
+                                h_out  = x_ref[:, _att['sl0']:_att['sl1'], :]
+                                h_sup  = (h_enc_ref + h_out) if _jc_diff else h_out
+                                h_tgt  = h_teachers[min(_t, len(h_teachers) - 1)]
+                                h_losses.append(F.mse_loss(h_sup, h_tgt))
+                            _fin = _jpos_k['final']
+                            h_out_f = x_ref[:, _fin['sl0']:_fin['sl1'], :]
+                            h_sup_f = (h_enc_ref + h_out_f) if _jc_diff else h_out_f
+                            h_losses.append(F.mse_loss(h_sup_f, h_teachers[-1]))
+                            _l_h = torch.stack(h_losses).mean()
+                            loss_val = loss_val + _h_loss_w * _l_h
+
+                        _tgt_tag = 'diff' if _jc_diff else 'direct'
+                        _ti = _teacher_iters if _teacher_iters is not None else 0
+                        mode = f'tf-jonline-{_tgt_tag}(k={_jk},ti={_ti})'
+                        _online_stats = dict(
+                            teacher_iters=_ti,
+                            teacher_stop_loss=round(float(_stop_loss) if _jk > 0 else 0.0, 5),
+                            online_k=_jk,
+                            online_l_ntp=round(float(_l_ntp), 5),
+                            online_l_aux=round(float(_l_aux), 5),
+                            online_l_mono=round(float(_l_mono), 5),
+                            online_l_h=round(float(_l_h), 5),
+                        )
                     elif _jc['traj'] == 'int':
                         logits = model(tokens, _jc['mask'])
                         loss_parts = []
@@ -848,9 +1200,13 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
             if local_step % log_every == 0:
                 elapsed = time.time() - t0
-                _jlog(dict(global_step=global_step, stage=stage_i,
-                           loss=loss_f, bpb=loss_f/math.log(2), lr=lr, mode=mode,
-                           elapsed_s=round(elapsed, 1), elapsed=_fmt_elapsed(elapsed)))
+                _step_log = dict(global_step=global_step, stage=stage_i,
+                                 loss=loss_f, bpb=loss_f/math.log(2), lr=lr, mode=mode,
+                                 elapsed_s=round(elapsed, 1), elapsed=_fmt_elapsed(elapsed))
+                if _online_stats is not None:
+                    _step_log.update(_online_stats)
+                _jlog(_step_log)
+                _save_plot(os.path.join(run_dir, 'train.jsonl'))
                 log_f.write(str(pbar) + '\n')
                 print()
 
@@ -888,7 +1244,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 y_start = f_start + warmup_len
                 y_end   = min(y_start + out_len, seg_len)
 
-                _verbose_eval = hp.get('verbose_eval', False)
+                _verbose_eval = not hp.get('silent_eval', False)
                 _verbose_n    = hp.get('verbose_eval_n', 2)
 
                 def _fmt_bytes(seq):
@@ -896,14 +1252,50 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
                 cfg_results = {}
                 perfect_all = True
+                _n_eval_attempts = hp.get('eval_n_attempts', _n_attempts_max + 15)
+                # stop_early=False when eval_n_attempts is explicit — always run all turns
+                _eval_stop_early = 'eval_n_attempts' not in hp
+                _use_ref_eval = seq_mode == 'ref' or (seq_mode == 'joint' and _has_ref_joint)
+
+                # Overfit sanity check: first 2 fixed pool examples.
+                # A well-trained model should reach 100% on these training examples.
+                overfit_results = {}
+                if _overfit_examples and _use_ref_eval:
+                    ov_matches = []
+                    overfit_verbose = []
+                    for _oi, (_ov_xS, _ov_wm, _ov_tgt) in enumerate(_overfit_examples):
+                        with torch.no_grad():
+                            _ov_drafts, _ov_g, _ov_qg = ar_decode_refine(
+                                model, _ov_xS, slot_len, _ov_wm, len(_ov_tgt), device,
+                                n_attempts=_n_eval_attempts,
+                                latent_len=latent_len, mem_window=mem_window,
+                                target=_ov_tgt, stop_early=False)
+                        _ov_m  = round(100 * (1 - cer(_ov_g, _ov_tgt)), 1)
+                        _ov_qm = round(100 * (1 - cer(_ov_qg, _ov_tgt)), 1)
+                        overfit_results[f'overfit_{_oi}_final'] = _ov_m
+                        overfit_results[f'overfit_{_oi}_query'] = _ov_qm
+                        ov_matches.append(_ov_m)
+                        overfit_verbose.append((_ov_wm, _ov_tgt, _ov_drafts, _ov_g, _ov_qg))
+                    _ov_mean = round(sum(ov_matches) / len(ov_matches), 1)
+                    overfit_results['overfit_mean'] = _ov_mean
+                    _log(f'  [overfit] {" ".join(f"ex{i}={m}%" for i,m in enumerate(ov_matches))}  mean={_ov_mean}%')
+                    for _oi, (_ov_wm_i, _ov_tgt_i, _ov_drafts_i, _ov_g_i, _ov_qg_i) in enumerate(overfit_verbose):
+                        _log(f'    [ov{_oi}] wm={_fmt_bytes(list(_ov_wm_i))}')
+                        _log(f'      gt={_fmt_bytes(list(_ov_tgt_i))}')
+                        for k, d in enumerate(_ov_drafts_i):
+                            _m = round(100*(1-cer(d, _ov_tgt_i)), 1)
+                            _log(f'      t{k+1}: {_fmt_bytes(d)}  ({_m}%)')
+                        _m = round(100*(1-cer(_ov_g_i, _ov_tgt_i)), 1)
+                        _log(f'      fin: {_fmt_bytes(list(_ov_g_i))}  ({_m}%)')
+                        _mq = round(100*(1-cer(_ov_qg_i, _ov_tgt_i)), 1)
+                        _log(f'      qry: {_fmt_bytes(list(_ov_qg_i))}  ({_mq}%)')
+
                 for eval_nb, eval_rf in eval_configs:
                     all_c = []
-                    # per-turn CER lists for refine mode: all_drafts[k] = CER list for draft turn k
-                    # Eval with n_eval_attempts = max_train + 2 to test extrapolation
-                    _n_eval_attempts = _n_attempts_max + 2
-                    _use_ref_eval = seq_mode == 'ref' or (seq_mode == 'joint' and _has_ref_joint)
                     all_drafts = [[] for _ in range(_n_eval_attempts)] if _use_ref_eval else []
-                    verbose_examples = []   # (sname, wm, tgt, drafts_or_None, g)
+                    all_query_c = []  # match% for post-refine query path
+                    first_100_counts = []
+                    verbose_examples = []
                     for sname, x_S in test_seqs.items():
                         wm = x_S[max(0, y_start - warmup_len):y_start]
                         if len(wm) < warmup_len:
@@ -911,13 +1303,17 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         tgt = x_S[y_start:y_end]
                         with torch.no_grad():
                             if _use_ref_eval:
-                                drafts, g = ar_decode_refine(
+                                drafts, g, query_g = ar_decode_refine(
                                     model, x_S, slot_len, wm, len(tgt), device,
                                     n_attempts=_n_eval_attempts,
-                                    latent_len=latent_len, mem_window=mem_window)
+                                    latent_len=latent_len, mem_window=mem_window,
+                                    target=tgt, stop_early=_eval_stop_early)
                                 for k, d in enumerate(drafts):
                                     if k < len(all_drafts):
                                         all_drafts[k].append(cer(d, tgt))
+                                all_query_c.append(cer(query_g, tgt))
+                                hit = next((k+1 for k, d in enumerate(drafts) if cer(d, tgt) == 0), None)
+                                first_100_counts.append(hit)
                             else:
                                 drafts = None
                                 g = ar_decode_role(model, x_S, slot_len, wm, len(tgt), device,
@@ -932,8 +1328,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     ok = '✓' if mean_c == 0.0 else '✗'
                     if mean_c != 0.0: perfect_all = False
                     if all_drafts:
-                        # Per-turn match% and monotonicity check
-                        turn_matches = [round(100*(1 - sum(c)/len(c)), 1) for c in all_drafts]
+                        # Per-turn match% — skip empty slots (sequences that stopped early)
+                        turn_matches = [round(100*(1 - sum(c)/len(c)), 1) for c in all_drafts if c]
                         final_match  = round(100*(1 - mean_c), 1)
                         all_matches  = turn_matches + [final_match]
                         monotonic    = all(all_matches[i] <= all_matches[i+1]
@@ -943,13 +1339,29 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                             cfg_results[f'{key}_t{k+1}'] = m
                         step_str = '  '.join(f't{k+1}={m:.1f}%' for k,m in enumerate(turn_matches))
                         delta    = round(final_match - turn_matches[0], 1)
+                        # 100%-reached summary: fraction of seqs that hit 100%, and median turn
+                        n_hit = sum(1 for h in first_100_counts if h is not None)
+                        pct_hit = round(100 * n_hit / len(first_100_counts), 0) if first_100_counts else 0
+                        hit_turns = [h for h in first_100_counts if h is not None]
+                        med_turn  = round(sum(hit_turns)/len(hit_turns), 1) if hit_turns else '-'
+                        cfg_results[f'{key}_pct100'] = pct_hit
+                        cfg_results[f'{key}_med_turn'] = med_turn if hit_turns else 0
+                        # Post-refine query match% (V1 check: both paths must reach 100%)
+                        if all_query_c:
+                            query_match = round(100 * (1 - sum(all_query_c) / len(all_query_c)), 1)
+                            cfg_results[f'{key}_query'] = query_match
+                            query_str = f'  query={query_match:.1f}%'
+                        else:
+                            query_str = ''
                         _log(f'  {ok} {mono_flag} n={eval_nb} rf={eval_rf}'
-                             f'  {step_str}  final={final_match:.1f}%  Δ={delta:+.1f}%')
+                             f'  {step_str}  final={final_match:.1f}%  Δ={delta:+.1f}%'
+                             f'  100%={pct_hit:.0f}%seqs@avg_t{med_turn}{query_str}')
                     else:
                         _log(f'  {ok} n={eval_nb} rf={eval_rf}  match={100*(1-mean_c):.1f}%')
                     if _verbose_eval:
                         for sname, wm, tgt, drafts, g in verbose_examples:
-                            _log(f'    [{sname}] wm={_fmt_bytes(wm)}  gt={_fmt_bytes(tgt)}')
+                            _log(f'    [{sname}] wm={_fmt_bytes(wm)}')
+                            _log(f'      gt={_fmt_bytes(tgt)}')
                             if drafts:
                                 for k, d in enumerate(drafts):
                                     _match = round(100*(1-cer(d, tgt)), 1)
@@ -960,10 +1372,11 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 _jlog_d = dict(global_step=global_step, stage=stage_i, loss=loss_f,
                                val_loss=val_loss, val_bpb=val_bpb,
                                elapsed_s=round(elapsed, 1), elapsed=_fmt_elapsed(elapsed),
-                               **cfg_results)
+                               **cfg_results, **overfit_results)
                 if val_ref_bpb is not None:
                     _jlog_d['val_ref_bpb'] = round(val_ref_bpb, 5)
                 _jlog(_jlog_d)
+                _save_plot(os.path.join(run_dir, 'train.jsonl'))
 
                 if perfect_all:
                     _log(f'\n★ PERFECT (all eval configs) at stage {stage_i} step={local_step}!')
@@ -1029,7 +1442,7 @@ DEFAULTS = dict(
     rope=True, yarn=True, grok=False, seed=42,
     
     ocd=False, ocd_prob=0.01, tf_warmup=0,
-    grad_clip=10.0, dataset_size=5000,
+    grad_clip=10.0, dataset_size=-1,
     stablemax=False, eval_offset=0.25,
     grad_checkpoint=False,
     mem_window=-1,  # -1=full history; 1=isolated; N=window
@@ -1169,9 +1582,19 @@ if __name__ == '__main__':
         eval_offset = hp.get('eval_offset', 0.25)
         eval_cfgs  = hp.get('eval_configs', [(1, 0)])
         test_seqs  = make_test_sequences(seg_len)
-        _eval_mode = 'ref' if any(s.get('mode') == 'ref'
-                                   for s in hp.get('curriculum', [])) else 'end'
-        _n_attempts_eval = _cur0.get('n_attempts', _cur0.get('n_draft_turns', 1)) + 2
+        def _stage_has_ref(s):
+            if s.get('mode') == 'ref':
+                return True
+            if s.get('mode') == 'joint':
+                return any(jm.get('traj') in ('ref', 'online_ref')
+                           for jm in s.get('joint_mix', []))
+            return False
+        _eval_mode = 'ref' if any(_stage_has_ref(s) for s in hp.get('curriculum', [])) else 'end'
+        _jmix_ref = next((jm for jm in _cur0.get('joint_mix', [])
+                          if jm.get('traj') in ('ref', 'online_ref')), None)
+        _n_attempts_eval = hp.get('eval_n_attempts',
+                                   (_jmix_ref or _cur0).get('n_attempts',
+                                   _cur0.get('n_draft_turns', 1)) + 2)
         print(f'Checkpoint: {args.eval_only}  (stage={ckpt.get("stage","?")}  step={ckpt.get("step","?")})')
         for nb, rf in eval_cfgs:
             all_c = []
@@ -1183,7 +1606,7 @@ if __name__ == '__main__':
                 if len(wm) < warmup_len: wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
                 tgt = x_S[y_start:y_end]
                 if _eval_mode == 'ref':
-                    drafts, g = ar_decode_refine(model, x_S, slot_len, wm, y_end - y_start,
+                    drafts, g, _qg = ar_decode_refine(model, x_S, slot_len, wm, y_end - y_start,
                                                  device, n_attempts=_n_attempts_eval,
                                                  latent_len=latent_len, mem_window=mem_window)
                     for k, d in enumerate(drafts):

@@ -762,13 +762,37 @@ def make_mask_refine(n_attempts: int, n_blocks: int, seg_len: int,
     return np.where(visible, 0.0, -1e9).astype(np.float32)
 
 
+def extract_multi_batch(tokens_np: np.ndarray, pos: dict, n_blocks: int) -> tuple:
+    """
+    Extract (segs, wm, tgt) from a make_multi_batch result.
+
+    segs : (B, n_blocks, seg_len) int64  — raw source segments per block
+    wm   : (B, warmup_len) int64         — warmup tokens (query anchor)
+    tgt  : (B, out_len) int64            — output target tokens
+
+    Used by online_ref trajectory to share segments/targets between the I Q pass
+    (for teacher h computation) and the I R Q pass (for correction training).
+    """
+    B = tokens_np.shape[0]
+    seg_len = pos['blocks'][0]['s1'] - pos['blocks'][0]['s0']
+    segs = np.zeros((B, n_blocks, seg_len), dtype=tokens_np.dtype)
+    for k, b in enumerate(pos['blocks']):
+        segs[:, k, :] = tokens_np[:, b['s0']:b['s1']]
+    wm  = tokens_np[:, pos['f0']:pos['f1']]
+    tgt = tokens_np[:, pos['c0']:pos['c1']]
+    return segs, wm, tgt
+
+
 def make_refine_batch(rng: np.random.Generator, B: int,
                       n_attempts: int, noise_schedule,
                       n_blocks: int, recall_from: int,
                       seg_len: int, slot_len: int,
                       warmup_len: int, out_len: int,
                       latent_len: int = 0,
-                      noise_skew: bool = False) -> np.ndarray:
+                      noise_skew: bool = False,
+                      segs_batch: np.ndarray | None = None,
+                      wm_batch: np.ndarray | None = None,
+                      tgt_batch: np.ndarray | None = None) -> np.ndarray:
     """
     Build refine batch.
 
@@ -778,6 +802,12 @@ def make_refine_batch(rng: np.random.Generator, B: int,
     Final turn: always noise=0 (clean ground truth), trains the copy mechanism.
 
     n_attempts=0: sequence identical to standard single-pass recall, just <r> tag.
+
+    segs_batch : (B, n_blocks, seg_len) optional — pre-sampled source segments.
+                 If provided, skips internal segment sampling.
+    wm_batch   : (B, warmup_len) optional — pre-sampled warmup tokens.
+    tgt_batch  : (B, out_len) optional — pre-sampled output targets.
+                 wm_batch and tgt_batch must be provided together.
 
     Returns (B, L) int64.
     """
@@ -793,7 +823,10 @@ def make_refine_batch(rng: np.random.Generator, B: int,
     out_arr  = np.zeros((B, L), dtype=np.int64)
 
     for i in range(B):
-        segs = [_sample_seg(rng, seg_len) for _ in range(n_blocks)]
+        if segs_batch is not None:
+            segs = [segs_batch[i, k] for k in range(n_blocks)]
+        else:
+            segs = [_sample_seg(rng, seg_len) for _ in range(n_blocks)]
 
         # Encoding blocks
         for k, b in enumerate(base['blocks']):
@@ -809,16 +842,21 @@ def make_refine_batch(rng: np.random.Generator, B: int,
             out_arr[i, b['sl0']:b['sl1']]           = slot_ids
             out_arr[i, b['sl1']:b['mc1']]           = MEM_CLOSE
 
-        # Ground truth
-        seg_r    = segs[recall_from]
-        y_start  = int(rng.integers(0, n_win + 1))
-        y_end    = min(y_start + out_len, seg_len)
-        alen     = y_end - y_start
-        w_st     = max(0, y_start - warmup_len)
-        wm       = seg_r[w_st:y_start]
-        if len(wm) < warmup_len:
-            wm = np.concatenate([np.full(warmup_len - len(wm), seg_r[0], dtype=np.int32), wm])
-        y_ref    = seg_r[y_start:y_end]
+        # Ground truth — use pre-sampled wm/tgt if provided, else sample fresh
+        if wm_batch is not None and tgt_batch is not None:
+            wm    = wm_batch[i]
+            y_ref = tgt_batch[i]
+            alen  = len(y_ref)
+        else:
+            seg_r    = segs[recall_from]
+            y_start  = int(rng.integers(0, n_win + 1))
+            y_end    = min(y_start + out_len, seg_len)
+            alen     = y_end - y_start
+            w_st     = max(0, y_start - warmup_len)
+            wm       = seg_r[w_st:y_start]
+            if len(wm) < warmup_len:
+                wm = np.concatenate([np.full(warmup_len - len(wm), seg_r[0], dtype=np.int32), wm])
+            y_ref    = seg_r[y_start:y_end]
 
         # Warmup: <r>wm</r>
         out_arr[i, pos['r_open']:pos['r0']] = REFINE_OPEN

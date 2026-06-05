@@ -43,7 +43,7 @@ hp = dict(
         noise_schedule=None,
         B=16,
         n_steps=80000,
-        dataset_size=0,
+        dataset_size=-1,
     )],
     eval_configs=[(1, 0)],
 )

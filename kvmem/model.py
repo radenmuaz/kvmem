@@ -230,22 +230,36 @@ class KVMemModel(nn.Module):
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor,
                 past_kv: list | None = None,
                 return_kv: bool = False,
-                offset: int = 0) -> torch.Tensor | tuple:
+                offset: int = 0,
+                return_features: bool = False,
+                h_inject: dict | None = None) -> torch.Tensor | tuple:
         """
-        tokens   : (B, L) or (L,) int64
-        mask     : (L_q, L_kv) — L_kv = L_past + L when past_kv given
-        past_kv  : list[n_layers] of (K_past, V_past) — cached prefix KV
-        return_kv: return (logits, kv_list) instead of just logits
-        offset   : RoPE position offset (= L_past for suffix pass)
+        tokens          : (B, L) or (L,) int64
+        mask            : (L_q, L_kv) — L_kv = L_past + L when past_kv given
+        past_kv         : list[n_layers] of (K_past, V_past) — cached prefix KV
+        return_kv       : return (logits, kv_list) instead of just logits
+        return_features : return (logits, x) where x is the pre-head residual stream
+                          (B, L, d); disables grad_checkpoint to preserve full graph.
+        offset          : RoPE position offset (= L_past for suffix pass)
+        h_inject        : dict mapping (sl0, sl1) → (B, slot_len, d) tensor.
+                          Overrides the embedding at x[:, sl0:sl1, :] after _embed()
+                          but before transformer blocks. Used by diff-residual inference
+                          to inject the accumulated h (h_enc + sum of prior deltas) at
+                          each correction turn's h positions.
 
         grad_checkpoint=True: checkpoint each block during backward (depth-only).
           Saves residual activations between layers; attention matrix is unchanged.
-          Only active when self.training and past_kv is None and not return_kv.
+          Only active when self.training and past_kv is None and not return_kv and
+          not return_features (features need the full graph).
         """
         batched = tokens.dim() == 2
         if not batched:
             tokens = tokens.unsqueeze(0)
         x      = self._embed(tokens)
+        if h_inject is not None:
+            for (sl0, sl1), h_val in h_inject.items():
+                x = x.clone()  # avoid in-place autograd error
+                x[:, sl0:sl1, :] = h_val
         kv_out = []
         L_past = past_kv[0][0].shape[2] if past_kv is not None else 0
         _offset = offset if offset else L_past
@@ -253,7 +267,7 @@ class KVMemModel(nn.Module):
         for i, block in enumerate(self.blocks):
             pkv = past_kv[i] if past_kv is not None else None
             use_ckpt = (self.grad_checkpoint and self.training
-                        and pkv is None and not return_kv)
+                        and pkv is None and not return_kv and not return_features)
             if use_ckpt:
                 # Checkpoint this block: discard intermediate activations,
                 # recompute in backward. mask must not require grad.
@@ -270,6 +284,9 @@ class KVMemModel(nn.Module):
         logits = self.W_out(self.norm_out(x))
         if not batched:
             logits = logits.squeeze(0)
+            x = x.squeeze(0)
+        if return_features:
+            return logits, x
         if return_kv:
             return logits, kv_out
         return logits

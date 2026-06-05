@@ -43,7 +43,7 @@ hp = dict(
         noise_schedule=[(0.05, 0.8)],
         B=16,
         n_steps=80000,
-        dataset_size=0,  # infinite stream
+        dataset_size=-1,  # infinite stream
     )],
     eval_configs=[(1, 0)],
 )

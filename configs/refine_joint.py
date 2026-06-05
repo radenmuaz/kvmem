@@ -27,10 +27,10 @@ hp = dict(
     eval_every=2000, log_every=500,
     ocd=False, ocd_prob=0.0,
     rope=True, yarn=True, grok=False,
-    stablemax=False, eval_offset=0.0, grad_clip=10.0,
+    stablemax=False, eval_offset=0.0, grad_clip=10.0,  # eval_offset=0 → y_start=warmup_len=4
     null_kv=True,
     compile=False,
-    verbose_eval=True,
+    silent_eval=False,   # set True to suppress per-attempt hex output
     verbose_eval_n=2,
     # Diffusion-style denoising:
     noise_skew=True,          # draft noise: linear ramp 0→2p (low at start, high at end)
@@ -44,7 +44,7 @@ hp = dict(
     seed=42,
     curriculum=[dict(
         seg_len=16, slot_len=1, warmup_len=4,
-        out_len=-1,             # full segment recall
+        out_len=12,             # full segment: warmup(4) + out(12) = seg_len(16)
         latent_len=7, mem_window=-1,
         mode='joint',
         joint_mix=[
@@ -56,7 +56,7 @@ hp = dict(
         ],
         B=16,
         n_steps=80000,
-        dataset_size=0,
+        dataset_size=-1,
     )],
     eval_configs=[(1, 0), (2, 0), (2, 1)],
 )

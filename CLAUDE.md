@@ -1,484 +1,141 @@
-# kvmem — Project Notes for Claude
+# kvmem
 
-## Vision
-
-**A model that reads any document once and answers any question about it — without storing the document, without backprop, and without retraining.**
-
-The `<h>` hidden state is a compressed fast-weight representation of whatever was ingested. At inference, base weights are frozen. Reading = forward passes that update `<h>`. Querying = NTP from a warmup prefix.
-
-**Instruction following without fine-tuning:** Feed the IT dataset as a corpus. Fast weights compress the instruction-answer patterns. Query with `"Q: [instruction]\nA: "` as the NTP warmup. This is **compressed few-shot learning** — N examples in O(slot_len) tokens instead of O(N × example_len).
-
-**Theoretical ceiling:**
-> Ingest any corpus forward-pass-only, answer arbitrary queries at quality comparable to a full-context LLM — but in O(slot_len) memory instead of O(corpus_length) KV cache.
+Fast-weight language model. `<h>` = compressed memory updated by forward passes, no backprop.
+Full reference: [`docs/BOOK.md`](docs/BOOK.md)
 
 ---
 
-## Primary Goal
+## Status
 
-**Learn in-context LM without backprop.**
+**Exp 4a done (step 8k)** — online_refine, seg=16, out=12. `configs/online_refine.py`
 
-Base weights learn one thing: *how to update `<h>` fast weights so `<y>` predictions improve.*
+| Metric | Value |
+|--------|-------|
+| val_bpb | 0.082 |
+| n1_r0 t1 | **100%** exact match (all 8 seqs) |
+| n1_r0 final | **100%** |
 
-```
-train BPB ≈ val BPB    →  generalised: learned the algorithm
-train BPB << val BPB   →  memorised
-val BPB → entropy(corpus)  →  milestone: compression is effective
-```
+**Key finding:** Teacher h training (gradient-guided h targets, zero-noise teacher force) fixes correction divergence. Converges to 100% in single refine turn by step 8k.
 
-**Windowed recall on random bytes** is a diagnostic task (entropy=8 bits/byte). Progression:
-1. Random bytes → verify mechanism ← *current*
-2. Structured text with line numbers → content-addressable retrieval
-3. Natural language corpus → LM prior learning
-4. Cross-corpus generalisation → real milestone
+**Current:** Exp 4b — harder test `src=64, out=56, slot=1, latent=3`. `configs/online_refine_64.py`
+- k sampled from {0, 4, 8} turns; teacher runs k gradient steps, pairs turn t with h_t*
+- Expect t1 < 100%, multi-turn correction visible
+- If 64 too easy (t1=100%): try src=128, or src=64 out=60 (warmup=4), or slot_len=0 (latent only)
+- If 64 too hard (no convergence): try src=32 out=24, or src=64 out=48 (more warmup context)
+- If error signal unclear: tune lengths until multi-turn improvement is visible, then ablate
+- eval_n_attempts=20 to test extrapolation beyond trained max (8 turns)
 
-Self-correction and ground truth are a **means**, not an end. OCD/correction trains the `<h>` update rule.
+Checkpoints:
+- `logs/role_refine_joint/checkpoints/stage0_end.pt` (Exp 3c.2 baseline)
+- `logs/role_online_refine/checkpoints/stage0_end.pt` (Exp 4a, 100% at t1)
 
 ---
 
-## CLI Reference
+## Ablations TODO
+
+### A1 — `<r>` vs `<q>` tag fusion
+**Question:** should refine mode use a separate `<r>` anchor tag, or fuse with `<q>`?
+
+**Current:** `<r>` (ID 266) is used as the refine warmup anchor, distinct from `<q>` (ID 260).
+The model can learn that seeing `<r>` means "correction turns will follow" and adjust t1 behavior.
+
+**Fused:** replace all `REFINE_OPEN/CLOSE` with `QUERY_OPEN/CLOSE` in `make_refine_batch` (data.py).
+- Pro: t1 is always the model's best single-shot attempt (same behavior as IQ)
+- Pro: simpler — one fewer pair of tag embeddings to learn
+- Con: model can't distinguish "final answer" from "first attempt" mode
+- Implementation: one-line change per tag in data.py, no vocab change
+
+**Hypothesis:** fused is better — teacher h training already drives correction quality through
+MSE loss, not through the tag. A "lazy first attempt" behavior under `<r>` would hurt t1 quality.
+
+### A2 — diff residual target
+**Question:** supervise correction h to output delta (-lr·grad) vs direct updated h (h - lr·grad)?
+
+**Diff:** MSE(h_enc + h_corr_t, h_teacher) — model learns correction delta, needs residual add at inference.
+**Direct (current):** MSE(h_corr_t, h_teacher) — model learns absolute target h directly.
+
+**Hypothesis:** direct simpler and no residual add needed at inference. Diff may help if correction
+blocks naturally learn incremental updates.
+
+### V1 — verify both refine and query paths reach 100%
+**Check:** at eval, two independent outputs must both match 100%:
+1. Last refine attempt (`all_attempts[-1]` from `ar_decode_refine`) — currently logged as `n1_r0_tN`
+2. Post-refine query (`<q>wm</q><y>` decode after copy+final-h) — currently only NTP loss `val_ref_bpb`, NOT a match%
+
+**Implementation needed:** extend `ar_decode_refine` to continue past the last attempt:
+- Write last attempt as copy turn input
+- Let model generate final `<h>` correction block
+- AR decode `<q>wm</q><y>` under the refine mask
+- Report this as a separate `n1_r0_query` match% in eval
+
+**Why it matters:** training loss is on the query path, not the attempt path. If query=100% but attempt<100% (or vice versa), the two paths disagree — suggests the h correction works on one path but not the other.
+
+### A3 — progressive teacher steps vs fixed target
+**Current:** teacher runs k gradient steps (same as sampled k), pairs turn t with h_t*.
+**Alternative:** always 1 teacher step → same h_teacher for all turns (monotonicity from mono_penalty only).
+
+**Hypothesis:** progressive targets enforce monotonicity in h-space directly, should be stronger than
+token-NLL mono_penalty alone.
+
+---
+
+## Run
 
 ```bash
-# Standard training:
-python -m kvmem.train --config configs/expB_chain_nullkv.py --device mps
-
-# Eval only — load checkpoint, run eval_configs, print results, exit:
-python -m kvmem.train --config configs/expB_chain_nullkv.py \
-  --eval-only logs/role_<name>/checkpoints/stage0_end.pt --device mps
-
-# Resume — full state (weights + optimizer + rng, exact continuation):
-python -m kvmem.train --config configs/expB_chain_nullkv.py \
-  --resume logs/role_<name>/checkpoints/stage0_end.pt --device mps
-
-# Pretrained weights only — fresh training with warm init, no optimizer/rng restore:
-python -m kvmem.train --config configs/expB_chain_nullkv.py \
-  --pretrained logs/role_<name>/checkpoints/stage0_end.pt --device mps
+python -m kvmem.train --config configs/refine_joint.py --device mps
+python -m kvmem.train --config <cfg> --eval-only <ckpt> --device mps
+python -m kvmem.train --config <cfg> --resume <ckpt> --device mps
+python -m kvmem.train --config <cfg> --pretrained <ckpt> --device mps
 ```
-
-**Checkpoint contents (full resume state):**
-`model`, `opt`, `hp`, `stage`, `step`, `global_step`, `rng_np`, `rng_torch`
 
 ---
 
-## Monitoring Runs
-
-**Always print the tail command immediately after starting any training run.**
-Task output path: `/private/tmp/claude-501/-Users-muaz-code-kvmem/5692f5ae-ec99-4edc-ac10-e65f033b3e3d/tasks/<task_id>.output`
+## Monitor
 
 ```bash
-# Live tqdm output (give this cmd every time a run starts):
-tail -f /private/tmp/claude-501/-Users-muaz-code-kvmem/5692f5ae-ec99-4edc-ac10-e65f033b3e3d/tasks/<task_id>.output
-
-# Structured eval metrics only:
+# Refine mode — val_ref_bpb is the primary signal:
 tail -f logs/role_<name>/train.jsonl | python3 -c "
-import sys,json
-for l in sys.stdin:
-    d=json.loads(l)
-    keys=sorted(k for k in d if k.startswith('n') and '_r' in k)
-    if keys: print(f's={d[\"stage\"]} @{d[\"global_step\"]}: ' + '  '.join(f'{k}={d[k]:.0f}%' for k in keys))
-"
-```
-
-Current run: **none** (Exp 3c done)
-```bash
-# Joint refine metrics:
-tail -f logs/role_refine_joint/train.jsonl | python3 -c "
 import sys,json
 for l in sys.stdin:
     d=json.loads(l)
     if 'val_ref_bpb' in d:
         t_keys=sorted(k for k in d if k.startswith('n1_r0_t'))
         tstr=' '.join(f'{k}={d[k]}%' for k in t_keys)
-        print(f'@{d[\"global_step\"]}: val_bpb={d[\"val_bpb\"]:.3f} val_ref_bpb={d[\"val_ref_bpb\"]:.3f} n1_r0={d.get(\"n1_r0\",\"?\")}% {tstr} {d[\"elapsed\"]}')
+        print(f'@{d[\"global_step\"]}: vbpb={d[\"val_bpb\"]:.3f} vrbpb={d[\"val_ref_bpb\"]:.3f} n1={d.get(\"n1_r0\",\"?\")}% {tstr} {d[\"elapsed\"]}')
+"
+
+# Standard mode — match%:
+tail -f logs/role_<name>/train.jsonl | python3 -c "
+import sys,json
+for l in sys.stdin:
+    d=json.loads(l)
+    keys=sorted(k for k in d if k.startswith('n') and '_r' in k)
+    if keys: print(f'@{d[\"global_step\"]}: ' + '  '.join(f'{k}={d[k]:.0f}%' for k in keys))
 "
 ```
 
-**Performance note — eval overhead:**
-AR decode eval (7 attempts × 16 tokens × 3 configs × N test seqs) takes ~10 min per checkpoint on MPS.
-Pure training: 41 it/s → 80k steps ≈ 32 min. Total with eval every 2000 steps: **6h43m**.
-Fix for future runs: set `eval_every=10000` or omit verbose AR decode — `val_ref_bpb` alone is sufficient signal.
+**Performance:** 41 it/s training. AR decode eval ~10 min/checkpoint. Use `eval_every=10000`.
 
 ---
 
-## Current Status (2026-06-05)
+## Key Principles
 
-**Exp 3c done** — `configs/refine_joint.py`, 80k steps, 6h43m total.
-
-| Metric | Value | Meaning |
-|--------|-------|---------|
-| val_ref_bpb | **0.025** | NLL on post-refine `<q><y>` — better than Exp 3a (0.063) |
-| val_bpb | 0.14 | IQ recall — no regression from joint training |
-| t1 match% | ~77% | First AR attempt — memory encoding working |
-| t2 match% | ~77% | Second attempt ≥ t1 — correction is helping |
-| t3 match% | ~81% | Third attempt — monotonically improving |
-
-Sawtooth (t1→t2 collapse) **fixed** at step 32k by `aux_attempt_loss`. Monotonic t1≤t2≤t3 holds at convergence. Joint training preserved IQ (val_bpb=0.14) while learning refine.
+- `null_kv=True` always — 1.5–2× faster, better bpb
+- `dataset_size=0` (infinite stream) — fastest convergence
+- `mode='joint'` for mixed trajectories — prevents regression
+- `aux_attempt_loss=0.3` for refine — necessary but not sufficient; fixes teacher-forced sawtooth but AR eval still diverges
+- flat noise (`noise_lo/hi`) — same range all draft turns; synthetic noise still mismatches model's own correlated AR errors
+- `out_len < seg_len` required — full recall (`out_len=seg_len`) leaves no prior context for NTP warmup
+- `eval_every=10000` — `val_ref_bpb` is sufficient live signal
 
 ---
 
-## Architecture (v2)
-
-Snapshot of prior code: `kvmem/old/v1/`
-
-**Tag vocabulary — RNN/DB style:**
-
-| Tag | Name | Meaning | Causal access |
-|-----|------|---------|---------------|
-| `<x>` | input | source data | sees prior only |
-| `<z>` | latent | intermediate learned representation before compression | sees x + prior h |
-| `<h>` | hidden | fast-weight memory (KV bank) | sees x + z |
-| `<q>` | query | warmup anchor (user-facing) | sees h only (x,z blocked) |
-| `<y>` | output | retrieved value (user-facing final) | sees h + q (x,z blocked) |
-| `<r>` | refine anchor | warmup for refine mode (like `<q>`, appears once) | sees h only (x,z blocked) |
-
-**Attention masks — successful experiments:**
-
-*Exp 1–B: Standard recall* `<x><z><h><q><y>` (single block)
-
-| | `<x>` | `<z>` | `<h>` | `<q>` | `<y>` |
-|---|---|---|---|---|---|
-| `<x>` | ✓ | | | | |
-| `<z>` | ✓ | ✓ | | | |
-| `<h>` | ✓ | ✓ | ✓ | | |
-| `<q>` | | | ✓ | ✓ | |
-| `<y>` | | | ✓ | ✓ | ✓ |
-
-*Exp 2/B: Multi-block recall* `<x1><z1><h1><x2><z2><h2><q><y>` (`<h2>` blocked from `<x1><z1>`)
-
-| | `<x1>` | `<z1>` | `<h1>` | `<x2>` | `<z2>` | `<h2>` | `<q>` | `<y>` |
-|---|---|---|---|---|---|---|---|---|
-| `<x1>` | ✓ | | | | | | | |
-| `<z1>` | ✓ | ✓ | | | | | | |
-| `<h1>` | ✓ | ✓ | ✓ | | | | | |
-| `<x2>` | ✓ | | | ✓ | | | | |
-| `<z2>` | ✓ | ✓ | ✓ | ✓ | ✓ | | | |
-| `<h2>` | | | ✓ | ✓ | ✓ | ✓ | | |
-| `<q>` | | | ✓ | | | ✓ | ✓ | |
-| `<y>` | | | ✓ | | | ✓ | ✓ | ✓ |
-
-*Exp 3a: Refine Stage A* `<x><z><h><q><r><q><y>` (draft `<r>` visible to final `<y>`)
-
-| | `<x>` | `<z>` | `<h>` | `<q1>` | `<r>` | `<q2>` | `<y>` |
-|---|---|---|---|---|---|---|---|
-| `<x>` | ✓ | | | | | | |
-| `<z>` | ✓ | ✓ | | | | | |
-| `<h>` | ✓ | ✓ | ✓ | | | | |
-| `<q1>` | | | ✓ | ✓ | | | |
-| `<r>` | | | ✓ | ✓ | ✓ | | |
-| `<q2>` | | | ✓ | ✓ | ✓ | ✓ | |
-| `<y>` | | | ✓ | ✓ | ✓ | ✓ | ✓ |
-
-**Note on `<z>` and diff:** `<z>_t` in block t comes after `<h>_{t-1}` in sequence order, so it can attend to the prior memory state causally. This gives `<z>` the architectural capacity to compute diffs — encoding only what's new in `<x>_t` relative to `<h>_{t-1}` — without any extra tokens or mask changes. Whether it learns to use this depends on training pressure (multi-block recall with retention requirements).
-
-Extended CRUD ops (planned): `<u>` update, `<d>` diff, `<c>` commit, `<s>` seek, `<n>` next.
-
-**Sequence:** `<x>src</x>[<z>z_0..z_P</z>]<h>h_0..h_N</h><q>warmup</q><y>output</y>`
-
-All attention is **pure causal** — no non-causal overrides. `<q>/<y>` are explicitly blocked from x and z, forced through `<h>` bottleneck. `<y>` is write-only.
-
-**Bottleneck:** `slot_len` directly (no `active_slots` masking). `slot_len=1, latent_len=7` ≈ v1's `slot_len=8, active_slots=1`.
-
-**Vocab:** V_in = 256 + 12 + slot_len + latent_len (auto-computed). V_out = 256 (data bytes only).
-Note: vocab expanded from 10→12 boundary tags when `<r>/<r>` (IDs 266/267) were added. HIDDEN_SLOT_BASE shifted from 266→268. Old checkpoints (V=274) are incompatible with new code (V=276 for slot=1,latent=7).
-- `data_embed: Embedding(256, d)` — data bytes (std=0.02)
-- `special_embed: Embedding(V_in-256, d)` — boundary tags + slot IDs (std=0.05)
-
-**Slot token scheme — three options:**
-- **Dedicated indexed** (current, K=slot_len): slot i → `266+i`. Unique V per slot, zero collision. Vocab grows with slot_len. No extrapolation beyond training slot_len.
-- **Dedicated cyclic** (K < slot_len): slot i → `266 + (i % K)`. K dedicated IDs above 255 cycle over all slots. Fixed vocab (K tokens), zero collision, extrapolates to arbitrary slot_len. Best design for scaling.
-- **Looped byte** (style A): slot i → `i % 256`. Fixed vocab=256, extrapolates, but collides with data bytes.
-
-**Dedicated cyclic is the right choice for scaling.** K is the "slot vocab budget" — train with K=8, infer with slot_len=1024 using the same 8 IDs cycling, RoPE carries absolute position. Current code uses dedicated indexed (K=slot_len=1 for now, so no practical difference). `make_hidden_slot_ids(slot_len, cycle_len=slot_len)` — set `cycle_len=8` before scaling.
-
-**null_kv=True (recommended):** appends fixed (K=0, V=0) to every attention head before softmax. Zero-score "abstain" option. Result: 1.5-2× faster convergence, better peak bpb (0.157 vs 0.217 base). Set `null_kv=True` in hp or `--null-kv` CLI flag.
-
-**mem_window:** controls how many prior `<h>` states each new `<h>` can attend to.
-- 0 (default): full history — fast-weight accumulation
-- 1: isolated — each `<h>` compresses only its own block
-- N: N-step sliding window
-
----
-
-## Terminology Reference
-
-### Windows (all independent, all configurable)
-
-| Term | What it controls | Config key | Typical value |
-|---|---|---|---|
-| **seg window** | bytes in one source block `<x>` | `seg_len` | 16 |
-| **slot window** | `<h>` token count — compression bottleneck | `slot_len` | 1 |
-| **latent length** | `<z>` latent token count per block | `latent_len` | 7 |
-| **mem window** | prior `<h>` states visible to new `<h>` (-1=full, 1=isolated) | `mem_window` | -1 |
-| **warmup window** | bytes used as query anchor prefix (`<q>` or `<r>` content) | `warmup_len` | 4 |
-| **segment recall window** | bytes model must output per query (`<y>` length) | `out_len` | 16 (=seg_len for full recall) |
-| **attempt window** | max refine attempts sampled per optimizer step | `n_attempts` | 5 |
-| **noise window** | noise range per attempt `(noise_lo .. noise_hi)` | `noise_hi/lo` | 0.05–0.8 |
-
-### Turns (sequence-level, per training example)
-
-| Term | Structure | Loss |
-|---|---|---|
-| **ingest turn** | `<x><z><h>` — reads one source segment into memory | none |
-| **attempt turn** | `<y><z><h>` — noisy output + memory correction block | none (context only) |
-| **final turn** | `<y>` — clean ground truth after all attempts; trains copy mechanism | optional |
-| **query turn** | `<q><y>` — post-refine query on updated `<h>`; must match 100% | **primary loss** |
-
-Full refine sequence (n attempts + query):
-```
-[<x><z><h>] × n_blocks           ingest turns
-<r>warmup</r>                     refine anchor (once)
-(<y>noisy</y><z><h>) × k          attempt turns  k ~ Uniform(0, n_attempts)
-<y>clean</y>                       final turn
-<z><h>                             ghost correction (updates h from final)
-<q>warmup</q><y>clean</y>          query turn  ← loss here
-```
-k=0: no attempt turns → `<r><y_final><z><h><q><y_query>` — same structure as standard recall.
-
-### Steps (training-level)
-
-| Term | Meaning | Config key |
-|---|---|---|
-| **optimizer step** | one forward+backward+weight update | `n_steps` |
-| **warmup step** | LR ramp steps before cosine decay | `warmup_steps` |
-| **eval step** | frequency of eval runs | `eval_every` |
-| **log step** | frequency of JSONL train logging | `log_every` |
-| **curriculum stage** | one training phase with fixed mode/n_blocks/steps | `curriculum` list |
-
----
-
-**Sequence DSL:** `<x:16><z:7><h:1><q:4><y:8>` → parsed by `kvmem/seq_dsl.py` → `SeqSpec`.
-
-**Curriculum DSL:** `kvmem/curriculum_dsl.py` — batch scheduler + eval config.
-```
-seq_spec | stage, stage @eval:eval_spec
-```
-
-Stage token: `nN/rK/Xk[/wM][/mMODE]` — n_blocks / recall / steps / mem_window / op-mode
-
-```
-"<x:16><z:7><h:1><q:4><y:8> | n1/r0/40k, n2/r1/40k +n2/r0, n2/r[0,1]/80k/w1 @eval:n1/r0,n2/r0,n2/r1"
-```
-
-| Syntax | Meaning |
-|--------|---------|
-| `nN/rK/Xk` | stage: n_blocks=N, recall=K, steps=X |
-| `r[0,1]` | mixed batch: each example randomly draws recall from list |
-| `+nN/rK` | overlap: merge into previous stage's batch distribution |
-| `wM` | mem_window (-1=full, 1=isolated) |
-| `mMODE` | op pattern: `mend` (default), `mint` (interleaved), `macc` (ingest-only), `mmix` (random mix) |
-| `@eval:nN/rK,...` | eval configs tested every `eval_every` steps (independent of training) |
-
-Eval is independent of curriculum — `@eval:` specifies exactly which (n_blocks, recall_from) pairs are tested at each eval step. If omitted: auto-derived from all stages + `n1/r0` baseline.
-
-Returns `(SeqSpec, curriculum_list, eval_configs)` — pass `eval_configs` to `hp['eval_configs']`.
-
-**Hparams absorbed by DSL (no longer set manually):**
-`seg_len`, `slot_len`, `latent_len`, `warmup_len`, `out_len` → from seq spec  
-`n_blocks`, `recall_from`/`recall_froms`, `mem_window` → from curriculum stage tokens  
-`active_slots`, `slot_style`, `V` → removed entirely (slot_len is the bottleneck, dedicated indexed always)
-
----
-
-## Fast Weights
-
-`<h>` is a **running state**, not a stack. Cross-`<h>` attention IS the update mechanism:
-```
-h_0 = compress(x_0)
-h_t = update(h_{t-1}, x_t)   ← learns to mimic GD without GD
-```
-
-The model must learn to propagate what matters through the chain (vanishing information problem). **Line numbers as explicit keys** help: `"0042 content"` gives the update an addressable key; `<q>0042 </q>` retrieves it.
-
----
-
-## Experiment Roadmap
-
-| Exp | Status | Key result |
-|-----|--------|-----------|
-| Exp 1: Dataset ablation | ✓ Done | 100% match, ds_random fastest |
-| Exp 2: Sequential routing | ✓ Done | catastrophic forgetting confirmed |
-| Exp 2b: Cold mixed routing | ✓ Done | both dirs learn simultaneously, 91% |
-| Exp A: null_kv ablation | ✓ Done | 1.5-2× faster, bpb 0.157 vs 0.217 |
-| **Exp B: Chain extrapolation** | ✓ Done | **n=4 95%, n=5 91-94% trained only on n=1,2,3. Best overall: all ≥91%** |
-| **Exp 3a: Refine Stage A** | ✓ Done | draft 1.6% → final 92.2% Δ+90.6%. val_ref_bpb=0.063. Sawtooth fails (75%). |
-| **Exp 3b: Refine multi-turn** | ✓ Done | FAILED: 17.2% final (vs 92.2% Exp 3a). Train-eval dist mismatch. See findings. |
-| **Exp 3c: Joint trajectory mix** | ✓ Done | **val_ref_bpb=0.025, n1_r0=82%, monotonic t1≤t2≤t3 from step 32k. IQ no regression.** |
-| Exp 4: Natural language corpus | ⏳ Future | replace random bytes with text+line numbers |
-
-Full results: `reports/EXP_RESULTS_SUMMARY.md`
-
-**Key findings:**
-- Cold mixed routing (`r[0,1]` from step 0) — no forgetting
-- null_kv=True — always use, 1.5-2× faster  
-- **Chain extrapolation** — training on n=1,2,3 gives 88-95% on n=4,5 (phase transition at 2k steps into n=3 training)
-- mmix mode (k~Uniform(1,n) queries) — trains interactive ingestion+query patterns
-- **Refine working (Exp 3c)** — val_ref_bpb=0.025, n1_r0=82%, t1≤t2≤t3 monotonic. aux_attempt_loss fixed sawtooth. Joint training preserved IQ.
-- **aux_attempt_loss** — direct NLL supervision on each attempt vs clean GT is essential; without it, model learns "ignore draft and regenerate" sawtooth pattern
-- **Eval overhead** — AR decode eval dominates runtime: 32 min training vs 6h43m total for 80k steps at eval_every=2000. Use eval_every=10000 and rely on val_ref_bpb signal.
-
----
-
-## Training Trajectory Taxonomy
-
-Three atomic ops (multi-turn refine counts as 1):
-- `I` = ingest one block
-- `Q` = query — single pass, `<q><y>`, loss on `<y>`
-- `R` = refine — variable k draft turns `<q><r>` + final `<q><y>`, loss on final `<y>` only
-
-Generalisation requirements:
-- **No regression**: simpler trajectories (fewer ops) must stay at full performance
-- **Extrapolation**: more ops/turns than trained on should work (like Exp B n-chain extrapolation)
-- **Joint training**: training on complex trajectories alone breaks simple ones — must mix all types
-
-**Enumeration — 1 block:**
-
-| Trajectory | Tests | Status |
-|---|---|---|
-| `I Q` | baseline recall | ✓ Exp 1 |
-| `I R` | single-block refine (1 turn) | ✓ Exp 3a |
-| `I R Q` (k=1..5 rand) | multi-turn refine + verify | ✓ Exp 3c (joint, 82%) |
-| `I Q Q` | consistency: same block twice | ✗ |
-| `I Q R` | query then self-correct | ✗ |
-| `I R Q` | refine then verify correction | ✗ |
-| `I R R` | two rounds of refinement | ✗ |
-| `I Q R Q` | query, refine, verify | ✗ |
-
-**Enumeration — 2 blocks:**
-
-| Trajectory | Tests | Status |
-|---|---|---|
-| `I I Q₀` | retention: query old after new ingest | ✓ Exp 2b r0 |
-| `I I Q₁` | encoding: query new | ✓ Exp 2b r1 |
-| `I I R₀` | retention + correction: refine OLD after update | ✗ high priority |
-| `I I R₁` | refine new block | ✓ Exp 3b (partial) |
-| `I Q₀ I Q₀` | interleaved same target — retention under update | ✗ |
-| `I Q₀ I Q₁` | standard interleaved | ✓ int mode |
-| `I Q₀ I R₀` | query, ingest, refine old | ✗ |
-| `I R₁ I Q₀` | refine new, ingest again, test x0 survived | ✗ |
-| `I I Q₁ Q₀` | sequential dual query | ✗ |
-| `I I R₁ Q₀` | refine new, prove old retained | ✗ **Exp 3c SRS** |
-| `I I R₀ Q₁` | refine old, prove new encoded | ✗ |
-| `I I R₀ R₁` | refine both blocks | ✗ |
-
-**Enumeration — 3+ blocks:**
-
-| Trajectory | Tests | Status |
-|---|---|---|
-| `I I I Q₀` | deep retention | ✓ Exp B chain |
-| `I I I R₀` | deep chain + correct oldest | ✗ |
-| `I I I Q₀ Q₂` | deep retention + current | ✗ |
-| `I Q₀ I Q₀ I Q₀` | SRS: review after every ingest | ✗ |
-| `I I Q₀ I Q₀` | retention at spacing 1, then spacing 2 | ✗ |
-
-**Sampled high-value set (novel, not yet trained):**
-
-| Priority | Trajectory | Why |
-|---|---|---|
-| ✓✓ | `I I R₀` | h must retain x0 for self-correction — direct diff signal |
-| ✓✓ | `I I R₁ Q₀` | **Exp 3c**: refine new, prove old survived — SRS under pressure |
-| ✓✓ | `I Q₀ I Q₀` | retention under update: after ingesting x1, x0 must still work |
-| ✓✓ | `I Q₀ I Q₀ I Q₀` | pure SRS: review x0 at spacing 1, 2, 3 |
-| ✓ | `I Q R` | online correction: query own output, then self-correct |
-| ✓ | `I I Q₁ Q₀` | sequential dual-query from same h |
-| ✓ | `I I I R₀` | maximum spacing + correction |
-| ✓ | `I R₁ I Q₀` | refine, continue ingesting, test x0 retained |
-
-**Joint training distribution (Exp 3c design):**
-```
-30% → I Q         (no regression: standard recall)
-20% → I R         (single-block refine, k~1..5 flat noise)
-20% → I I Q₀      (retention baseline)
-15% → I I R₁ Q₀   (SRS: refine new + test old)
-15% → I Q₀ I Q₀   (interleaved same target)
-```
-
----
-
-## SRS Heuristic for Trajectory Design
-
-**Spaced Repetition System insight:** the forgetting curve for `<h>` mirrors biological memory — each new `I_k` risks overwriting prior states. SRS says train at the spacing where the model is *about to forget*.
-
-| SRS concept | Trajectory | Spacing |
-|---|---|---|
-| Immediate review | `I1 Y1` | 0 |
-| Short interval | `I1 I2 → Y1` | 1 |
-| Long interval | `I1...I5 → Y1` | 4 |
-| Increasing intervals | `I1 Y1 I2 Y1 I3 I4 Y1 ...` | geometric |
-
-**Key implication:** sample `n_blocks` per example from a distribution (geometric or uniform over 1..N_max) rather than fixing it per stage. This trains the model on all spacings simultaneously — easy retention (short spacing) and hard retention (long spacing) in the same batch.
-
-**Refine + SRS:** `I^n → R Y` is "cued recall at spacing n" — the SRS hint mechanism. `<r>` is the retrieval cue; `<y>` is the test; the correction signal is the feedback. Long-spacing refine (`I^5 → R Y_0`) is the hardest SRS card.
-
-**Non-monotonic improvement penalty:** when training multi-turn refine (R R Y), each turn should improve over the prior. A penalty on non-monotonic turns (turn k worse than turn k-1) provides direct training signal. `mono_penalty` hp key (default 0.0).
-
----
-
-## SRS Experiment Plan
-
-Progression of refine experiments following the SRS (Spaced Repetition System) heuristic:
-
-**Exp 3a** (done) — Single block, 1 draft turn, fixed noise. 92.2% final from 1.6% draft. Sawtooth fails (75%).
-
-**Exp 3b** (done, failed) — k~Uniform(1,5), descending noise. 17.2% final. Root cause: train-eval distribution mismatch — later drafts get near-zero synthetic noise during training (U(0, noise_hi*(K-j)/K)), but model's own AR-decoded drafts at eval time are still very noisy (≈15%). Model learns "5th draft is clean, just copy" but sees noisy 5th draft at eval. Fix: flat noise schedule — same noise range for all draft turns.
-
-**Exp 3c** (done) — Joint trajectory mix with flat noise, `configs/refine_joint.py`, 80k steps.
-- Mix: 30% I Q, 20% I R Q (k~0..5 flat noise), 20% I I Q₀, 30% interleaved n=2
-- New: `mode='joint'` per-step trajectory sampling, `out_len=-1` (full recall), `aux_attempt_loss=0.3`, `mono_penalty=0.05`, `noise_skew=True`, positional label smoothing `ls_max=0.2`
-- Result: val_ref_bpb=0.025, n1_r0=82%, monotonic at 80k. IQ val_bpb=0.14 (no regression).
-- Key fix: `aux_attempt_loss` gave direct gradient to correction path — without it, sawtooth (t1=50%→t2=5%) persisted indefinitely.
-
-**Key constraint for all future refine experiments:**
-- Flat noise: all draft turns use same U(lo, hi) range — keeps training drafts at same quality distribution as model's own eval outputs
-- Joint training: always include I Q batches alongside I R batches to prevent I Q regression
-- Extrapolation eval: always eval at k_max + 2 turns to track generalisation
-
----
-
-## Key Findings Log
-
-| Date | Finding |
-|------|---------|
-| 2026-06-03 | v1: 93.8% match (seg=16, active=1, full-pass TF) |
-| 2026-06-03 | v2: 98-100% match with slot_len=1, latent_len=7 |
-| 2026-06-03 | active_slots masking was wrong — slot_len IS the bottleneck |
-| 2026-06-03 | Non-causal slot→src was a mistake — pure causal works and is simpler |
-| 2026-06-03 | kv_cache default hurts match% — full-pass TF is correct default |
-| 2026-06-04 | Catastrophic forgetting between sequential stages confirmed |
-| 2026-06-04 | 2-block recall (from=0 and from=1) each achieves ~98% in isolation |
-| 2026-06-04 | ar_decode_role was broken for multi-block — now uses correct n_blocks eval |
-| 2026-06-04 | Dedicated cyclic IDs (266+(i%K)) is the right scaling design — fixed vocab K, zero data collision, extrapolates to arbitrary slot_len via cycle; looped byte (i%256) also works but collides with data |
-| 2026-06-04 | null_kv=True: 1.5-2× faster convergence, better peak val_bpb (0.157 vs 0.217 base). Should be default for future runs. |
-| 2026-06-04 | Cold mixed routing (r[0,1] from step 0) solves catastrophic forgetting — both directions learn simultaneously, no sequential overwriting |
-| 2026-06-04 | Interleaved mode (mmix): random end/int per step, random query count k∈[1,n], each query targets random prior block — trains interactive "sometimes ingest, sometimes query" |
-| 2026-06-05 | **Exp B complete: chain extrapolation confirmed.** Training on n=1,2,3 → n=4 95%, n=5 91-94% without ever training on 4 or 5 blocks. Phase transition at 2k steps into n=3 training. Algorithm generalises beyond training chain length. |
-| 2026-06-04 | Added `<r>/<r>` refinement tags (IDs 266/267). HIDDEN_SLOT_BASE shifted 266→268, N_BOUNDARY_TAGS 10→12, V=276 (was 274). Old checkpoints incompatible. |
-| 2026-06-04 | **Refine Stage A working**: model corrects from 3% draft to 56% final using `<h>`. val_ref_bpb≈0.37. `<z>` has architectural access to prior `<h>` causally — diff capacity available without new tokens. |
-| 2026-06-04 | SRS heuristic: vary n_blocks per example (geometric/uniform over 1..N_max) to train all retention spacings simultaneously rather than fixed n per stage. |
-| 2026-06-04 | **Exp 3b failed**: descending noise (turn j of K gets U(0, noise_hi*(K-j)/K)) causes train-eval distribution mismatch. Later training drafts are near-clean; AR eval drafts are still noisy. Model learns to copy clean drafts, fails on noisy eval. Fix: flat noise schedule, same range all turns. |
-| 2026-06-04 | Joint training required: training only on I R breaks I Q (model expects `<r>` context). Must mix trajectory types per step. Simple trajectories in mix prevent regression. |
-| 2026-06-04 | Trajectory generalisation goals: (1) no regression at k < trained max, (2) extrapolation at k > trained max (same mechanism as Exp B chain extrapolation). Both require rand_turns + flat noise + trajectory mixing. |
-| 2026-06-05 | **Exp 3c complete**: val_ref_bpb=0.025 (better than Exp 3a 0.063), n1_r0=82%, monotonic t1≤t2≤t3 at 80k steps. Joint training (30% IQ + 20% IRQ + 20% IIQ₀ + 30% int) preserved IQ (val_bpb=0.14). |
-| 2026-06-05 | **aux_attempt_loss** is essential for multi-turn refine. Without it, model learns "ignore draft and regenerate fresh" (sawtooth: t1=50%→t2=5%). Direct NLL supervision on each attempt vs clean GT forces gradient through the correction path. Fixed by step 32k. |
-| 2026-06-05 | Sawtooth mechanism: model has no gradient on attempt turns (loss only on post-refine query). Correction blocks see training drafts (random noise) vs eval drafts (AR accumulated errors) — model learns to ignore context and regenerate. Fix: aux_attempt_loss + mono_penalty. |
-| 2026-06-05 | Eval overhead: AR decode with 7 attempts × 16 tokens × 3 configs takes ~10 min per checkpoint on MPS. Training itself is 41 it/s (32 min for 80k). Total 6h43m with eval_every=2000. Recommend eval_every=10000 for future runs; val_ref_bpb is sufficient live signal. |
-| 2026-06-05 | `mode='joint'` added to train.py: per-step trajectory sampling from weighted mixture of {end, ref, int} types with different n_blocks/recall_from. val_ref_bpb now computed in joint mode. `out_len=-1` resolves to seg_len (full recall). |
-| 2026-06-05 | Positional noise skew (noise_skew=True): draft noise ramps 0→2p left→right. Positional label smoothing (ls_max=0.2 annealing over 40k steps): ε=0 at sequence start, ε=ls_max at end. Both mimic AR error distribution — errors compound toward sequence end. |
-
----
-
-## Reference
+## Docs
 
 | What | Where |
 |------|-------|
-| Exp 1 results | `reports/EXP1_DATASET_ABLATION.md` |
-| Exp 2 live tracking | `reports/EXP2_MULTITURN_TRACKING.md` |
-| Exp 2 plan + refine plan | `plan/PLAN_EXP2.md` |
-| Exp 3c checkpoint | `logs/role_refine_joint/checkpoints/stage0_end.pt` |
-| Exp 3c config | `configs/refine_joint.py` |
-| Tag naming rationale | `reports/tag_naming.md` |
-| KV dimension tables | `reports/kv_dims.md` |
-| v1 results and findings | `reports/v1/` |
-| Old plans (archived) | `plan/archive/` |
-| Self-correction theory | `plan/PLAN_REFINED.md` §Direction B |
-| Hidden state viz ideas | `plan/VIZ_HIDDEN_STATES.md` |
-| v1 code snapshot | `kvmem/old/v1/` |
-| Active configs | `configs/` |
+| Full reference book | [`docs/BOOK.md`](docs/BOOK.md) |
+| All experiment results | [`docs/EXP_RESULTS_SUMMARY.md`](docs/EXP_RESULTS_SUMMARY.md) |
+| Exp 2 tracking | [`docs/EXP2_MULTITURN_TRACKING.md`](docs/EXP2_MULTITURN_TRACKING.md) |
+| Plans & theory | [`docs/plan/`](docs/plan/) |
+| Active configs | [`configs/`](configs/) |
