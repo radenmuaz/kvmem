@@ -352,31 +352,51 @@ def ar_decode_refine(model, x_S: list[int], slot_len: int,
 
 
 @torch.no_grad()
+# ---------------------------------------------------------------------------
+# Ablation: 1-token MEM blocks — entire block filled with HMN_MEM_START,
+# no structural start/slot/end distinction. Tests whether explicit token
+# roles matter vs a single repeated memory marker.
+# BLEN unchanged (slot_len+2) so sequence length is identical to baseline.
+# ---------------------------------------------------------------------------
+
+def _hmn_fill_1tok(arr: np.ndarray, pos: dict) -> np.ndarray:
+    """Overwrite all MEM block positions with HMN_MEM_START (single token)."""
+    for mb in pos['mem_blocks']:
+        arr[mb['ms']:mb['me'] + 1] = HMN_MEM_START
+    return arr
+
+
+def _hmn_fill_1tok_2d(arr: np.ndarray, pos: dict) -> np.ndarray:
+    """Batch version: overwrite all MEM block positions with HMN_MEM_START."""
+    for mb in pos['mem_blocks']:
+        arr[:, mb['ms']:mb['me'] + 1] = HMN_MEM_START
+    return arr
+
+
+def _hmn_make_iq_batch_1tok(rng, B, src_len, slot_len, warmup_len, out_len):
+    arr = hmn_make_iq_batch(rng, B, src_len, slot_len, warmup_len, out_len)
+    return _hmn_fill_1tok_2d(arr, hmn_iq_positions(src_len, slot_len, warmup_len, out_len))
+
+
+def _hmn_make_ir_batch_1tok(rng, B, k, src_len, slot_len, warmup_len, out_len,
+                             segs_batch=None, wm_batch=None, tgt_batch=None):
+    arr = hmn_make_ir_batch(rng, B, k, src_len, slot_len, warmup_len, out_len,
+                             segs_batch=segs_batch, wm_batch=wm_batch, tgt_batch=tgt_batch)
+    return _hmn_fill_1tok_2d(arr, hmn_ir_positions(src_len, slot_len, warmup_len, out_len, k))
+
+
 def ar_decode_hmn_ir(model, x_S: list[int], slot_len: int,
                      warmup: list[int], out_len: int, device,
                      k: int = 0) -> list[int]:
-    """
-    Greedy AR decode for HashMemNet I R^k Q sequence.
-
-    Writes src + slot tokens for each of k+1 turns (I + k R turns),
-    then AR-generates output positions. Slot tokens are fixed IDs (HMN_SLOT_0-3
-    cycling) — the model's residual stream carries the actual memory state.
-
-    k=0: I Q (single insert, then recall).
-    k>0: I R^k Q (k additional revision turns before recall).
-    """
+    """1-token ablation: entire MEM block = HMN_MEM_START repeated."""
     src_len  = len(x_S)
     wl       = len(warmup)
     pos      = hmn_ir_positions(src_len, slot_len, wl, out_len, k)
     mask_np  = hmn_mask_ir(src_len, slot_len, wl, out_len, k)
-    sids     = hmn_slot_ids(slot_len)
     mask_t   = torch.tensor(mask_np, dtype=torch.float32, device=device)
 
     tokens = np.zeros(pos['L'], dtype=np.int64)
-    for mb in pos['mem_blocks']:
-        tokens[mb['ms']]             = HMN_MEM_START
-        tokens[mb['sl0']:mb['sl1']]  = sids
-        tokens[mb['me']]             = HMN_MEM_END
+    _hmn_fill_1tok(tokens, pos)          # all MEM positions → HMN_MEM_START
     for sb in pos['src_blocks']:
         tokens[sb['s0']:sb['s1']] = x_S
     if wl > 0:
@@ -495,66 +515,6 @@ def compute_teacher_h(model, tokens_t, mask_t, h_positions,
         log_probs_fn, cur_ls, n_targets=n_h_steps,
         max_iter=n_h_steps, teacher_lr=lr_h)
     return targets
-
-
-def run_hmn_eval(model, stage_cfg, device, verbose=True, verbose_n=4,
-                 src_period_override=None):
-    """Run HMN multi-turn eval for all k in hmn_eval_turns. Returns match% per k.
-
-    src_period_override: if set, overrides the config's src_period.
-      Use 9999 for pure bottleneck (only turn 0 sees src, all others blind).
-    """
-    import torch
-    _fmt = lambda seq: ' '.join(f'{b:02x}' for b in seq)
-    seg_len    = stage_cfg.get('src_len',     stage_cfg.get('seg_len', 32))
-    slot_len   = stage_cfg.get('slot_len',    4)
-    warmup_len = stage_cfg.get('warmup_len',  8)
-    out_len    = stage_cfg.get('out_len',     24)
-    eval_turns = stage_cfg.get('hmn_eval_turns', [0, 1, 2, 3, 4])
-    eval_offset = stage_cfg.get('eval_offset', 0.25)
-    _jm = next((jm for jm in stage_cfg.get('joint_mix', [])
-                if jm.get('traj') == 'hmn_ir'), {})
-    src_period = src_period_override if src_period_override is not None \
-                 else _jm.get('src_period', stage_cfg.get('src_period', 1))
-
-    test_seqs = make_test_sequences(seg_len)
-    f_start = min(int(seg_len * eval_offset), seg_len - warmup_len - out_len)
-    y_start = f_start + warmup_len
-    y_end   = min(y_start + out_len, seg_len)
-
-    results = {}
-    prev_perfect = False
-    for hk in range(max(eval_turns) + 1):
-        if hk not in eval_turns:
-            continue
-        hk_cer = []
-        hk_verbose = []
-        for sname, x_S in test_seqs.items():
-            wm = x_S[max(0, y_start - warmup_len):y_start]
-            if len(wm) < warmup_len:
-                wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
-            tgt = x_S[y_start:y_end]
-            with torch.no_grad():
-                g = ar_decode_hmn_ir(model, x_S, slot_len, wm, len(tgt), device, k=hk)
-            hk_cer.append(cer(g, tgt))
-            if verbose and len(hk_verbose) < verbose_n:
-                hk_verbose.append((sname, wm, tgt, g))
-        perfect   = (sum(hk_cer) == 0.0)
-        match_pct = round(100 * (1 - sum(hk_cer) / len(hk_cer)), 1)
-        results[hk] = match_pct
-        if verbose:
-            if prev_perfect and not perfect:
-                print(f'  !! hmn k={hk}  REGRESSION match={match_pct:.1f}% (was 100% at k={hk-1})')
-            else:
-                ok = '✓✓' if (perfect and prev_perfect) else ('✓' if perfect else '✗')
-                print(f'  {ok} hmn k={hk}  match={match_pct:.1f}%')
-            for sname, wm, tgt, g in hk_verbose:
-                m = round(100 * (1 - cer(g, tgt)), 1)
-                print(f'    [{sname}] wm={_fmt(list(wm))}')
-                print(f'      gt={_fmt(list(tgt))}')
-                print(f'      gen={_fmt(list(g))}  ({m}%)')
-        prev_perfect = perfect
-    return results
 
 
 def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
@@ -1009,7 +969,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             _hmn_iq_jc = next((jm for jm in _joint_cache if jm['traj'] == 'hmn_iq'), None)
             _hmn_ir_jc = next((jm for jm in _joint_cache if jm['traj'] == 'hmn_ir'), None)
             if _hmn_iq_jc is not None:
-                _hmn_val_np   = hmn_make_iq_batch(
+                _hmn_val_np   = _hmn_make_iq_batch_1tok(
                     np.random.default_rng(seed + stage_i + 3), B,
                     seg_len, slot_len, warmup_len, out_len)
                 _hmn_val_pos  = _hmn_iq_jc['pos']
@@ -1017,7 +977,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             elif _hmn_ir_jc is not None:
                 _k_val = max(_hmn_ir_jc['k_choices'])
                 _hmn_val_pos, _hmn_val_mask = _hmn_ir_jc['hmn_cache'][_k_val]
-                _hmn_val_np = hmn_make_ir_batch(
+                _hmn_val_np = _hmn_make_ir_batch_1tok(
                     np.random.default_rng(seed + stage_i + 3), B, _k_val,
                     seg_len, slot_len, warmup_len, out_len)
 
@@ -1087,8 +1047,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 elif _jc['traj'] == 'online_ref':
                     tokens_np = None  # batch built inside loss block (needs teacher h)
                 elif _jc['traj'] == 'hmn_iq':
-                    tokens_np = hmn_make_iq_batch(rng, B, seg_len, slot_len,
-                                                   warmup_len, out_len)
+                    tokens_np = _hmn_make_iq_batch_1tok(rng, B, seg_len, slot_len,
+                                                         warmup_len, out_len)
                 elif _jc['traj'] == 'hmn_ir':
                     tokens_np = None  # batch built inside loss block (needs teacher h)
                 elif _jc['traj'] == 'int':
@@ -1352,8 +1312,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         _jk = int(rng.choice(_jc['k_choices']))
                         _jhmn_pos_k, _jhmn_mask_k = _jc['hmn_cache'][_jk]
                         # Build I Q batch to extract seg/wm/tgt and run teacher
-                        tokens_hmn_iq = hmn_make_iq_batch(rng, B, seg_len, slot_len,
-                                                           warmup_len, out_len)
+                        tokens_hmn_iq = _hmn_make_iq_batch_1tok(rng, B, seg_len, slot_len,
+                                                                 warmup_len, out_len)
                         tokens_hmn_iq_t = torch.tensor(tokens_hmn_iq, device=device)
                         segs_hmn, wm_hmn, tgt_hmn = hmn_extract_batch(
                             tokens_hmn_iq, _jc['iq_pos'])
@@ -1385,7 +1345,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                             h_teachers = []
                             _stop_loss  = 0.0
                         # Build I R^k Q batch with same content
-                        tokens_hmn_ir = hmn_make_ir_batch(
+                        tokens_hmn_ir = _hmn_make_ir_batch_1tok(
                             rng, B, _jk, seg_len, slot_len, warmup_len, out_len,
                             segs_batch=segs_hmn, wm_batch=wm_hmn, tgt_batch=tgt_hmn)
                         tokens_hmn_ir_t = torch.tensor(tokens_hmn_ir, device=device)
@@ -1970,25 +1930,6 @@ if __name__ == '__main__':
                 print(f'  {mono} n={nb} rf={rf}  {step_str}  final={final_m}%  Δ={final_m-turn_m[0]:+.1f}%')
             else:
                 print(f'  n={nb} rf={rf}: match={100*(1-mean_c):.1f}%')
-        # HMN multi-turn eval (if any stage has hmn_ir traj)
-        _has_hmn = any(
-            jm.get('traj') == 'hmn_ir'
-            for s in hp.get('curriculum', [])
-            for jm in s.get('joint_mix', [])
-        )
-        if _has_hmn:
-            _cur0 = hp.get('curriculum', [{}])[0]
-            _jm0  = next((jm for jm in _cur0.get('joint_mix', [])
-                          if jm.get('traj') == 'hmn_ir'), {})
-            _train_period = _jm0.get('src_period', 1)
-            _vn = hp.get('verbose_eval_n', 4)
-            print(f'\n--- HMN eval [src_period={_train_period}, in-distribution] ---')
-            run_hmn_eval(model, _cur0, device, verbose=True, verbose_n=_vn,
-                         src_period_override=None)
-            if _train_period != 1:
-                print(f'\n--- HMN eval [src_period=∞, bottleneck: only t=0 sees src] ---')
-                run_hmn_eval(model, _cur0, device, verbose=False,
-                             src_period_override=9999)
         import sys; sys.exit(0)
 
     if args.resume:

@@ -352,33 +352,62 @@ def ar_decode_refine(model, x_S: list[int], slot_len: int,
 
 
 @torch.no_grad()
+# ---------------------------------------------------------------------------
+# Ablation: 1-token MEM blocks — entire block filled with HMN_MEM_START,
+# no structural start/slot/end distinction. Tests whether explicit token
+# roles matter vs a single repeated memory marker.
+# BLEN unchanged (slot_len+2) so sequence length is identical to baseline.
+# ---------------------------------------------------------------------------
+
+def _hmn_fill_1tok(arr: np.ndarray, pos: dict) -> np.ndarray:
+    """Overwrite all MEM block positions with HMN_MEM_START (single token)."""
+    for mb in pos['mem_blocks']:
+        arr[mb['ms']:mb['me'] + 1] = HMN_MEM_START
+    return arr
+
+
+def _hmn_fill_1tok_2d(arr: np.ndarray, pos: dict) -> np.ndarray:
+    """Batch version: overwrite all MEM block positions with HMN_MEM_START."""
+    for mb in pos['mem_blocks']:
+        arr[:, mb['ms']:mb['me'] + 1] = HMN_MEM_START
+    return arr
+
+
+def _hmn_make_iq_batch_1tok(rng, B, src_len, slot_len, warmup_len, out_len):
+    arr = hmn_make_iq_batch(rng, B, src_len, slot_len, warmup_len, out_len)
+    return _hmn_fill_1tok_2d(arr, hmn_iq_positions(src_len, slot_len, warmup_len, out_len))
+
+
+def _hmn_make_ir_batch_1tok(rng, B, k, src_len, slot_len, warmup_len, out_len,
+                             segs_batch=None, wm_batch=None, tgt_batch=None):
+    arr = hmn_make_ir_batch(rng, B, k, src_len, slot_len, warmup_len, out_len,
+                             segs_batch=segs_batch, wm_batch=wm_batch, tgt_batch=tgt_batch)
+    return _hmn_fill_1tok_2d(arr, hmn_ir_positions(src_len, slot_len, warmup_len, out_len, k))
+
+
 def ar_decode_hmn_ir(model, x_S: list[int], slot_len: int,
                      warmup: list[int], out_len: int, device,
-                     k: int = 0) -> list[int]:
+                     k: int = 0, src_period: int = 1) -> list[int]:
+    """1-token ablation: entire MEM block = HMN_MEM_START repeated.
+    src_period: show src only at turns t where t % src_period == 0.
+      1  = always show (default).
+      2  = show at t=0,2,4,...  blind at t=1,3,...
+     -1  = only t=0 sees src; all subsequent turns fully blind.
     """
-    Greedy AR decode for HashMemNet I R^k Q sequence.
-
-    Writes src + slot tokens for each of k+1 turns (I + k R turns),
-    then AR-generates output positions. Slot tokens are fixed IDs (HMN_SLOT_0-3
-    cycling) — the model's residual stream carries the actual memory state.
-
-    k=0: I Q (single insert, then recall).
-    k>0: I R^k Q (k additional revision turns before recall).
-    """
+    # -1 (or any <=0) means "only first turn" — treat as large period
+    src_period = 9999 if src_period <= 0 else src_period
     src_len  = len(x_S)
     wl       = len(warmup)
     pos      = hmn_ir_positions(src_len, slot_len, wl, out_len, k)
     mask_np  = hmn_mask_ir(src_len, slot_len, wl, out_len, k)
-    sids     = hmn_slot_ids(slot_len)
     mask_t   = torch.tensor(mask_np, dtype=torch.float32, device=device)
 
     tokens = np.zeros(pos['L'], dtype=np.int64)
-    for mb in pos['mem_blocks']:
-        tokens[mb['ms']]             = HMN_MEM_START
-        tokens[mb['sl0']:mb['sl1']]  = sids
-        tokens[mb['me']]             = HMN_MEM_END
-    for sb in pos['src_blocks']:
-        tokens[sb['s0']:sb['s1']] = x_S
+    _hmn_fill_1tok(tokens, pos)          # all MEM positions → HMN_MEM_START
+    for t, sb in enumerate(pos['src_blocks']):
+        if src_period == 1 or t % src_period == 0:
+            tokens[sb['s0']:sb['s1']] = x_S
+        # else: leave as 0 — blind turn, must rely on MEM chain
     if wl > 0:
         tokens[pos['w0']:pos['w1']] = warmup
 
@@ -390,6 +419,106 @@ def ar_decode_hmn_ir(model, x_S: list[int], slot_len: int,
         gen.append(nb)
         tok_t[pos['c0'] + j] = nb
     return gen
+
+
+# ---------------------------------------------------------------------------
+# Teacher logit distillation helper
+# ---------------------------------------------------------------------------
+
+def compute_logit_teacher(model, tok_iq_t, mask_iq, c0, c1,
+                           log_probs_fn, cur_ls=0.0,
+                           max_iter=10, lr=1e-3):
+    """Clone model, overfit clone on IQ batch, return output log-probs as soft labels.
+
+    Teacher uses IQ format (k=0, full src always visible).
+    After overfitting, teacher's logits represent what a model that knows
+    this exact batch would output. Fresh clone per step — no staleness.
+    Caller must ensure model is in train() mode before and after.
+    """
+    import copy
+    teacher = copy.deepcopy(model)
+    teacher.train()
+    opt = torch.optim.AdamW(teacher.parameters(), lr=lr, weight_decay=0.0)
+    tgt = tok_iq_t[:, c0:c1]
+    for _ in range(max_iter):
+        opt.zero_grad()
+        logits = teacher(tok_iq_t, mask_iq)
+        lp     = log_probs_fn(logits[:, c0-1:c1-1])
+        loss   = _positional_ls_nll(lp, tgt, cur_ls).mean()
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        logits_t   = teacher(tok_iq_t, mask_iq)
+        teacher_lp = F.log_softmax(logits_t[:, c0-1:c1-1], dim=-1)
+    del teacher, opt
+    return teacher_lp.detach()   # [B, out_len, vocab]
+
+
+# ---------------------------------------------------------------------------
+# HMN eval helper (used by both train loop and --eval-only)
+# ---------------------------------------------------------------------------
+
+def run_hmn_eval(model, stage_cfg, device, verbose=True, verbose_n=4,
+                 src_period_override=None):
+    """Run HMN multi-turn eval for all k in hmn_eval_turns. Returns match% per k.
+
+    src_period_override: if set, overrides the config's src_period.
+      Use 9999 for pure bottleneck (only turn 0 sees src, all others blind).
+    """
+    import torch
+    _fmt = lambda seq: ' '.join(f'{b:02x}' for b in seq)
+    seg_len    = stage_cfg.get('src_len',     stage_cfg.get('seg_len', 32))
+    slot_len   = stage_cfg.get('slot_len',    4)
+    warmup_len = stage_cfg.get('warmup_len',  8)
+    out_len    = stage_cfg.get('out_len',     24)
+    eval_turns = stage_cfg.get('hmn_eval_turns', [0, 1, 2, 3, 4])
+    eval_offset = stage_cfg.get('eval_offset', 0.25)
+    # src_period from joint_mix entry (first hmn_ir traj found), or override
+    _jm = next((jm for jm in stage_cfg.get('joint_mix', [])
+                if jm.get('traj') == 'hmn_ir'), {})
+    _sp_raw    = (src_period_override if src_period_override is not None
+                  else _jm.get('src_period', stage_cfg.get('src_period', 1)))
+    src_period = 9999 if _sp_raw <= 0 else _sp_raw
+
+    test_seqs = make_test_sequences(seg_len)
+    f_start = min(int(seg_len * eval_offset), seg_len - warmup_len - out_len)
+    y_start = f_start + warmup_len
+    y_end   = min(y_start + out_len, seg_len)
+
+    results = {}
+    prev_perfect = False
+    for hk in range(max(eval_turns) + 1):
+        if hk not in eval_turns:
+            continue
+        hk_cer = []
+        hk_verbose = []
+        for sname, x_S in test_seqs.items():
+            wm = x_S[max(0, y_start - warmup_len):y_start]
+            if len(wm) < warmup_len:
+                wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
+            tgt = x_S[y_start:y_end]
+            with torch.no_grad():
+                g = ar_decode_hmn_ir(model, x_S, slot_len, wm, len(tgt), device,
+                                     k=hk, src_period=src_period)
+            hk_cer.append(cer(g, tgt))
+            if verbose and len(hk_verbose) < verbose_n:
+                hk_verbose.append((sname, wm, tgt, g))
+        perfect   = (sum(hk_cer) == 0.0)
+        match_pct = round(100 * (1 - sum(hk_cer) / len(hk_cer)), 1)
+        results[hk] = match_pct
+        if verbose:
+            if prev_perfect and not perfect:
+                print(f'  !! hmn k={hk}  REGRESSION match={match_pct:.1f}% (was 100% at k={hk-1})')
+            else:
+                ok = '✓✓' if (perfect and prev_perfect) else ('✓' if perfect else '✗')
+                print(f'  {ok} hmn k={hk}  match={match_pct:.1f}%')
+            for sname, wm, tgt, g in hk_verbose:
+                m = round(100 * (1 - cer(g, tgt)), 1)
+                print(f'    [{sname}] wm={_fmt(list(wm))}')
+                print(f'      gt={_fmt(list(tgt))}')
+                print(f'      gen={_fmt(list(g))}  ({m}%)')
+        prev_perfect = perfect
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +546,7 @@ def _positional_ls_nll(lp: torch.Tensor, tgt: torch.Tensor, ls_max: float) -> to
     return (1.0 - eps) * nll_hard + eps * nll_soft
 
 
-def compute_teacher_trajectory(model, tokens_t, mask_t, h_positions,
+def _placeholder_remove_teacher(model, tokens_t, mask_t, h_positions,
                                 ntp_c0, ntp_c1, log_probs_fn, cur_ls,
                                 n_targets, max_iter=50, teacher_lr=3e-4,
                                 loss_threshold=0.01):
@@ -495,66 +624,6 @@ def compute_teacher_h(model, tokens_t, mask_t, h_positions,
         log_probs_fn, cur_ls, n_targets=n_h_steps,
         max_iter=n_h_steps, teacher_lr=lr_h)
     return targets
-
-
-def run_hmn_eval(model, stage_cfg, device, verbose=True, verbose_n=4,
-                 src_period_override=None):
-    """Run HMN multi-turn eval for all k in hmn_eval_turns. Returns match% per k.
-
-    src_period_override: if set, overrides the config's src_period.
-      Use 9999 for pure bottleneck (only turn 0 sees src, all others blind).
-    """
-    import torch
-    _fmt = lambda seq: ' '.join(f'{b:02x}' for b in seq)
-    seg_len    = stage_cfg.get('src_len',     stage_cfg.get('seg_len', 32))
-    slot_len   = stage_cfg.get('slot_len',    4)
-    warmup_len = stage_cfg.get('warmup_len',  8)
-    out_len    = stage_cfg.get('out_len',     24)
-    eval_turns = stage_cfg.get('hmn_eval_turns', [0, 1, 2, 3, 4])
-    eval_offset = stage_cfg.get('eval_offset', 0.25)
-    _jm = next((jm for jm in stage_cfg.get('joint_mix', [])
-                if jm.get('traj') == 'hmn_ir'), {})
-    src_period = src_period_override if src_period_override is not None \
-                 else _jm.get('src_period', stage_cfg.get('src_period', 1))
-
-    test_seqs = make_test_sequences(seg_len)
-    f_start = min(int(seg_len * eval_offset), seg_len - warmup_len - out_len)
-    y_start = f_start + warmup_len
-    y_end   = min(y_start + out_len, seg_len)
-
-    results = {}
-    prev_perfect = False
-    for hk in range(max(eval_turns) + 1):
-        if hk not in eval_turns:
-            continue
-        hk_cer = []
-        hk_verbose = []
-        for sname, x_S in test_seqs.items():
-            wm = x_S[max(0, y_start - warmup_len):y_start]
-            if len(wm) < warmup_len:
-                wm = [x_S[0]] * (warmup_len - len(wm)) + list(wm)
-            tgt = x_S[y_start:y_end]
-            with torch.no_grad():
-                g = ar_decode_hmn_ir(model, x_S, slot_len, wm, len(tgt), device, k=hk)
-            hk_cer.append(cer(g, tgt))
-            if verbose and len(hk_verbose) < verbose_n:
-                hk_verbose.append((sname, wm, tgt, g))
-        perfect   = (sum(hk_cer) == 0.0)
-        match_pct = round(100 * (1 - sum(hk_cer) / len(hk_cer)), 1)
-        results[hk] = match_pct
-        if verbose:
-            if prev_perfect and not perfect:
-                print(f'  !! hmn k={hk}  REGRESSION match={match_pct:.1f}% (was 100% at k={hk-1})')
-            else:
-                ok = '✓✓' if (perfect and prev_perfect) else ('✓' if perfect else '✗')
-                print(f'  {ok} hmn k={hk}  match={match_pct:.1f}%')
-            for sname, wm, tgt, g in hk_verbose:
-                m = round(100 * (1 - cer(g, tgt)), 1)
-                print(f'    [{sname}] wm={_fmt(list(wm))}')
-                print(f'      gt={_fmt(list(tgt))}')
-                print(f'      gen={_fmt(list(g))}  ({m}%)')
-        prev_perfect = perfect
-    return results
 
 
 def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
@@ -1009,7 +1078,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             _hmn_iq_jc = next((jm for jm in _joint_cache if jm['traj'] == 'hmn_iq'), None)
             _hmn_ir_jc = next((jm for jm in _joint_cache if jm['traj'] == 'hmn_ir'), None)
             if _hmn_iq_jc is not None:
-                _hmn_val_np   = hmn_make_iq_batch(
+                _hmn_val_np   = _hmn_make_iq_batch_1tok(
                     np.random.default_rng(seed + stage_i + 3), B,
                     seg_len, slot_len, warmup_len, out_len)
                 _hmn_val_pos  = _hmn_iq_jc['pos']
@@ -1017,7 +1086,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             elif _hmn_ir_jc is not None:
                 _k_val = max(_hmn_ir_jc['k_choices'])
                 _hmn_val_pos, _hmn_val_mask = _hmn_ir_jc['hmn_cache'][_k_val]
-                _hmn_val_np = hmn_make_ir_batch(
+                _hmn_val_np = _hmn_make_ir_batch_1tok(
                     np.random.default_rng(seed + stage_i + 3), B, _k_val,
                     seg_len, slot_len, warmup_len, out_len)
 
@@ -1036,6 +1105,16 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
              f'  B={B}  steps={n_steps}  L={L_total}')
 
         pbar = tqdm(range(1, n_steps + 1), desc=f'stage{stage_i}', dynamic_ncols=True)
+
+        # EMA accumulators for adaptive weighting of pressure terms.
+        # Each EMA only updates when its term is > 0 (avoids zero-collapse from k=1
+        # steps or already-monotone / already-correct turns).
+        _ema_ntp      = 1.0   # tracks flat mean NTP magnitude
+        _ema_mono     = 0.1   # tracks l_mono (ReLU pairwise NLL violations)
+        _ema_cum      = 0.1   # tracks l_cum (cum_mean excess)
+        _ema_cerb     = 0.1   # tracks l_cerb (delta-CER weighted NLL, variant B)
+        _ema_distill  = 0.1   # tracks l_distill (KL vs teacher logits)
+        _ema_alpha    = 0.99
 
         for local_step in pbar:
             global_step += 1
@@ -1087,8 +1166,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 elif _jc['traj'] == 'online_ref':
                     tokens_np = None  # batch built inside loss block (needs teacher h)
                 elif _jc['traj'] == 'hmn_iq':
-                    tokens_np = hmn_make_iq_batch(rng, B, seg_len, slot_len,
-                                                   warmup_len, out_len)
+                    tokens_np = _hmn_make_iq_batch_1tok(rng, B, seg_len, slot_len,
+                                                         warmup_len, out_len)
                 elif _jc['traj'] == 'hmn_ir':
                     tokens_np = None  # batch built inside loss block (needs teacher h)
                 elif _jc['traj'] == 'int':
@@ -1347,77 +1426,190 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         mode = 'tf-hmn-iq'
                         _online_stats = None
                     elif _jc['traj'] == 'hmn_ir':
-                        # I R^k Q: teacher h-targets for R turns, NTP + h-loss
-                        # Sample k from configured choices
+                        # Monotonic NLL training — no teacher, no h-loss.
+                        # loss = ntp + adaptive_mono * l_mono + adaptive_cum * l_cum
+                        # l_mono = mean ReLU(nll_t - nll_{t-1} - margin)  [local/2-step]
+                        # l_cum  = ReLU(mean_t(cum_mean_t) - mean(nll_t))  [global]
+                        #   cum_mean_t = mean(nll_0..nll_t); pressure > 0 when early turns worse
+                        # adaptive_* = ema_ntp / (ema_pressure + eps) — balances magnitudes.
+                        # Set mono_w=0 or cum_w=0 to disable that term.
                         _jk = int(rng.choice(_jc['k_choices']))
-                        _jhmn_pos_k, _jhmn_mask_k = _jc['hmn_cache'][_jk]
-                        # Build I Q batch to extract seg/wm/tgt and run teacher
-                        tokens_hmn_iq = hmn_make_iq_batch(rng, B, seg_len, slot_len,
-                                                           warmup_len, out_len)
-                        tokens_hmn_iq_t = torch.tensor(tokens_hmn_iq, device=device)
+                        _mono_w           = _jc.get('mono_w', 1.0)
+                        _cum_w            = _jc.get('cum_w', 0.0)
+                        _cer_b_w          = _jc.get('cer_b_w', 0.0)
+                        _mono_margin      = _jc.get('mono_margin', 0.02)
+                        _src_period_raw   = _jc.get('src_period', 1)
+                        # -1 (or <=0) = only first turn sees src; treat as 9999
+                        _src_period       = 9999 if _src_period_raw <= 0 else _src_period_raw
+                        _teacher_distill_w  = _jc.get('teacher_distill_w', 0.0)
+                        _teacher_iters      = _jc.get('teacher_iters', 10)
+                        _teacher_lr         = _jc.get('teacher_lr', 1e-3)
+                        # Alpha mode — two options (mutually exclusive):
+                        #   teacher_alpha (float): fixed alpha for all turns k>=1, 0 at k=0
+                        #   teacher_alpha_start + teacher_alpha_k_max: per-turn ramp
+                        #     alpha_k = alpha_start + (1-alpha_start)*(k-1)/(k_max-1), 0 at k=0
+                        _teacher_alpha_fixed = _jc.get('teacher_alpha', None)
+                        _teacher_alpha_start = _jc.get('teacher_alpha_start', 0.1)
+                        _teacher_alpha_k_max = _jc.get('teacher_alpha_k_max', 12)
+
+                        # Build IQ batch for k=0 and extract content
+                        tokens_hmn_iq = _hmn_make_iq_batch_1tok(rng, B, seg_len, slot_len,
+                                                                 warmup_len, out_len)
                         segs_hmn, wm_hmn, tgt_hmn = hmn_extract_batch(
                             tokens_hmn_iq, _jc['iq_pos'])
-                        # h positions = MEM_1 slot positions in the I Q batch (output of I)
-                        _hmn_h_pos = list(range(_jc['iq_pos']['output_sl0'],
-                                                 _jc['iq_pos']['output_sl1']))
-                        # Teacher trajectory: k steps on I Q batch
-                        if _jk > 0:
-                            if _teacher_iters is None:
-                                _teacher_iters     = _jc.get('teacher_max_iter', 10)
-                                _teacher_max_iters = _jc.get('teacher_max_max_iter', 80)
-                            _hmn_teacher_lr  = _jc.get('teacher_lr', lr_max)
-                            _hmn_teacher_thr = _jc.get('teacher_loss_threshold', 0.01)
-                            h_teachers, _broke, _stop_loss, _actual_iters = compute_teacher_trajectory(
-                                model, tokens_hmn_iq_t, _jc['iq_mask'],
-                                _hmn_h_pos,
+
+                        # Teacher logit distillation: clone model, overfit on IQ batch,
+                        # take IQ output logits as soft labels. Fresh clone each step
+                        # — no staleness. All k turns distill against same teacher target.
+                        _teacher_lp = None
+                        if _teacher_distill_w > 0.0 and _jk > 0:
+                            _tok_iq_t = torch.tensor(tokens_hmn_iq, device=device)
+                            _teacher_lp = compute_logit_teacher(
+                                model, _tok_iq_t, _jc['iq_mask'],
                                 _jc['iq_pos']['c0'], _jc['iq_pos']['c1'],
-                                log_probs_fn, _cur_ls,
-                                n_targets=_jk,
-                                max_iter=_teacher_iters,
-                                teacher_lr=_hmn_teacher_lr,
-                                loss_threshold=_hmn_teacher_thr)
-                            _converged = '✓' if _broke else '✗'
-                            _log(f'  [hmn-teacher] k={_jk} iters={_actual_iters}/{_teacher_iters} loss={_stop_loss:.4f} {_converged}')
-                            if not _broke:
-                                _teacher_iters = min(_teacher_iters * 2,
-                                                     _jc.get('teacher_max_max_iter', 80))
-                        else:
-                            h_teachers = []
-                            _stop_loss  = 0.0
-                        # Build I R^k Q batch with same content
-                        tokens_hmn_ir = hmn_make_ir_batch(
-                            rng, B, _jk, seg_len, slot_len, warmup_len, out_len,
-                            segs_batch=segs_hmn, wm_batch=wm_hmn, tgt_batch=tgt_hmn)
-                        tokens_hmn_ir_t = torch.tensor(tokens_hmn_ir, device=device)
-                        # Forward with features for h-loss
-                        logits_hmn, x_hmn = model(tokens_hmn_ir_t, _jhmn_mask_k,
-                                                   return_features=True)
-                        # NTP loss on output positions
-                        _jc0, _jc1 = _jhmn_pos_k['c0'], _jhmn_pos_k['c1']
-                        lp_c   = log_probs_fn(logits_hmn[:, _jc0-1:_jc1-1])
-                        tgts_c = tokens_hmn_ir_t[:, _jc0:_jc1]
-                        _l_ntp = _positional_ls_nll(lp_c, tgts_c, _cur_ls).mean()
+                                log_probs_fn, cur_ls=_cur_ls,
+                                max_iter=_teacher_iters, lr=_teacher_lr,
+                            )
+
+                        # Forward pass at each k level: k=0 is IQ, k>0 is IR.
+                        # CER collected inline to avoid a redundant extra forward pass.
+                        # src_period: mask src at turns where t % src_period != 0.
+                        # Forces information flow through MEM at blind turns.
+                        _BLEN = slot_len + 2
+                        nll_per_turn = []
+                        cer_per_turn = []
+                        kl_per_turn  = []
+                        for _step_k in range(_jk + 1):
+                            if _step_k == 0:
+                                _tk = torch.tensor(tokens_hmn_iq, device=device)
+                                _pk, _mk = _jc['iq_pos'], _jc['iq_mask']
+                            else:
+                                _tok_k = _hmn_make_ir_batch_1tok(
+                                    rng, B, _step_k, seg_len, slot_len, warmup_len, out_len,
+                                    segs_batch=segs_hmn, wm_batch=wm_hmn, tgt_batch=tgt_hmn)
+                                if _src_period > 1:
+                                    # mask src blocks at turns where t % src_period != 0
+                                    _tok_k = _tok_k.copy()
+                                    for _t in range(_step_k + 1):
+                                        if _t % _src_period != 0:
+                                            _s0 = _t * (seg_len + _BLEN)
+                                            _tok_k[:, _s0:_s0 + seg_len] = 0
+                                _tk = torch.tensor(_tok_k, device=device)
+                                _pk, _mk = _jc['hmn_cache'][_step_k]
+                            _log_k = model(_tk, _mk)
+                            _c0, _c1 = _pk['c0'], _pk['c1']
+                            _lp_k  = log_probs_fn(_log_k[:, _c0-1:_c1-1])
+                            _tgt_k = _tk[:, _c0:_c1]
+                            nll_per_turn.append(_positional_ls_nll(_lp_k, _tgt_k, _cur_ls).mean())
+                            with torch.no_grad():
+                                _cer_k = (_log_k[:, _c0-1:_c1-1].argmax(-1) != _tgt_k).float().mean()
+                            cer_per_turn.append(_cer_k)
+                            if _teacher_lp is not None:
+                                _sl_k  = F.log_softmax(_log_k[:, _c0-1:_c1-1], dim=-1)
+                                _V     = _log_k.shape[-1]
+                                _gt_oh = F.one_hot(_tgt_k, num_classes=_V).float()
+                                # alpha at this turn
+                                if _step_k == 0:
+                                    _alpha_k = 0.0   # turn 0 always pure GT
+                                elif _teacher_alpha_fixed is not None:
+                                    _alpha_k = float(_teacher_alpha_fixed)
+                                else:
+                                    _alpha_k = min(
+                                        _teacher_alpha_start +
+                                        (1.0 - _teacher_alpha_start) *
+                                        (_step_k - 1) / max(_teacher_alpha_k_max - 1, 1),
+                                        1.0)
+                                _target = _alpha_k * _teacher_lp.exp() + \
+                                          (1.0 - _alpha_k) * _gt_oh
+                                kl_per_turn.append(F.kl_div(
+                                    _sl_k, _target,
+                                    reduction='batchmean', log_target=False))
+
+                        _l_ntp  = torch.stack(nll_per_turn).mean()
+                        _l_mono = torch.zeros(1, device=device)[0]
+                        _l_cum  = torch.zeros(1, device=device)[0]
+                        _adaptive_mono_w = 1.0
+                        _adaptive_cum_w  = 1.0
                         loss_val = _l_ntp
-                        _l_h = torch.zeros(1, device=device)[0]
-                        # h-loss on R turns: mem_blocks[2..k+1] (skip MEM_0 prior + MEM_1/I)
-                        _hmn_h_loss_w = _jc['h_loss_w']
-                        if _jk > 0 and _hmn_h_loss_w > 0.0 and h_teachers:
-                            h_losses = []
-                            for _t, _mb in enumerate(_jhmn_pos_k['mem_blocks'][2:]):
-                                h_out = x_hmn[:, _mb['sl0']:_mb['sl1'], :]
-                                h_tgt = h_teachers[min(_t, len(h_teachers) - 1)]
-                                h_losses.append(F.mse_loss(h_out, h_tgt))
-                            if h_losses:
-                                _l_h = torch.stack(h_losses).mean()
-                                loss_val = loss_val + _hmn_h_loss_w * _l_h
-                        _ti = _teacher_iters if _teacher_iters is not None else 0
-                        mode = f'tf-hmn-ir(k={_jk},ti={_ti})'
+
+                        _ntp_f = float(_l_ntp.detach())
+                        _ema_ntp = _ema_alpha * _ema_ntp + (1 - _ema_alpha) * _ntp_f
+
+                        if _jk > 0 and _mono_w > 0.0:
+                            # local/2-step: penalise adjacent-turn worsening
+                            mono_viol = [
+                                F.relu(nll_per_turn[t] - nll_per_turn[t-1] - _mono_margin)
+                                for t in range(1, len(nll_per_turn))
+                            ]
+                            _l_mono = torch.stack(mono_viol).mean()
+                            _mono_f = float(_l_mono.detach())
+                            if _mono_f > 1e-8:
+                                _ema_mono = _ema_alpha * _ema_mono + (1 - _ema_alpha) * _mono_f
+                            _adaptive_mono_w = _ema_ntp / (_ema_mono + 1e-6)
+                            loss_val = loss_val + _adaptive_mono_w * _l_mono
+
+                        if _jk > 0 and _cum_w > 0.0:
+                            # global: cum_mean_t = mean(nll_0..nll_t); excess > 0 when
+                            # early turns are worse than average (front-loading pressure)
+                            cum_means = []
+                            running = torch.zeros(1, device=device)[0]
+                            for _t, _n in enumerate(nll_per_turn):
+                                running = running + _n
+                                cum_means.append(running / (_t + 1))
+                            _l_cum_raw = torch.stack(cum_means).mean()
+                            _l_cum = F.relu(_l_cum_raw - _l_ntp.detach())
+                            _cum_f = float(_l_cum.detach())
+                            if _cum_f > 1e-8:
+                                _ema_cum = _ema_alpha * _ema_cum + (1 - _ema_alpha) * _cum_f
+                            _adaptive_cum_w = _ema_ntp / (_ema_cum + 1e-6)
+                            loss_val = loss_val + _adaptive_cum_w * _l_cum
+
+                        _l_cerb = torch.zeros(1, device=device)[0]
+                        _adaptive_cerb_w = 1.0
+                        if _jk > 0 and _cer_b_w > 0.0:
+                            # variant B: delta-CER weighted NLL.
+                            # delta_cer_t = ReLU(cer_t - cer_{t-1}): fires when CER worsens.
+                            # penalty_t = delta_cer_t * nll_t: gradient flows through nll_t,
+                            # CER delta acts as a hard gating weight (no grad).
+                            cerb_terms = []
+                            for _t in range(1, len(nll_per_turn)):
+                                _delta_cer = F.relu(cer_per_turn[_t] - cer_per_turn[_t - 1])
+                                cerb_terms.append(_delta_cer.detach() * nll_per_turn[_t])
+                            _l_cerb = torch.stack(cerb_terms).mean()
+                            _cerb_f = float(_l_cerb.detach())
+                            if _cerb_f > 1e-8:
+                                _ema_cerb = _ema_alpha * _ema_cerb + (1 - _ema_alpha) * _cerb_f
+                            _adaptive_cerb_w = _ema_ntp / (_ema_cerb + 1e-6)
+                            loss_val = loss_val + _adaptive_cerb_w * _l_cerb
+
+                        _l_distill = torch.zeros(1, device=device)[0]
+                        _adaptive_distill_w = 1.0
+                        if kl_per_turn:
+                            _l_distill = torch.stack(kl_per_turn).mean()
+                            _dist_f = float(_l_distill.detach())
+                            if _dist_f > 1e-8:
+                                _ema_distill = _ema_alpha * _ema_distill + (1 - _ema_alpha) * _dist_f
+                            _adaptive_distill_w = _ema_ntp / (_ema_distill + 1e-6)
+                            loss_val = loss_val + _adaptive_distill_w * _l_distill
+
+                        # CER on final turn — already computed inline, no extra forward pass
+                        _step_cer = float(cer_per_turn[-1])
+
+                        mode = f'tf-hmn-mono(k={_jk})'
                         _online_stats = dict(
-                            teacher_iters=_ti,
-                            teacher_stop_loss=round(float(_stop_loss) if _jk > 0 else 0.0, 5),
                             hmn_k=_jk,
                             hmn_l_ntp=round(float(_l_ntp), 5),
-                            hmn_l_h=round(float(_l_h), 5),
+                            hmn_l_mono=round(float(_l_mono), 5),
+                            hmn_l_cum=round(float(_l_cum), 5),
+                            hmn_l_cerb=round(float(_l_cerb), 5),
+                            hmn_l_distill=round(float(_l_distill), 5),
+                            hmn_mono_w=round(_adaptive_mono_w, 4),
+                            hmn_cum_w=round(_adaptive_cum_w, 4),
+                            hmn_cerb_w=round(_adaptive_cerb_w, 4),
+                            hmn_distill_w=round(_adaptive_distill_w, 4),
+                            step_cer=round(_step_cer, 4),
+                            nll_turns=[round(float(n), 4) for n in nll_per_turn],
+                            cer_turns=[round(float(c), 4) for c in cer_per_turn],
                         )
                     elif _jc['traj'] == 'int':
                         logits = model(tokens, _jc['mask'])
@@ -1527,6 +1719,9 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 _use_ref_eval = seq_mode == 'ref' or (seq_mode == 'joint' and _has_ref_joint)
                 _use_hmn_eval = seq_mode == 'joint' and _has_hmn_joint
                 _hmn_eval_turns = stage.get('hmn_eval_turns', hp.get('hmn_eval_turns', [0]))
+                _hmn_ir_jm = next((jm for jm in stage.get('joint_mix', [])
+                                   if jm.get('traj') == 'hmn_ir'), {})
+                _hmn_src_period = _hmn_ir_jm.get('src_period', 1)
 
                 # HMN overfit eval — adaptive, double-confirm 100%
                 if _use_hmn_eval and _overfit_examples:
@@ -1537,7 +1732,7 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         for _ov_xS, _ov_wm, _ov_tgt in _overfit_examples:
                             _hmn_g = ar_decode_hmn_ir(
                                 model, _ov_xS, slot_len, _ov_wm, len(_ov_tgt),
-                                device, k=_hmn_k)
+                                device, k=_hmn_k, src_period=_hmn_src_period)
                             _hmn_cer_list.append(cer(_hmn_g, _ov_tgt))
                         _hmn_ov_perfect = (sum(_hmn_cer_list) == 0.0)
                         _hmn_match = round(100 * (1 - sum(_hmn_cer_list)/len(_hmn_cer_list)), 1)
@@ -1603,7 +1798,8 @@ def train_role(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                             tgt = x_S[y_start:y_end]
                             with torch.no_grad():
                                 g = ar_decode_hmn_ir(model, x_S, slot_len, wm,
-                                                     len(tgt), device, k=_hk)
+                                                     len(tgt), device, k=_hk,
+                                                     src_period=_hmn_src_period)
                             _hk_cer.append(cer(g, tgt))
                             if _verbose_eval and len(_hk_verbose) < _verbose_n:
                                 _hk_verbose.append((sname, wm, tgt, g))
@@ -1982,9 +2178,11 @@ if __name__ == '__main__':
                           if jm.get('traj') == 'hmn_ir'), {})
             _train_period = _jm0.get('src_period', 1)
             _vn = hp.get('verbose_eval_n', 4)
+            # Mode 1: same src_period as training (in-distribution)
             print(f'\n--- HMN eval [src_period={_train_period}, in-distribution] ---')
             run_hmn_eval(model, _cur0, device, verbose=True, verbose_n=_vn,
                          src_period_override=None)
+            # Mode 2: bottleneck — only turn 0 sees src (src_period=9999)
             if _train_period != 1:
                 print(f'\n--- HMN eval [src_period=∞, bottleneck: only t=0 sees src] ---')
                 run_hmn_eval(model, _cur0, device, verbose=False,

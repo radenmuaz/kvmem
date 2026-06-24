@@ -367,6 +367,235 @@ Sample `n_blocks` from a distribution (geometric or uniform) — trains all spac
 
 ---
 
+## 8. HashMemNet (v3) — Implicit Memory Architecture
+
+All v2 chat tags removed. Memory is implicit: only `MEM_START/MEM_END/SLOT_*` tokens (IDs 256–267). Vocab size fixed at 268.
+
+### Token Vocabulary
+
+| Token | ID | Role |
+|-------|----|------|
+| `MEM_START` | 256 | Begin memory block |
+| `MEM_END`   | 257 | End memory block |
+| `SLOT_0–3`  | 258–261 | Slot positions (cycling for any `slot_len`) |
+| `DEL_START` | 262 | Begin forget block (Stage 4+) |
+| `DEL_END`   | 263 | End forget block |
+| `DEL_SLOT_0–3` | 264–267 | Delete slot positions (cycling) |
+
+`slot_len=0` → block is `[MEM_START, MEM_END]` (ponder/gate mode, 2 tokens only).
+
+### Sequence Layout
+
+BLEN = slot_len + 2 (one MEM block: MEM_START + slots + MEM_END).
+
+```
+k=0 (I Q):   [MEM_0][src][MEM_1][warmup][out]
+k=1 (I R Q): [MEM_0][src][MEM_1][src][MEM_2][warmup][out]
+k=n:         [MEM_0][src][MEM_1]...[src][MEM_{n+1}][warmup][out]
+```
+
+- **MEM_0** = prior state (zeros/cold start for first call; save KV → reload as MEM_0 for streaming)
+- **MEM_1** = I output after first read of src (no h-loss; trained via NTP backprop only)
+- **MEM_2..n+1** = R outputs, one per refinement turn (h-loss each vs teacher trajectory)
+- **Recall** (warmup+out) sees **only MEM_{n+1}** — blocked from all src and MEM_0..n
+
+Total L = (n+2)·BLEN + (n+1)·src_len + warmup_len + out_len
+
+### Operation Semantics
+
+| Op | Role | h-loss? | Teacher steps |
+|----|------|---------|---------------|
+| **I** | `[MEM_0][src][MEM_1]` — first compress | ✗ | 0 |
+| **R** | `[src][MEM_t]` — refinement turn | ✓ MSE on slots | +1 per R |
+| **Q** | `[warmup][out]` — recall (R with k=0) | ✗ NTP only | 0 |
+| **D** | `[DEL_START][DEL_SLOT×n][DEL_END]` — forget | ✓ max-entropy | 1 |
+
+Sequence programs:
+```
+I Q          k=0: [MEM_0][src][MEM_1][warmup][out]   — NTP only
+I R Q        k=1: [MEM_0][src][MEM_1][src][MEM_2][warmup][out]   — 1 h-loss
+I R R Q      k=2: +[src][MEM_3]  — 2 h-losses
+I R R R Q    k=3:               — 3 h-losses
+```
+
+### Correct Refine Objective (and current code gap)
+
+**Key insight**: supervision is always available during training (we have ground truth bytes). So every intermediate position can be teacher-forced — no AR decode needed during training. AR is only needed at inference for the **final Q**.
+
+**The correct per-turn objective:**
+
+At every R turn t, run a TF forward pass. Its output should argmax to the correct target bytes. If it fails, MEM_{t+1} must be corrected so the next turn's TF argmax succeeds. Only the final Q is AR at inference.
+
+This requires per-turn outputs in the sequence:
+
+```
+[MEM_0][src][MEM_1][warmup][out_1_tf]        ← I: TF output, NTP supervised
+[MEM_1][src][MEM_2][warmup][out_2_tf]        ← R1: TF output, NTP supervised
+...
+[MEM_k][warmup][out_final]                    ← Q: TF during training, AR at inference
+```
+
+h-loss target for MEM_{t+1}: run teacher on turn t's sub-sequence `[MEM_t][src][MEM_{t+1}][warmup][out_t]` until argmax is correct → h*. Push MEM_{t+1} → h*.
+
+The cascade: if out_1 argmax fails → h-loss on MEM_2 corrects it → out_2 argmax should then pass → and so on until final Q.
+
+**What the current code actually does:**
+
+1. Builds an **IQ batch** `[MEM_0][src][MEM_1][warmup][out]`
+2. Runs teacher once on that IQ batch — clones model, gradient-descends on NTP at `out` positions, stops when `argmax == tgt` for all tokens
+3. Records MEM_1 slot activations at k evenly-spaced checkpoints → h_teachers
+4. Builds IR batch `[MEM_0][src][MEM_1][src][MEM_2]...[warmup][out_final]` with same src
+5. Computes h-loss: MSE(MEM_2 activations, h_teachers[0]), MSE(MEM_3, h_teachers[1]), ...
+6. NTP loss only on the **single final `out`** position
+
+**The gaps:**
+
+| Issue | Description |
+|-------|-------------|
+| No per-turn outputs | IR sequence has no `out_t` at intermediate turns — no per-turn argmax check |
+| Teacher context mismatch | Teacher runs on IQ `[MEM_0][src][MEM_1][…]`, but MEM_2 in IR sees `[MEM_0][src][MEM_1][src][MEM_2]` — different context |
+| Single teacher run | Teacher is run once and targets reused across all turns. Correct version: run teacher separately for each turn in the correct turn context (sequential, expensive) |
+| h-loss target semantics | h_teachers[t] = MEM_1 activations of a cloned model after t gradient-descent steps on model weights, not a direct "what activations would make argmax correct" |
+
+**The teacher's argmax stopping criterion** (line 466–468 in train.py) is correct: it stops gradient descent when `(pred == tgt).all()`. So the oracle h* is "what a model-with-better-weights produces when it can correctly recall" — a reasonable proxy for the per-turn target, just computed in the wrong context (IQ instead of per-turn IR sub-sequence).
+
+**Gap severity:** The teacher-context mismatch is the main issue. h_teachers gives targets for what MEM_1 should look like in an IQ sequence, but MEM_2 in IR is conditioned on MEM_1 before it. If the model learns to use MEM_1 as prior context in MEM_2's update, the IQ-derived target is off-distribution. May cause stagnation at higher k (k≥2).
+
+**Fix:** Add per-turn outputs to the IR sequence and run the teacher on each turn's sub-sequence using the actual MEM_t from the current forward pass as prior state. Expensive (k teacher runs per training step) but matches the correct objective exactly.
+
+**Simpler training: no h-targets needed**
+
+If monotonic NLL decrease per turn is enforced, the teacher trajectory is unnecessary. The only signals needed are:
+
+1. Per-turn NTP loss on each turn's output (TF during training)
+2. Monotonicity penalty: heavy loss if NLL does not strictly decrease turn-over-turn
+
+```python
+nll = [NLL_0, NLL_1, ..., NLL_k, NLL_final]
+mono_penalty = sum(F.relu(nll[t+1] - nll[t] + margin) for t in range(len(nll)-1))
+loss = nll_final + λ_mono * mono_penalty
+```
+
+No model cloning, no h-loss MSE targets, no teacher context mismatch. The model discovers what MEM state to produce — the only constraint is that NLL must decrease. `λ_mono` must be large (heavily penalized) to force strict monotonicity rather than allowing plateaus.
+
+This removes `compute_teacher_trajectory` entirely and replaces it with a single forward pass through the full per-turn sequence. Simpler code, cleaner gradient, no target mismatch.
+
+**Requirement:** sequence must have per-turn outputs `[out_t]` at each R turn to compute per-turn NLL (not just the final Q). The current HMN sequence layout lacks these.
+
+**Test-time implication — supervision is available at inference too:**
+
+At inference, the src bytes are known (we just read them). So the argmax-correctness check works at test time with zero extra cost:
+
+```
+1. Store: [MEM_0][src][MEM_1]
+2. Verify: forward([MEM_1][src_tf]) → check argmax == src bytes
+3. If < 100% match: do another R turn → [MEM_1][src][MEM_2]
+4. Verify again. Repeat until 100% or max_turns.
+5. Recall: AR decode [MEM_k][warmup][out]
+```
+
+This gives **adaptive compute at inference** — easy inputs converge in 1–2 turns, hard inputs get more. The training monotonicity requirement (each R turn must improve argmax match, never regress) is what makes this safe to run until convergence: you know stopping when argmax is 100% is always valid, and you know more turns never hurt.
+
+Training must enforce: match(turn t+1) ≥ match(turn t) strictly. If this monotonicity holds, the test-time verify-then-refine loop is a greedy decoder with a guaranteed stopping condition.
+
+### Experiment Ladder
+
+| Stage | Config | Sequence | Signal |
+|-------|--------|----------|--------|
+| 1 | `hmn_32` s1 | I Q full (warmup=0, out=32) | overfit→100%, val_hmn_bpb↓ |
+| 2 | `hmn_32` s2 | I Q windowed (wm=8, out=24) | hmn_k0 match% |
+| 3 | `hmn_32` s3 | I R Q k∈{0..4} windowed | Δ=tN−t1>0 per turn |
+| 4 | `hmn_32` s4 | joint mix (IQ 40% + IR 60%) | no regression on k0 |
+
+### Residual Corrector Idea (if Stage 3 stalls)
+
+If the model struggles to express correction through slot activations alone, a two-pass residual corrector could help:
+
+**Architecture variant:**
+1. **Pass 1 (residual pass)**: forward with the same `[src][MEM][…]` sequence but a *residual corrector* block `[MEM_START][CORR_SLOT×n][MEM_END]` appended. This pass generates correction KV activations targeting the error signal.
+2. **Pass 2 (memory pass)**: regular forward, but slot activations are `h_prev + h_corr` (residual add). Corrector output is added to the current memory state before the second decode.
+
+This separates *"what is wrong"* from *"what to remember"* into two distinct representations. Each pass is a full single forward (no parallel shortcut).
+
+**Format**: same cycling `SLOT_0–3` IDs, just a new block type. Model learns correction-block semantics from the h-loss target (teacher trajectory delta: `h_target - h_current`).
+
+**Trade-off vs direct (current):**
+- Current: single pass, slot activations must encode both memory and error in one representation
+- Residual: two passes per step, stronger separation; correction block targets `Δh`, memory block targets `h`
+- Try direct first; switch to residual if correction diverges or Δ(tN−t1) < 0 after step 40k
+
+### Soft Residual Corrector (expensive, stronger error signal)
+
+New token type: `[RES_START][RES_SLOT×n][RES_END]` — the residual correction block, same cycling IDs as MEM but separate token type so the model distinguishes "store" from "correct".
+
+**Training loop per step** (converge inner loop before outer gradient step):
+
+```
+iter 0:
+  Pass A — teacher-forced NLL:
+    forward([MEM_1, tf_src, MEM_2])  →  logits, NLL_loss
+    softmax(logits) → p  →  embed_mix = Σ_v p[v] · E[v]   (soft, no Gumbel, fully differentiable)
+
+  Pass B — residual correction:
+    forward([MEM_1, embed_mix, RES_1])  →  h_res1
+    MSE(h_res1, h_teacher_target)  →  res_loss
+    KV(MEM_2) += KV(RES_1)   (residual add in KV space; MEM_2 is now corrected)
+
+iter 1:
+  Pass A — teacher-forced NLL with updated MEM_2:
+    forward([MEM_2_corrected, tf_src, MEM_3])  →  NLL_loss
+    softmax(logits) → embed_mix
+
+  Pass B — residual correction:
+    forward([MEM_2_corrected, embed_mix, RES_2])  →  h_res2
+    MSE(h_res2, h_teacher_target_2)
+    KV(MEM_3) += KV(RES_2)
+
+... repeat until NLL_loss converges or max_iter reached
+```
+
+**Why soft embedding (not Gumbel/discrete):**
+- Softmax weighted sum `Σ p[v]·E[v]` is differentiable through the logits — gradients flow from the residual MSE loss back through Pass B embeddings, through the softmax, back through the NLL logits, into MEM_1 activations
+- Gumbel-softmax would discretize and require straight-through estimator, weaker gradient signal
+- This gives the residual block a direct gradient path to the memory slot that produced the wrong token distribution
+
+**Why KV residual add (not activation add):**
+- KV cache is the persistent memory structure — adding RES KV to MEM KV means downstream positions (MEM_3 forward) can attend to both the raw memory and the correction, weighted by attention
+- Activation add would collapse both into a single vector before attention, losing the ability to query correction vs memory separately
+
+**Cost vs benefit:**
+- Cost: 2 forward passes per inner iteration × max_iter iterations (vs 1 forward in direct h-loss)
+- Benefit: gradients flow through the full correction chain; error and memory are separate representations; each iteration refines the correction rather than forcing one-shot convergence
+- Fall back to this if direct h-loss stalls (Δ match per turn < 1% after step 60k)
+
+**Gradient path analysis:**
+
+The connected graph from res_loss back to MEM_1 is: `res_loss → Pass B → embed_mix → softmax → logits_A → Pass A → MEM_1`. Standard `backward()` works — no retain_graph tricks because embed_mix is a leaf output of Pass A that flows into Pass B.
+
+**Problems:**
+
+1. **logits_A has two conflicting objectives.** NLL_loss wants logits_A[correct_token] high. res_loss (via embed_mix) wants logits_A[v] high for whichever token v has embedding E[v] that pushes h_res1 toward h_teacher. These agree only if the correct next token's embedding also happens to be the best correction signal — not guaranteed. The gradient at logits_A is a sum of two unrelated tasks.
+
+2. **embed_mix is off-distribution for Pass B.** Pass B's transformer was trained on discrete token embeddings, not arbitrary weighted sums from a softmax. The attention patterns in Pass B for a continuous mixture input are unpredictable unless Pass B is trained from scratch with soft inputs.
+
+3. **KV add requires non-standard forward.** `KV(MEM_2) += KV(RES_1)` has no standard transformer equivalent — MEM_2 token IDs are unchanged between iterations, so the transformer recomputes identical KV values. Injecting the RES KV requires hooking the K/V projection at MEM_2 positions per-layer, which breaks standard autograd.
+
+**Cleaner alternative — context concatenation instead of KV add:**
+
+Drop KV manipulation. RES_1 is just additional context tokens, carried forward:
+
+```
+iter 0: forward([MEM_1, tf_src, MEM_2]) → NLL, embed_mix
+        forward([MEM_1, embed_mix, RES_1]) → MSE
+
+iter 1: forward([MEM_1, RES_1, tf_src, MEM_3]) → NLL_2, embed_mix_2
+        forward([MEM_1, RES_1, embed_mix_2, RES_2]) → MSE_2
+```
+
+MEM_3 attends to both MEM_1 and RES_1 via standard causal attention — no hooks, no KV surgery, clean gradient everywhere. The unresolved issue (conflicting objectives on logits_A) remains regardless of KV vs context. The only fix for that is to detach logits_A from res_loss entirely, making embed_mix a stop-gradient from the NLL path — then res_loss only trains Pass B, and Pass A is trained only by NLL. Weaker but cleaner signal separation.
+
+---
+
 ## 7. Raw Data & Reports
 
 ### Active

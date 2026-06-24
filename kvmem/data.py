@@ -2160,5 +2160,268 @@ def _cli():
         _print_tokens_info(tokens, meta, args.path)
 
 
+# ---------------------------------------------------------------------------
+# HashMemNet (HMN) — Implicit memory, no chat tags
+# ---------------------------------------------------------------------------
+# Vocab: 256 data bytes + 12 special = 268 total (fixed, independent of slot_len)
+#
+# Token IDs:
+#   256 = HMN_MEM_START  — begin memory compression block
+#   257 = HMN_MEM_END    — end memory block
+#   258-261 = HMN_SLOT_0-3 — slot positions (cycling for slot_len > 4)
+#   262 = HMN_DEL_START  (reserved for Stage 4 Delete)
+#   263 = HMN_DEL_END
+#   264-267 = HMN_DEL_SLOT_0-3
+#
+# Sequence layout:
+#   I Q    (k=0): [MEM_0][src][MEM_1][warmup][out]
+#   I R Q  (k=1): [MEM_0][src][MEM_1][src][MEM_2][warmup][out]
+#   I R^k Q:      [MEM_0][src][MEM_1]...[src][MEM_{k+1}][warmup][out]
+#
+#   MEM_0   = prior state (zeros / cold start; saved KV for streaming reuse)
+#   MEM_1   = I output (no h-loss)
+#   MEM_2+  = R outputs (h-loss vs teacher trajectory targets)
+#   Recall  = sees ONLY MEM_{k+1} (full bottleneck); blocked from all src and MEM_0..k
+#
+# Q = R(k=0): unsupervised recall (NTP only, no teacher steps)
+# R = supervised refinement: +1 teacher step, +1 h-loss target per R turn
+# ---------------------------------------------------------------------------
+
+HMN_MEM_START  = 256
+HMN_MEM_END    = 257
+HMN_SLOT_0     = 258
+HMN_SLOT_1     = 259
+HMN_SLOT_2     = 260
+HMN_SLOT_3     = 261
+HMN_DEL_START  = 262
+HMN_DEL_END    = 263
+HMN_DEL_SLOT_0 = 264
+HMN_DEL_SLOT_1 = 265
+HMN_DEL_SLOT_2 = 266
+HMN_DEL_SLOT_3 = 267
+
+HMN_VOCAB_SIZE = 268
+
+_HMN_SLOT_IDS     = [HMN_SLOT_0, HMN_SLOT_1, HMN_SLOT_2, HMN_SLOT_3]
+_HMN_DEL_SLOT_IDS = [HMN_DEL_SLOT_0, HMN_DEL_SLOT_1, HMN_DEL_SLOT_2, HMN_DEL_SLOT_3]
+
+
+def hmn_slot_ids(slot_len: int) -> list[int]:
+    """Cycling slot token IDs for slot_len positions."""
+    return [_HMN_SLOT_IDS[i % 4] for i in range(slot_len)]
+
+
+def hmn_del_slot_ids(slot_len: int) -> list[int]:
+    return [_HMN_DEL_SLOT_IDS[i % 4] for i in range(slot_len)]
+
+
+def hmn_ir_positions(src_len: int, slot_len: int,
+                     warmup_len: int, out_len: int, k: int) -> dict:
+    """
+    Positions for [MEM_0][src_0][MEM_1]...[src_k][MEM_{k+1}][warmup][out].
+
+    k=0 (I Q): [MEM_0][src][MEM_1][warmup][out]  — 2 MEM blocks, 1 src block
+    k=1 (I R Q): [MEM_0][src][MEM_1][src][MEM_2][warmup][out]  — 3 MEM, 2 src
+    ...
+
+    MEM_0     = prior state (cold start = zeros; save/reload for streaming)
+    MEM_1     = I output (first compress; no h-loss)
+    MEM_2..+  = R outputs (h-loss vs teacher trajectory; 1 per R turn)
+    Recall    = sees MEM_{k+1} only (strict bottleneck; blocked from src and MEM_0..k)
+
+    Returns:
+      mem_blocks: list of k+2 dicts {ms, sl0, sl1, me}
+      src_blocks: list of k+1 dicts {s0, s1}
+      final_mem:  mem_blocks[-1]
+      src_start/src_end: convenience aliases for src_blocks[0]
+      output_sl0/sl1:    convenience aliases for mem_blocks[1] slot range (h-loss target for IQ)
+      w0, w1, c0, c1, L, BLEN, k
+    """
+    BLEN = slot_len + 2  # MEM_START + slots + MEM_END
+    n_mems = k + 2       # MEM_0 .. MEM_{k+1}
+    n_srcs = k + 1       # src_0 .. src_k
+
+    mem_blocks = []
+    for t in range(n_mems):
+        ms  = t * (src_len + BLEN)
+        sl0 = ms + 1
+        sl1 = sl0 + slot_len
+        me  = sl1
+        mem_blocks.append(dict(ms=ms, sl0=sl0, sl1=sl1, me=me))
+
+    src_blocks = []
+    for t in range(n_srcs):
+        s0 = mem_blocks[t]['me'] + 1
+        s1 = s0 + src_len
+        src_blocks.append(dict(s0=s0, s1=s1))
+
+    final_mem = mem_blocks[-1]
+    w0 = final_mem['me'] + 1
+    w1 = w0 + warmup_len
+    c0 = w1
+    c1 = c0 + out_len
+    L  = c1
+
+    return dict(
+        k=k, BLEN=BLEN,
+        mem_blocks=mem_blocks,
+        src_blocks=src_blocks,
+        final_mem=final_mem,
+        final_sl0=final_mem['sl0'], final_sl1=final_mem['sl1'],
+        # h-loss target range for IQ teacher (MEM_1 slots)
+        output_sl0=mem_blocks[1]['sl0'], output_sl1=mem_blocks[1]['sl1'],
+        # src convenience aliases (first src block)
+        src_start=src_blocks[0]['s0'], src_end=src_blocks[0]['s1'],
+        w0=w0, w1=w1, c0=c0, c1=c1, L=L,
+    )
+
+
+def hmn_iq_positions(src_len: int, slot_len: int,
+                     warmup_len: int, out_len: int) -> dict:
+    """Convenience wrapper: hmn_ir_positions(k=0)."""
+    return hmn_ir_positions(src_len, slot_len, warmup_len, out_len, k=0)
+
+
+def hmn_mask_ir(src_len: int, slot_len: int,
+                warmup_len: int, out_len: int, k: int) -> np.ndarray:
+    """
+    Attention mask for [MEM_0][src_0][MEM_1]...[src_k][MEM_{k+1}][warmup][out].
+
+    Rules:
+      - Base: causal (lower triangular)
+      - Recall rows (warmup+out): blocked from everything EXCEPT final MEM block + recall itself
+        (enforces full bottleneck through MEM_{k+1})
+    """
+    pos = hmn_ir_positions(src_len, slot_len, warmup_len, out_len, k)
+    L   = pos['L']
+    r   = np.arange(L)
+    c   = np.arange(L)
+
+    # Base: causal
+    visible = c[None, :] <= r[:, None]
+
+    # Recall bottleneck: block recall rows from everything before final MEM
+    final_ms = pos['final_mem']['ms']
+    final_me = pos['final_mem']['me']
+    recall_row   = r >= pos['w0']
+    in_final_mem = (c >= final_ms) & (c <= final_me)
+    in_recall    = c >= pos['w0']
+    # For recall rows: only final MEM cols and recall cols are allowed
+    recall_blocked = recall_row[:, None] & ~(in_final_mem | in_recall)[None, :]
+    visible = visible & ~recall_blocked
+
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
+
+
+def hmn_mask_iq(src_len: int, slot_len: int,
+                warmup_len: int, out_len: int) -> np.ndarray:
+    """Attention mask for I Q (k=0)."""
+    return hmn_mask_ir(src_len, slot_len, warmup_len, out_len, k=0)
+
+
+def hmn_make_iq_batch(rng: np.random.Generator, B: int,
+                      src_len: int, slot_len: int,
+                      warmup_len: int, out_len: int) -> np.ndarray:
+    """Build I Q batch: [MEM_0][src][MEM_1][warmup][out]."""
+    pos     = hmn_iq_positions(src_len, slot_len, warmup_len, out_len)
+    L       = pos['L']
+    sids    = hmn_slot_ids(slot_len)
+    out_arr = np.zeros((B, L), dtype=np.int64)
+    n_win   = max(1, src_len - out_len) if warmup_len > 0 else 1
+    mb0, mb1 = pos['mem_blocks'][0], pos['mem_blocks'][1]
+    sb0      = pos['src_blocks'][0]
+
+    for i in range(B):
+        seg = _sample_seg(rng, src_len)
+        # MEM_0 (prior state — cold start, tokens only; residual stream is zeros)
+        out_arr[i, mb0['ms']]            = HMN_MEM_START
+        out_arr[i, mb0['sl0']:mb0['sl1']] = sids
+        out_arr[i, mb0['me']]            = HMN_MEM_END
+        # src
+        out_arr[i, sb0['s0']:sb0['s1']]  = seg
+        # MEM_1 (updated state after reading src)
+        out_arr[i, mb1['ms']]            = HMN_MEM_START
+        out_arr[i, mb1['sl0']:mb1['sl1']] = sids
+        out_arr[i, mb1['me']]            = HMN_MEM_END
+
+        if warmup_len > 0:
+            y_start = int(rng.integers(0, n_win + 1))
+        else:
+            y_start = 0
+        y_end = min(y_start + out_len, src_len)
+        if warmup_len > 0:
+            w_st = max(0, y_start - warmup_len)
+            wm   = seg[w_st:y_start]
+            if len(wm) < warmup_len:
+                wm = np.concatenate([np.full(warmup_len - len(wm), seg[0], dtype=np.int32), wm])
+            out_arr[i, pos['w0']:pos['w1']] = wm
+        out_arr[i, pos['c0']:pos['c0'] + (y_end - y_start)] = seg[y_start:y_end]
+
+    return out_arr
+
+
+def hmn_extract_batch(tokens_np: np.ndarray, pos: dict) -> tuple:
+    """Extract (segs, wm, tgt) from an hmn_make_iq_batch result."""
+    segs = tokens_np[:, pos['src_start']:pos['src_end']]
+    wm   = tokens_np[:, pos['w0']:pos['w1']] if pos['w1'] > pos['w0'] else None
+    tgt  = tokens_np[:, pos['c0']:pos['c1']]
+    return segs, wm, tgt
+
+
+def hmn_make_ir_batch(rng: np.random.Generator, B: int, k: int,
+                      src_len: int, slot_len: int,
+                      warmup_len: int, out_len: int,
+                      segs_batch: np.ndarray | None = None,
+                      wm_batch:   np.ndarray | None = None,
+                      tgt_batch:  np.ndarray | None = None) -> np.ndarray:
+    """
+    Build I R^k Q batch: [MEM_0][src][MEM_1]...[src][MEM_{k+1}][warmup][out].
+
+    k=0: degenerates to I Q.
+    segs_batch: (B, src_len) pre-sampled src — repeated across all src blocks.
+    """
+    pos     = hmn_ir_positions(src_len, slot_len, warmup_len, out_len, k)
+    L       = pos['L']
+    sids    = hmn_slot_ids(slot_len)
+    out_arr = np.zeros((B, L), dtype=np.int64)
+    n_win   = max(1, src_len - out_len) if warmup_len > 0 else 1
+
+    for i in range(B):
+        seg = segs_batch[i] if segs_batch is not None else _sample_seg(rng, src_len)
+
+        for mb in pos['mem_blocks']:
+            out_arr[i, mb['ms']]             = HMN_MEM_START
+            out_arr[i, mb['sl0']:mb['sl1']]  = sids
+            out_arr[i, mb['me']]             = HMN_MEM_END
+
+        for sb in pos['src_blocks']:
+            out_arr[i, sb['s0']:sb['s1']] = seg
+
+        if wm_batch is not None:
+            wm    = wm_batch[i]
+            y_ref = tgt_batch[i]
+        else:
+            if warmup_len > 0:
+                y_start = int(rng.integers(0, n_win + 1))
+            else:
+                y_start = 0
+            y_end = min(y_start + out_len, src_len)
+            if warmup_len > 0:
+                w_st = max(0, y_start - warmup_len)
+                wm   = seg[w_st:y_start]
+                if len(wm) < warmup_len:
+                    wm = np.concatenate([np.full(warmup_len - len(wm), seg[0], dtype=np.int32), wm])
+            else:
+                wm = np.empty(0, dtype=np.int32)
+            y_ref = seg[y_start:y_end]
+
+        if warmup_len > 0:
+            out_arr[i, pos['w0']:pos['w1']] = wm
+        alen = len(y_ref)
+        out_arr[i, pos['c0']:pos['c0'] + alen] = y_ref
+
+    return out_arr
+
+
 if __name__ == '__main__':
     _cli()
