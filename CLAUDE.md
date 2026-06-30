@@ -23,67 +23,90 @@ Fast-weight language model — HashMemNet (HMN). Two architectures: v3 (MEM bloc
 
 ---
 
-## Chunk Memorization — Feedback SRS Architecture (current work)
+## Chunk Memorization — Local-Refine Windowed Architecture (current work)
 
-**Redesigned architecture**: depth-2 SRS with explicit feedback argmax IR turns + chunked attention.
+**Earlier depth-2 SRS curriculum (`hmn_chunk_curric`/`hmn_chunk_srs_ir`) FAILED**: stage 0
+(IQ-only, 256B src, 64x slot compression/chunk) never escaped random-baseline BPB (~8.0)
+after 12000 steps. Root cause diagnosed as too-aggressive compression + far too few
+training steps, not a windowing/refinement problem per se.
 
-**Training script**: [`kvmem/train_hmn_chunk.py`](kvmem/train_hmn_chunk.py) — use `train_fn='fb'` in config for feedback arch.
+**Current approach**: fall back to the ONE proven mechanism (`hmn_feedback_32_ir`:
+100% match k=0..12) — IQ once + 2 chained argmax-refine IR turns, scoped to a single
+32-byte window — and grow scale by adding MORE overlapping 32-byte windows (fixed
+window=32B, fixed stride=16B, 50% overlap) instead of widening compression ratio.
+`chunk_len=16` makes 32B windows / 16B stride land exactly on chunk-index boundaries.
 
-### Sequence layout (single forward pass, feedback IR)
+**Training script**: [`kvmem/train_hmn_chunk.py`](kvmem/train_hmn_chunk.py) — use `train_fn='fb'` in config.
+
+### Local-refine window unit (`ir_local` trajectory type)
 ```
-Encoding:  [chunk_0: C][SLOT×s] ... [chunk_{N-1}: C][SLOT×s]
-
-Per SRS span (depth-2: halves + full):
-  Turn 0 (IQ):  [SLOT_0: s][warmup: wl][out_0: ol]           ← initial recall
-  Turn 1 (IR):  [SLOT_A: s][argmax_0: ol][SLOT_B: s][warmup: wl][out_1: ol]  ← feedback
+chunk_positions_fb_localrefine(n_chunks, chunk_len, slot_len, warmup_len, windows, n_refine)
 ```
-- `argmax_0` = model's own greedy output from turn 0 (detached, 2 forward passes/step)
-- `warmup_len=8`, `ol = span_len - wl`
-- Mask: IR warmup/out blocked from everything except own SLOT_B + own warmup/out
-- Chunked attention: `chunk_attn=512` to bound peak memory to O(L×chunk)
+Each `window` in `windows` gets its OWN local IQ turn (recall scoped only to that
+window's chunks, not a global full-source read) + `n_refine` chained argmax-IR turns
+refining the same window — directly reusing the `hmn_feedback_32_ir` unit, just scoped
+per-window instead of always "the whole source". Windows are processed in sequence,
+threading one running token offset; `chunk_mask_fb`/`_chunk_make_batch_fb`/
+`_fill_argmax_fb` are generic and needed **no changes** to support this.
 
-### Depth-2 SRS schedule
-```python
-srs_schedule_depth2(N):  # N=2 → [(0,1),(1,2),(0,2)];  N=4 → [(0,2),(2,4),(0,4)]
-    halves + full  (3 spans always)
-```
+### Stage recipe — **must match the proven `hmn_feedback_32_iq`/`_ir` recipe**
+A slot_len=2 / 8k-step first attempt undertrained badly: stage 1 (IR) eval BPB
+diverged 10→19 while train loss kept falling (classic premature-feedback-before-IQ-
+is-solid failure). Fix: `slot_len=4` (not 2), IQ stage 50000 steps, IR stage 80000
+steps — exactly matching `hmn_feedback_32_iq.py`/`hmn_feedback_32_ir.py`.
 
-### Training queue (RESET — feedback SRS arch)
+| Stage | n_chunks (src) | windows (chunk-idx) | n_refine | steps | Config |
+|---|---|---|---|---|---|
+| 1 | 2 (32B) | `[(0,2)]` | 0 | 50000 | `hmn_chunk_local_32.py` (stage 0) |
+| 2 | 2 (32B) | `[(0,2)]` | 2 | 80000 | `hmn_chunk_local_32.py` (stage 1) |
+| 3 | 4 (64B) | `[(0,2),(1,3),(2,4)]` | 2 | 80000 | `hmn_chunk_local_64.py`, resumes stage 2 |
 
-| # | Config | Size | Test set | Status |
-|---|--------|------|----------|--------|
-| sanity | `hmn_chunk_sanity` | 256B (2×128) | suratalkauthar.txt (179B) | **RUNNING** (step ~130/20k) |
-| full | `hmn_chunk_1024` | 1024B (4×256) | suratalfatihah.txt (556B) | queued if sanity passes |
+Growth rule (fixed window=32B, fixed stride=16B): `n_windows = (src_len-32)/16 + 1`.
+128B→7 windows, 256B→15 windows (chunk-idx tuples `(i,i+2)` stepping by 1).
 
-**Decision**: if sanity BPB improves and test_match > 5% → launch full 1024 config.
+### Eval protocol — full-sequence "prolonged AR" decode (stage 3+, >1 window)
+`ar_decode_chunk_fb_stitch_kv` (next to `ar_decode_chunk_fb_kv`): only the very first
+window's warmup (first 8 bytes of the whole source) is seeded from ground truth — every
+later byte (every later window's warmup AND output) comes from the model's own
+previously generated tokens, stitched into one global `(src_len,)` buffer (later windows
+overwrite earlier ones in the 16B overlap). Works because warmup_len=8 fits entirely
+within the 16B overlap. Wired automatically in `train_chunk_fb`'s eval loop whenever
+`eval_traj == 'ir_local'` and the trajectory spans >1 window; single-window stages keep
+using the original last-block-only `ar_decode_chunk_fb_kv`. Training-time batch
+construction is unaffected (teacher-forced GT warmup per window, unchanged).
+
+### Pending follow-up
+After stage 3 finishes: eval **zero-shot** full-span (0-64) IQ-only recall (single
+window `[(0,4)]`, `n_refine=0`, no training) against stage 3's checkpoint — tests
+whether stitching transfers to an explicitly-untrained full-span read. Expected to fail
+(motivates either explicit full-span IQ training or accepting windowed-only stitching).
+
+### Parked (not deleted) — overlapping-window **stitching** experiment
+`chunk_positions_fb_stitch` + `ir_stitch` trajectory type + configs
+`hmn_chunk_stitch_a/b/smoke.py` — global IQ + per-window IR pairs + optional trailing
+full-span stitched IQ turn. Larger-scale alternative design, deferred — do not delete.
 
 ### Run commands
 ```bash
-# Sanity (running)
+# Stage 1+2 (random init)
 caffeinate -i python3 -m kvmem.train_hmn_chunk \
-    --config configs/hmn_chunk_sanity.py \
-    --pretrained logs/hmn_feedback_32_ir/checkpoints/stage0_end.pt \
-    --device mps
+    --config configs/hmn_chunk_local_32.py --device mps
 
-# Full 1024 — after sanity passes
+# Stage 3 (resumes stage 2's checkpoint)
 caffeinate -i python3 -m kvmem.train_hmn_chunk \
-    --config configs/hmn_chunk_1024.py \
-    --pretrained logs/hmn_feedback_32_ir/checkpoints/stage0_end.pt \
+    --config configs/hmn_chunk_local_64.py \
+    --pretrained logs/hmn_chunk_local_32/checkpoints/stage1_end.pt \
     --device mps
 ```
 
-### Completed runs (old arch, for reference)
-
-| Run | Best BPB | Best test_match | Notes |
-|-----|----------|-----------------|-------|
-| `hmn_chunk_fine` (baseline, wl=0) | 7.41 | 8.0% | stage 1 best |
-| `hmn_chunk_fine_wm` (q1, wl=8) | **7.26** | **10.6%** | stage 1 best, beats baseline |
-
 ### Metrics
-- **val**: `make_test_sequences` split into n_chunks (8 deterministic sequences, in-distribution)
-- **test**: specific surah file, padded to (n_chunks, chunk_len), eval-only, never trained on
-- **BPB**: teacher-forced NLL/ln(2) on IR `out_1` of final full-sequence span
-- **match%**: AR greedy exact-match on IR `out_1` of final full-sequence span
+- **val**: `make_test_sequences` split into n_chunks (`val_n_seqs` config knob caps
+  how many of the 8 deterministic sequences are used, for faster iteration)
+- **test**: specific surah file, padded to (n_chunks, chunk_len), eval-only — currently
+  omitted from new configs (no `eval_file`) for faster iteration
+- **BPB**: teacher-forced NLL/ln(2) on the final recall block's own output (single
+  window) or the full stitched sequence (multi-window, via `ar_decode_chunk_fb_stitch_kv`)
+- **match%**: AR greedy exact-match, same scope as BPB above
 
 ---
 
@@ -169,7 +192,9 @@ All variants plateau at ~95% with no monotone improvement across k turns.
 | HMN v3 reference book | [`docs/BOOK.md`](docs/BOOK.md) |
 | KV capacity + SRS trajectories | [`docs/kv_dims.md`](docs/kv_dims.md) |
 | All configs | [`configs/`](configs/) |
-| **Chunk SRS training** | [`kvmem/train_hmn_chunk.py`](kvmem/train_hmn_chunk.py) |
+| **Chunk SRS / local-refine training** | [`kvmem/train_hmn_chunk.py`](kvmem/train_hmn_chunk.py) |
+| Current local-refine configs | [`configs/hmn_chunk_local_32.py`](configs/hmn_chunk_local_32.py), [`configs/hmn_chunk_local_64.py`](configs/hmn_chunk_local_64.py) |
+| Parked stitching-experiment configs | [`configs/hmn_chunk_stitch_a.py`](configs/hmn_chunk_stitch_a.py), `_b.py`, `_smoke.py` |
 | Feedback training | [`kvmem/train_hmn_feedback.py`](kvmem/train_hmn_feedback.py) |
 | HMN v3 mono training | [`kvmem/train_hmn_mono.py`](kvmem/train_hmn_mono.py) |
 | Test set | [`datasets/suratalfatihah.txt`](datasets/suratalfatihah.txt) |
