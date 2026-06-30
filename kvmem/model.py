@@ -110,13 +110,24 @@ class MHAttention(nn.Module):
             K = torch.cat([K_past, K], dim=2)
             V = torch.cat([V_past, V], dim=2)
         if self.null_kv:
-            # Append fixed zero (K=0, V=0); extend mask with 0-column (always visible)
             null = torch.zeros(B, H, 1, dh, device=K.device, dtype=K.dtype)
             K    = torch.cat([K, null], dim=2)
             V    = torch.cat([V, null], dim=2)
             mask = F.pad(mask, (0, 1), value=0.0)
-        out = F.scaled_dot_product_attention(Q, K, V,
-                                             attn_mask=mask.unsqueeze(0).unsqueeze(0))
+        # Chunked attention: compute in row-chunks to bound peak memory O(chunk×L_kv)
+        # instead of O(L_q×L_kv). chunk_attn=0 disables chunking (full SDPA).
+        chunk = getattr(self, 'chunk_attn', 0)
+        if chunk > 0 and L > chunk:
+            m = mask.unsqueeze(0).unsqueeze(0)           # (1,1,L_q,L_kv)
+            parts = []
+            for i in range(0, L, chunk):
+                parts.append(F.scaled_dot_product_attention(
+                    Q[:, :, i:i+chunk, :], K, V,
+                    attn_mask=m[:, :, i:i+chunk, :]))
+            out = torch.cat(parts, dim=2)
+        else:
+            out = F.scaled_dot_product_attention(Q, K, V,
+                                                 attn_mask=mask.unsqueeze(0).unsqueeze(0))
         out = out.permute(0, 2, 1, 3).reshape(B, L, d)
         out = self.W_O(out)
         if not batched:
@@ -324,6 +335,11 @@ def build_model(hp: dict, device=None) -> KVMemModel:
         null_kv=hp.get('null_kv', False),
         V_out=256,
     )
+    # Chunked attention: set chunk_attn on all attention layers
+    chunk_attn = hp.get('chunk_attn', 0)
+    if chunk_attn > 0:
+        for block in model.blocks:
+            block.attn.chunk_attn = chunk_attn
     if device is not None:
         model = model.to(device)
     return model

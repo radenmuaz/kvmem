@@ -14,16 +14,78 @@ Fast-weight language model — HashMemNet (HMN). Two architectures: v3 (MEM bloc
 
 ## Current Status
 
-**Feedback architecture solved the refinement problem.**
+**Feedback architecture solved the refinement problem. Now extending to multi-sequence SRS chunk memorization.**
 
 | Run | Result |
 |-----|--------|
 | `hmn_feedback_32_ir` | **100% at k=0..4 AND k=0..12 extrapolation** ✓✓ |
 | All HMN v3 variants (mono, cerb, p2, p4, pinf, tlogit) | ~95% k=0, collapses at k>4 |
 
-**Currently running:** `hmn_feedback_32_ir_cumm` — feedback IR with cum_mean loss (likely redundant given 100% baseline, may kill).
+---
 
-**Next:** harder evaluation (longer src, multi-sequence SRS).
+## Chunk Memorization — Feedback SRS Architecture (current work)
+
+**Redesigned architecture**: depth-2 SRS with explicit feedback argmax IR turns + chunked attention.
+
+**Training script**: [`kvmem/train_hmn_chunk.py`](kvmem/train_hmn_chunk.py) — use `train_fn='fb'` in config for feedback arch.
+
+### Sequence layout (single forward pass, feedback IR)
+```
+Encoding:  [chunk_0: C][SLOT×s] ... [chunk_{N-1}: C][SLOT×s]
+
+Per SRS span (depth-2: halves + full):
+  Turn 0 (IQ):  [SLOT_0: s][warmup: wl][out_0: ol]           ← initial recall
+  Turn 1 (IR):  [SLOT_A: s][argmax_0: ol][SLOT_B: s][warmup: wl][out_1: ol]  ← feedback
+```
+- `argmax_0` = model's own greedy output from turn 0 (detached, 2 forward passes/step)
+- `warmup_len=8`, `ol = span_len - wl`
+- Mask: IR warmup/out blocked from everything except own SLOT_B + own warmup/out
+- Chunked attention: `chunk_attn=512` to bound peak memory to O(L×chunk)
+
+### Depth-2 SRS schedule
+```python
+srs_schedule_depth2(N):  # N=2 → [(0,1),(1,2),(0,2)];  N=4 → [(0,2),(2,4),(0,4)]
+    halves + full  (3 spans always)
+```
+
+### Training queue (RESET — feedback SRS arch)
+
+| # | Config | Size | Test set | Status |
+|---|--------|------|----------|--------|
+| sanity | `hmn_chunk_sanity` | 256B (2×128) | suratalkauthar.txt (179B) | **RUNNING** (step ~130/20k) |
+| full | `hmn_chunk_1024` | 1024B (4×256) | suratalfatihah.txt (556B) | queued if sanity passes |
+
+**Decision**: if sanity BPB improves and test_match > 5% → launch full 1024 config.
+
+### Run commands
+```bash
+# Sanity (running)
+caffeinate -i python3 -m kvmem.train_hmn_chunk \
+    --config configs/hmn_chunk_sanity.py \
+    --pretrained logs/hmn_feedback_32_ir/checkpoints/stage0_end.pt \
+    --device mps
+
+# Full 1024 — after sanity passes
+caffeinate -i python3 -m kvmem.train_hmn_chunk \
+    --config configs/hmn_chunk_1024.py \
+    --pretrained logs/hmn_feedback_32_ir/checkpoints/stage0_end.pt \
+    --device mps
+```
+
+### Completed runs (old arch, for reference)
+
+| Run | Best BPB | Best test_match | Notes |
+|-----|----------|-----------------|-------|
+| `hmn_chunk_fine` (baseline, wl=0) | 7.41 | 8.0% | stage 1 best |
+| `hmn_chunk_fine_wm` (q1, wl=8) | **7.26** | **10.6%** | stage 1 best, beats baseline |
+
+### Metrics
+- **val**: `make_test_sequences` split into n_chunks (8 deterministic sequences, in-distribution)
+- **test**: specific surah file, padded to (n_chunks, chunk_len), eval-only, never trained on
+- **BPB**: teacher-forced NLL/ln(2) on IR `out_1` of final full-sequence span
+- **match%**: AR greedy exact-match on IR `out_1` of final full-sequence span
+
+---
 
 ---
 
@@ -107,5 +169,7 @@ All variants plateau at ~95% with no monotone improvement across k turns.
 | HMN v3 reference book | [`docs/BOOK.md`](docs/BOOK.md) |
 | KV capacity + SRS trajectories | [`docs/kv_dims.md`](docs/kv_dims.md) |
 | All configs | [`configs/`](configs/) |
+| **Chunk SRS training** | [`kvmem/train_hmn_chunk.py`](kvmem/train_hmn_chunk.py) |
 | Feedback training | [`kvmem/train_hmn_feedback.py`](kvmem/train_hmn_feedback.py) |
 | HMN v3 mono training | [`kvmem/train_hmn_mono.py`](kvmem/train_hmn_mono.py) |
+| Test set | [`datasets/suratalfatihah.txt`](datasets/suratalfatihah.txt) |
