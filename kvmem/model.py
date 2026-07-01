@@ -63,7 +63,8 @@ def apply_rope(x: torch.Tensor, freqs: torch.Tensor, offset: int = 0) -> torch.T
 class MHAttention(nn.Module):
     def __init__(self, d: int, n_heads: int,
                  rope: bool = False, freqs: torch.Tensor | None = None,
-                 null_kv: bool = False):
+                 null_kv: bool = False, qk_norm: bool = False,
+                 logit_cap: float = 0.0, attn_temp: bool = False):
         """
         null_kv=True: append a learnable (null_k, null_v) pair to the KV sequence
         before softmax. Gives each query a "blank slot" to attend to when no real
@@ -72,22 +73,40 @@ class MHAttention(nn.Module):
         null_k is initialised to zero so Q·null_k = 0 initially (score=0 before
         scaling), but it is learned and can diverge. null_v is also learnable —
         the model decides what to emit when attending to nothing.
+
+        qk_norm=True: RMS-normalize Q and K along d_head (with a learned
+        per-dim scale) before RoPE/dot-product — stabilizes attention logit
+        scale early in training, ablation flag.
         """
         super().__init__()
         self.n_heads = n_heads
         self.d_head  = d // n_heads
         self.rope    = rope
         self.null_kv = null_kv
+        self.qk_norm  = qk_norm
+        self.logit_cap = logit_cap   # tanh soft-cap value (0 = disabled)
+        self.attn_temp = attn_temp   # learned per-head temperature
         self.W_Q = nn.Linear(d, d, bias=False)
         self.W_K = nn.Linear(d, d, bias=False)
         self.W_V = nn.Linear(d, d, bias=False)
         self.W_O = nn.Linear(d, d, bias=False)
+        if qk_norm:
+            self.q_norm_scale = nn.Parameter(torch.ones(self.d_head))
+            self.k_norm_scale = nn.Parameter(torch.ones(self.d_head))
+        if attn_temp:
+            # log-scale per head, init 0 → temperature = 1/sqrt(d_head) at start
+            self.log_attn_temp = nn.Parameter(torch.zeros(n_heads))
         # null_kv uses fixed zero K and V — no learned parameters.
         # Q·null_k = 0 always, giving a fixed-score "abstain" option in softmax.
         if freqs is not None:
             self.register_buffer('freqs', freqs)
         else:
             self.freqs = None
+
+    @staticmethod
+    def _rms_normalize(x: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        norm = x.pow(2).mean(-1, keepdim=True).add(eps).rsqrt()
+        return x * norm * scale
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor,
                 past_kv: tuple | None = None,
@@ -101,6 +120,9 @@ class MHAttention(nn.Module):
         Q = self.W_Q(x).reshape(B, L, H, dh).permute(0, 2, 1, 3)
         K = self.W_K(x).reshape(B, L, H, dh).permute(0, 2, 1, 3)
         V = self.W_V(x).reshape(B, L, H, dh).permute(0, 2, 1, 3)
+        if self.qk_norm:
+            Q = self._rms_normalize(Q, self.q_norm_scale)
+            K = self._rms_normalize(K, self.k_norm_scale)
         if self.rope and self.freqs is not None:
             Q = apply_rope(Q, self.freqs, offset=offset)
             K = apply_rope(K, self.freqs, offset=offset)
@@ -114,10 +136,20 @@ class MHAttention(nn.Module):
             K    = torch.cat([K, null], dim=2)
             V    = torch.cat([V, null], dim=2)
             mask = F.pad(mask, (0, 1), value=0.0)
-        # Chunked attention: compute in row-chunks to bound peak memory O(chunk×L_kv)
-        # instead of O(L_q×L_kv). chunk_attn=0 disables chunking (full SDPA).
+        # Logit soft-cap or learned temperature: bypass SDPA, compute manually.
+        # Chunked attention: compute in row-chunks (chunk_attn=0 = full SDPA).
         chunk = getattr(self, 'chunk_attn', 0)
-        if chunk > 0 and L > chunk:
+        if self.logit_cap > 0 or self.attn_temp:
+            scale = 1.0 / math.sqrt(dh)
+            if self.attn_temp:
+                # per-head multiplicative scale: exp(log_temp) / sqrt(d_head)
+                scale = scale * self.log_attn_temp.exp().view(1, H, 1, 1)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
+            if self.logit_cap > 0:
+                scores = torch.tanh(scores / self.logit_cap) * self.logit_cap
+            scores = scores + mask.unsqueeze(0).unsqueeze(0)
+            out = torch.softmax(scores, dim=-1) @ V
+        elif chunk > 0 and L > chunk:
             m = mask.unsqueeze(0).unsqueeze(0)           # (1,1,L_q,L_kv)
             parts = []
             for i in range(0, L, chunk):
@@ -137,27 +169,56 @@ class MHAttention(nn.Module):
         return out
 
 
-class FFN(nn.Module):
-    def __init__(self, d: int, d_ff: int):
+class RMSNorm(nn.Module):
+    """True RMSNorm: no mean-centering, no bias — just a learned per-dim scale."""
+    def __init__(self, d: int, eps: float = 1e-6):
         super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return x * norm * self.weight
+
+
+def _make_norm(d: int, rmsnorm: bool) -> nn.Module:
+    return RMSNorm(d) if rmsnorm else nn.LayerNorm(d)
+
+
+class FFN(nn.Module):
+    """gated=True: SwiGLU (silu(W1 x) * W3 x -> W2) instead of plain GELU-MLP.
+    Note: at the same d_ff this adds ~50% more params (extra W3) — ablation
+    flag, not param-matched."""
+    def __init__(self, d: int, d_ff: int, gated: bool = False):
+        super().__init__()
+        self.gated = gated
         self.W1 = nn.Linear(d, d_ff, bias=False)
+        if gated:
+            self.W3 = nn.Linear(d, d_ff, bias=False)
         self.W2 = nn.Linear(d_ff, d, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.W1(x)
-        h = 0.5 * h * (1.0 + torch.tanh(0.7978845608028654 * (h + 0.044715 * h ** 3)))
+        if self.gated:
+            h = F.silu(self.W1(x)) * self.W3(x)
+        else:
+            h = self.W1(x)
+            h = 0.5 * h * (1.0 + torch.tanh(0.7978845608028654 * (h + 0.044715 * h ** 3)))
         return self.W2(h)
 
 
 class TransformerBlock(nn.Module):
     def __init__(self, d: int, n_heads: int, d_ff: int,
                  rope: bool = False, freqs: torch.Tensor | None = None,
-                 null_kv: bool = False):
+                 null_kv: bool = False, qk_norm: bool = False,
+                 gated_ffn: bool = False, rmsnorm: bool = False,
+                 logit_cap: float = 0.0, attn_temp: bool = False):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d)
-        self.attn  = MHAttention(d, n_heads, rope=rope, freqs=freqs, null_kv=null_kv)
-        self.norm2 = nn.LayerNorm(d)
-        self.ffn   = FFN(d, d_ff)
+        self.norm1 = _make_norm(d, rmsnorm)
+        self.attn  = MHAttention(d, n_heads, rope=rope, freqs=freqs,
+                                 null_kv=null_kv, qk_norm=qk_norm,
+                                 logit_cap=logit_cap, attn_temp=attn_temp)
+        self.norm2 = _make_norm(d, rmsnorm)
+        self.ffn   = FFN(d, d_ff, gated=gated_ffn)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor,
                 past_kv: tuple | None = None,
@@ -185,6 +246,15 @@ class KVMemModel(nn.Module):
                  L_train: int = 512, L_max: int = 4096,
                  grad_checkpoint: bool = False,
                  null_kv: bool = False,
+                 qk_norm: bool = False,
+                 gated_ffn: bool = False,
+                 rmsnorm: bool = False,
+                 embed_scale: bool = False,
+                 zero_init_residual: bool = False,
+                 depth_scaled_init: bool = False,
+                 logit_cap: float = 0.0,
+                 attn_temp: bool = False,
+                 tied_embed: bool = False,
                  V_out: int = 256):
         """
         V     : input vocab size (covers data bytes + special tag/slot tokens)
@@ -193,15 +263,25 @@ class KVMemModel(nn.Module):
         Special tokens (tags, slot IDs, ponder IDs) appear in the INPUT only.
         The model never needs to predict them, so the output head stays at 256.
         This avoids "bytes out of range" errors and keeps loss over data bytes only.
+
+        Ablation flags (all default False = original behavior):
+          qk_norm            : RMS-norm Q/K before dot-product (attention stability)
+          gated_ffn           : SwiGLU instead of plain GELU-MLP
+          rmsnorm             : true RMSNorm instead of LayerNorm
+          embed_scale         : multiply embeddings by sqrt(d) (classic Transformer trick)
+          zero_init_residual  : zero-init attn W_O and FFN W2 (ReZero-style identity start)
         """
         super().__init__()
         n_special            = V - 256             # number of special tokens (tags, slot IDs)
         self.data_embed      = nn.Embedding(256, d)        # data bytes 0-255
         self.special_embed   = nn.Embedding(n_special, d)  # special tokens 256+
         self.n_special       = n_special
-        self.norm_out        = nn.LayerNorm(d)
+        self.norm_out        = _make_norm(d, rmsnorm)
         self.W_out           = nn.Linear(d, V_out, bias=False)  # output: data bytes only
         self.grad_checkpoint = grad_checkpoint
+        self.embed_scale     = math.sqrt(d) if embed_scale else None
+        self.tied_embed      = tied_embed
+        self.V_out           = V_out
 
         freqs = None
         if rope:
@@ -210,10 +290,14 @@ class KVMemModel(nn.Module):
                       if yarn else rope_freqs(d_head))
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(d, n_heads, d_ff, rope=rope, freqs=freqs, null_kv=null_kv)
+            TransformerBlock(d, n_heads, d_ff, rope=rope, freqs=freqs, null_kv=null_kv,
+                             qk_norm=qk_norm, gated_ffn=gated_ffn, rmsnorm=rmsnorm,
+                             logit_cap=logit_cap, attn_temp=attn_temp)
             for _ in range(n_layers)
         ])
-        self._init_weights()
+        self._init_weights(zero_init_residual=zero_init_residual,
+                           depth_scaled_init=depth_scaled_init,
+                           n_layers=n_layers)
 
     def _embed(self, tokens: torch.Tensor) -> torch.Tensor:
         """Route tokens to data_embed (0-255) or special_embed (256+)."""
@@ -223,20 +307,33 @@ class KVMemModel(nn.Module):
         d_emb = self.data_embed(data_ids)
         s_emb = self.special_embed(special_ids)
         mask  = is_sp.unsqueeze(-1).to(d_emb.dtype)
-        return s_emb * mask + d_emb * (1.0 - mask)
+        x = s_emb * mask + d_emb * (1.0 - mask)
+        if self.embed_scale is not None:
+            x = x * self.embed_scale
+        return x
 
-    def _init_weights(self):
-        # Data embeddings: standard small normal (content tokens)
+    def _init_weights(self, zero_init_residual: bool = False,
+                      depth_scaled_init: bool = False,
+                      n_layers: int = 0):
         nn.init.normal_(self.data_embed.weight, std=0.02)
-        # Special embeddings: slightly larger, orthogonal-ish init
-        # (structural tokens need stronger, distinct representations)
         nn.init.normal_(self.special_embed.weight, std=0.05)
         nn.init.normal_(self.W_out.weight, std=0.02)
         for name, p in self.named_parameters():
             if 'embed' in name or 'W_out' in name:
-                continue   # already initialized above
+                continue
             if p.dim() == 2:
                 nn.init.normal_(p, std=math.sqrt(2.0 / p.shape[-1]))
+        if zero_init_residual:
+            for block in self.blocks:
+                nn.init.zeros_(block.attn.W_O.weight)
+                nn.init.zeros_(block.ffn.W2.weight)
+        if depth_scaled_init and n_layers > 0:
+            # GPT-2 style: scale residual projections by 1/sqrt(2*n_layers)
+            # so the residual stream variance stays O(1) at init regardless of depth.
+            std = 0.02 / math.sqrt(2.0 * n_layers)
+            for block in self.blocks:
+                nn.init.normal_(block.attn.W_O.weight, std=std)
+                nn.init.normal_(block.ffn.W2.weight, std=std)
 
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor,
                 past_kv: list | None = None,
@@ -292,7 +389,12 @@ class KVMemModel(nn.Module):
                 else:
                     x = result
 
-        logits = self.W_out(self.norm_out(x))
+        h_out  = self.norm_out(x)
+        if self.tied_embed:
+            # tied_embed: share weights with data_embed (both V_out × d)
+            logits = F.linear(h_out, self.data_embed.weight[:self.V_out])
+        else:
+            logits = self.W_out(h_out)
         if not batched:
             logits = logits.squeeze(0)
             x = x.squeeze(0)
@@ -333,6 +435,15 @@ def build_model(hp: dict, device=None) -> KVMemModel:
         L_max=hp.get('L_max', hp.get('seg_len', 512) * 8),
         grad_checkpoint=hp.get('grad_checkpoint', False),
         null_kv=hp.get('null_kv', False),
+        qk_norm=hp.get('qk_norm', False),
+        gated_ffn=hp.get('gated_ffn', False),
+        rmsnorm=hp.get('rmsnorm', False),
+        embed_scale=hp.get('embed_scale', False),
+        zero_init_residual=hp.get('zero_init_residual', False),
+        depth_scaled_init=hp.get('depth_scaled_init', False),
+        logit_cap=hp.get('logit_cap', 0.0),
+        attn_temp=hp.get('attn_temp', False),
+        tied_embed=hp.get('tied_embed', False),
         V_out=256,
     )
     # Chunked attention: set chunk_attn on all attention layers

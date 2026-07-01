@@ -457,6 +457,17 @@ def chunk_mask_fb(pos: dict) -> np.ndarray:
     for b in enc_blocks:
         is_any_chunk |= (c >= b['s0']) & (c < b['s1'])
 
+    # Union of every rec_block's own output region (c0:c1) — IR turns must
+    # reach earlier turns' output ONLY via their explicit argmax copy
+    # (am0:am1), never by attending straight to the raw c0:c1 tokens sitting
+    # in context. Those tokens are ground truth during training (teacher-
+    # forced) but the model's own greedy decode at eval time — a direct
+    # attention path there lets training "cheat" via leaked ground truth,
+    # which collapses at AR-decode eval once that region is no longer GT.
+    is_any_rec_output = np.zeros(L, dtype=bool)
+    for rb2 in rec_blocks:
+        is_any_rec_output |= (c >= rb2['c0']) & (c < rb2['c1'])
+
     # Rule 2: encoding SLOT_k blocked from chunk_j (j≠k)
     for k, b in enumerate(enc_blocks):
         sl_row = (r >= b['sl0']) & (r < b['sl1'])
@@ -482,11 +493,14 @@ def chunk_mask_fb(pos: dict) -> np.ndarray:
             blocked |= out_row[:, None] & ~own[None, :]
 
         else:  # type == 'ir'
-            # Rules 5,6,7: SLOT_A, argmax, SLOT_B — all blocked from encoding chunks
+            # Rules 5,6,7: SLOT_A, argmax, SLOT_B — blocked from encoding chunks
+            # AND from every rec_block's own raw output region (own am0:am1
+            # copy is the only sanctioned path back to an earlier turn's
+            # output — see is_any_rec_output comment above).
             sla_row = (r >= rb['sla0']) & (r < rb['sla1'])
             am_row  = (r >= rb['am0'])  & (r < rb['am1'])
             slb_row = (r >= rb['slb0']) & (r < rb['slb1'])
-            blocked |= (sla_row | am_row | slb_row)[:, None] & is_any_chunk[None, :]
+            blocked |= (sla_row | am_row | slb_row)[:, None] & (is_any_chunk | is_any_rec_output)[None, :]
 
             # Rule 8: IR warmup/out rows — only own SLOT_B + own warmup + own output
             wm_row  = (r >= rb['w0'])  & (r < rb['w1'])
@@ -912,46 +926,40 @@ def ar_decode_chunk_fb(model, chunks_arr, slot_len: int, slot_count: int,
     sids_t  = torch.tensor(sids, dtype=torch.long, device=device)
     span_gen = {}   # span → (iq_gen, ir_gen)
 
-    # Process span by span — each span has IQ then IR turn
-    iq_rbs = [rb for rb in pos['rec_blocks'] if rb['type'] == 'iq']
-    ir_rbs = {rb['span']: rb for rb in pos['rec_blocks'] if rb['type'] == 'ir'}
-
-    for iq_rb in iq_rbs:
-        span = iq_rb['span']
+    # Process all rec_blocks in sequence order (handles n_refine>1 correctly).
+    last_ir_by_span = {}
+    for rb in pos['rec_blocks']:
+        span = rb['span']
         span_s, span_e = span
         gt_span = np.concatenate(chunks_list[span_s:span_e])
 
-        # ── Turn 0 (IQ): AR generate out_0 ──────────────────────────────
-        tok_t[iq_rb['sl0']:iq_rb['sl1']] = sids_t
-        if wl > 0:
-            tok_t[iq_rb['w0']:iq_rb['w1']] = torch.tensor(
-                gt_span[:wl].astype(np.int64), dtype=torch.long, device=device)
-        for j in range(iq_rb['out_len']):
-            logits = model(tok_t, full_mask)
-            nb = int(logits[iq_rb['c0'] + j - 1].argmax())
-            tok_t[iq_rb['c0'] + j] = nb
-
-        iq_gen = tok_t[iq_rb['c0']:iq_rb['c1']].cpu().numpy()
-
-        # ── Turn 1 (IR): fill argmax from turn 0, AR generate out_1 ─────
-        ir_rb = ir_rbs.get(span)
-        if ir_rb is None:
-            span_gen[span] = (iq_gen, None)
-            continue
-
-        tok_t[ir_rb['sla0']:ir_rb['sla1']] = sids_t                # SLOT_A
-        tok_t[ir_rb['am0']:ir_rb['am1']]   = tok_t[iq_rb['c0']:iq_rb['c1']]  # argmax = IQ output
-        tok_t[ir_rb['slb0']:ir_rb['slb1']] = sids_t                # SLOT_B
-        if wl > 0:
-            tok_t[ir_rb['w0']:ir_rb['w1']] = torch.tensor(
-                gt_span[:wl].astype(np.int64), dtype=torch.long, device=device)
-        for j in range(ir_rb['out_len']):
-            logits = model(tok_t, full_mask)
-            nb = int(logits[ir_rb['c0'] + j - 1].argmax())
-            tok_t[ir_rb['c0'] + j] = nb
-
-        ir_gen = tok_t[ir_rb['c0']:ir_rb['c1']].cpu().numpy()
-        span_gen[span] = (iq_gen, ir_gen)
+        if rb['type'] == 'iq':
+            tok_t[rb['sl0']:rb['sl1']] = sids_t
+            if wl > 0:
+                tok_t[rb['w0']:rb['w1']] = torch.tensor(
+                    gt_span[:wl].astype(np.int64), dtype=torch.long, device=device)
+            for j in range(rb['out_len']):
+                logits = model(tok_t, full_mask)
+                nb = int(logits[rb['c0'] + j - 1].argmax())
+                tok_t[rb['c0'] + j] = nb
+            span_gen[span] = (tok_t[rb['c0']:rb['c1']].cpu().numpy(), None)
+            last_ir_by_span[span] = rb  # track previous block (IQ) for argmax chaining
+        else:  # 'ir'
+            prev_rb = last_ir_by_span[span]
+            tok_t[rb['sla0']:rb['sla1']] = sids_t
+            tok_t[rb['am0']:rb['am1']] = tok_t[prev_rb['c0']:prev_rb['c1']]
+            tok_t[rb['slb0']:rb['slb1']] = sids_t
+            if wl > 0:
+                tok_t[rb['w0']:rb['w1']] = torch.tensor(
+                    gt_span[:wl].astype(np.int64), dtype=torch.long, device=device)
+            for j in range(rb['out_len']):
+                logits = model(tok_t, full_mask)
+                nb = int(logits[rb['c0'] + j - 1].argmax())
+                tok_t[rb['c0'] + j] = nb
+            ir_gen = tok_t[rb['c0']:rb['c1']].cpu().numpy()
+            iq_gen = span_gen[span][0]
+            span_gen[span] = (iq_gen, ir_gen)
+            last_ir_by_span[span] = rb
 
     # ── Result: IR output of full-sequence span ──────────────────────────
     full_span = (0, n_chunks)
@@ -971,11 +979,9 @@ def ar_decode_chunk_fb(model, chunks_arr, slot_len: int, slot_count: int,
 
     match_pct = 100.0 * float(np.sum(gen_v == target_v)) / max(len(target_v), 1)
 
-    # Teacher-forced BPB on IR output
-    full_ir_rb = ir_rbs.get(full_span)
-    if full_ir_rb is None:
-        full_ir_rb = next(rb for rb in reversed(pos['rec_blocks'])
-                         if rb['span'] == full_span)
+    # Teacher-forced BPB on last rec_block for full_span
+    full_ir_rb = next(rb for rb in reversed(pos['rec_blocks'])
+                      if rb['span'] == full_span)
     tok_tf = tok_t.clone()
     tok_tf[full_ir_rb['c0']:full_ir_rb['c1']] = torch.tensor(
         target[:out_len].astype(np.int64), dtype=torch.long, device=device)
@@ -1054,6 +1060,19 @@ def ar_decode_chunk_fb_kv(model, chunks_arr, slot_len: int, slot_count: int,
             kv_cache  = _cat_kv(kv_cache, prev_kv)
             L_cached += 1
             tok[rb['c0'] + j] = int(prev_logits[-1].argmax())
+        # Cache the last decoded output token so subsequent blocks start at the
+        # correct offset. The loop feeds positions c0..c1-2 into the cache, but
+        # the final token (c1-1) is only written into tok without being cached,
+        # leaving L_cached = c1-1 and causing all later blocks to receive RoPE
+        # positions shifted by -1.
+        if rb['out_len'] > 0:
+            last_pos  = rb['c1'] - 1
+            last_t    = torch.tensor([tok[last_pos]], dtype=torch.long, device=device)
+            last_mask = full_mask[last_pos:last_pos+1, :L_cached + 1]
+            _, last_kv = model(last_t, last_mask, past_kv=kv_cache,
+                               return_kv=True, offset=L_cached)
+            kv_cache  = _cat_kv(kv_cache, last_kv)
+            L_cached += 1
 
     # Process every rec_block in sequence order. 'iq' blocks decode against
     # their own SLOT; 'ir' blocks copy their argmax cue directly out of `tok`
@@ -1184,6 +1203,15 @@ def ar_decode_chunk_fb_stitch_kv(model, chunks_arr, slot_len: int, slot_count: i
             kv_cache  = _cat_kv(kv_cache, prev_kv)
             L_cached += 1
             tok[rb['c0'] + j] = int(prev_logits[-1].argmax())
+        # Cache the last decoded output token (same fix as in ar_decode_chunk_fb_kv).
+        if rb['out_len'] > 0:
+            last_pos  = rb['c1'] - 1
+            last_t    = torch.tensor([tok[last_pos]], dtype=torch.long, device=device)
+            last_mask = full_mask[last_pos:last_pos+1, :L_cached + 1]
+            _, last_kv = model(last_t, last_mask, past_kv=kv_cache,
+                               return_kv=True, offset=L_cached)
+            kv_cache  = _cat_kv(kv_cache, last_kv)
+            L_cached += 1
 
     # Global stitched-byte buffer: filled in as each window's blocks decode.
     # -1 = not yet decoded. Later windows overwrite earlier ones in the
@@ -1347,6 +1375,9 @@ def train_chunk(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         d=hp['d'], n_layers=hp['n_layers'], n_heads=hp['n_heads'], d_ff=hp['d_ff'],
         rope=hp.get('rope', True), yarn=hp.get('yarn', True),
         null_kv=hp.get('null_kv', True), compile=hp.get('compile', False),
+        qk_norm=hp.get('qk_norm', False), gated_ffn=hp.get('gated_ffn', False),
+        rmsnorm=hp.get('rmsnorm', False), embed_scale=hp.get('embed_scale', False),
+        zero_init_residual=hp.get('zero_init_residual', False),
     )
     model   = build_model(hp_model, device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -1645,7 +1676,16 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     n_heads=hp['n_heads'], d_ff=hp['d_ff'],
                     rope=hp.get('rope', True), yarn=hp.get('yarn', True),
                     null_kv=hp.get('null_kv', True), compile=hp.get('compile', False),
-                    chunk_attn=hp.get('chunk_attn', 0))
+                    chunk_attn=hp.get('chunk_attn', 0),
+                    qk_norm=hp.get('qk_norm', False),
+                    gated_ffn=hp.get('gated_ffn', False),
+                    rmsnorm=hp.get('rmsnorm', False),
+                    embed_scale=hp.get('embed_scale', False),
+                    zero_init_residual=hp.get('zero_init_residual', False),
+                    depth_scaled_init=hp.get('depth_scaled_init', False),
+                    logit_cap=hp.get('logit_cap', 0.0),
+                    attn_temp=hp.get('attn_temp', False),
+                    tied_embed=hp.get('tied_embed', False))
     model    = build_model(hp_model, device)
     n_params = sum(p.numel() for p in model.parameters())
     _log(f'Model: {n_params:,} params  device={device}  chunk_attn={hp_model["chunk_attn"]}')
@@ -1658,8 +1698,10 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     lr_max        = hp.get('lr_max', 3e-4)
     wd            = hp.get('wd', 0.001)
     warmup_steps  = hp.get('warmup_steps', 500)
+    adam_b2       = hp.get('adam_b2', 0.999)
     use_actual_am = hp.get('use_actual_argmax', True)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=wd)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=wd,
+                            betas=(0.9, adam_b2))
 
     eval_file  = hp.get('eval_file', None)
     eval_every = hp.get('eval_every', 5000)
