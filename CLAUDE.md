@@ -22,7 +22,9 @@ Fast-weight language model — HashMemNet (HMN). Two architectures: v3 (MEM bloc
 | `hmn_feedback_32_ir` | **100% at k=0..4 AND k=0..12 extrapolation** ✓✓ |
 | `hmn_chunk_local_32` stage 1 (IQ, 50k) | 81.9% match — solid IQ pretraining ✓ |
 | `hmn_chunk_local_32_stage1` (IR, 80k) | **87.5% match** with fixed KV decode ✓ |
-| `hmn_chunk_local_64` (stage 3, 64B, 3 windows) | **in progress** |
+| `hmn_chunk_local_64` v1 (64B, pure stitch, 80k) | stitch=76.8%, win0=85.9%, win1=**0%**, win2=13% — chaining failure |
+| `hmn_chunk_local_64_v2` (64B, 4-way equal mix, 80k) | **stitch collapsed to 6.2%** — equal mix gave stitch only 25% of steps, insufficient |
+| `hmn_chunk_local_64_v3` (64B, targeted fix: stitch×3+win1×1+win2×1, from v1 end) | **running** — 60% stitch steps, 20% each problematic window |
 | All HMN v3 variants (mono, cerb, p2, p4, pinf, tlogit) | ~95% k=0, collapses at k>4 |
 
 ---
@@ -62,11 +64,16 @@ steps — exactly matching `hmn_feedback_32_iq.py`/`hmn_feedback_32_ir.py`.
 `slot_len=4, slot_count=2` in all stages: 4 token positions per slot block, 2 alternating
 IDs (258/259). slot_count=4 was ablated but not adopted.
 
-| Stage | n_chunks (src) | windows (chunk-idx) | n_refine | steps | Config | Result |
+| Stage | n_chunks (src) | windows / traj mix | n_refine | steps | Config | Result |
 |---|---|---|---|---|---|---|
-| 1 | 2 (32B) | `[(0,2)]` | 0 | 50000 | `hmn_chunk_local_32.py` (stage 0) | 81.9% match ✓ |
-| 2 | 2 (32B) | `[(0,2)]` | 2 | 80000 | `hmn_chunk_local_32_stage1.py` | **87.5% match** ✓ |
-| 3 | 4 (64B) | `[(0,2),(1,3),(2,4)]` | 2 | 80000 | `hmn_chunk_local_64.py`, resumes stage 2 | in progress |
+| 1 | 2 (32B) | `[(0,2)]` | 0 | 50000 | `hmn_chunk_local_32.py` | 81.9% ✓ |
+| 2 | 2 (32B) | `[(0,2)]` | 2 | 80000 | `hmn_chunk_local_32_stage1.py` | **87.5%** ✓ |
+| 3 v1 | 4 (64B) | all-3 only | 2 | 80000 | `hmn_chunk_local_64.py` | stitch=76.8%, **win1=0%** — chaining failure |
+| 3 v2 | 4 (64B) | equal mix (4-way) from stage2 | 2 | 80000 | `hmn_chunk_local_64_v2.py` | **stitch=6.2%** — too few stitch steps |
+| 3 v3 | 4 (64B) | stitch×3+win1×1+win2×1 from v1 | 2 | 80000 | `hmn_chunk_local_64_v3.py` | **running** |
+| 4a | 8 (128B) | all-7 only (pure stitch) | 2 | 80000 | `hmn_chunk_local_128_stitch.py` from v3 | pending |
+| 4b | 8 (128B) | stitch×3+win1..win6×1 | 2 | 80000 | `hmn_chunk_local_128_v3.py` from 4a | pending |
+| 5 | 16 (256B) | stitch×3+win1..win14×1 | 2 | 80000 | `hmn_chunk_local_256.py` from 4b | pending |
 
 **Stage 3 sequence layout** (L=572, slot_len=4, slot_count=2):
 ```
@@ -102,34 +109,90 @@ within the 16B overlap. Wired automatically in `train_chunk_fb`'s eval loop when
 using the original last-block-only `ar_decode_chunk_fb_kv`. Training-time batch
 construction is unaffected (teacher-forced GT warmup per window, unchanged).
 
-### Pending follow-up
-After stage 3 finishes: eval **zero-shot** full-span (0-64) IQ-only recall (single
-window `[(0,4)]`, `n_refine=0`, no training) against stage 3's checkpoint — tests
-whether stitching transfers to an explicitly-untrained full-span read. Expected to fail
-(motivates either explicit full-span IQ training or accepting windowed-only stitching).
+### Stage 3 v1 failure — slot chaining dependency (do not reintroduce)
 
-### Parked (not deleted) — overlapping-window **stitching** experiment
-`chunk_positions_fb_stitch` + `ir_stitch` trajectory type + configs
-`hmn_chunk_stitch_a/b/smoke.py` — global IQ + per-window IR pairs + optional trailing
-full-span stitched IQ turn. Larger-scale alternative design, deferred — do not delete.
+v1 trained ONLY on all-3-windows trajectories. The mask only blocks raw output
+regions (`c0:c1`) from later windows — it does NOT block window i's IQ SLOT from
+attending to window j<i's IQ/IR SLOT tokens. The model exploited this: window 1's
+IQ SLOT read from window 0's SLOT context instead of encoding chunks 1-2 from the
+encoding blocks independently. Result:
+- Window 0 (independent, no prior window SLOTs in context): 85.9% ✓
+- Window 1 (relied on window 0's SLOT): 0.0% in isolation ✗
+- Window 2 (relied on windows 0+1's SLOT): 13.0% in isolation ✗
+- Stitch (chaining present): 76.8% (windows benefit from prior SLOTs)
+
+**v2 attempt (failed)**: 4-way equal-weight mix from stage 2 checkpoint.
+- Stitch got only 25% of steps → stitch collapsed from 76.8% (v1) to 6.2%
+- Per-window: win0=13.5%, win1=15.1%, win2=24.5% — independence improved but weak
+- Root cause: starting point (stage 2 checkpoint) had no stitch knowledge + too few stitch steps
+
+**Fix (v3)**: Targeted mix starting from v1 checkpoint (76.8% stitch, win0=85.9%):
+- Stitch ×3 (60% of steps): preserves v1's strong stitch quality
+- Win1 ×1 (20%): fixes window (1,3) — chains in v1, no solo training
+- Win2 ×1 (20%): fixes window (2,4) — partial chaining in v1
+- Win0 skipped: already independent (no prior window to chain from)
+
+**Staged approach for 4+ windows**: always establish pure stitch first (100% steps),
+THEN fine-tune independence. Never mix from a damaged-stitch starting point.
+- Stage 4a: pure stitch `hmn_chunk_local_128_stitch.py` (from v3 end)
+- Stage 4b: targeted mix `hmn_chunk_local_128_v3.py` (from 4a end), skip win0
+
+### Experiment tiers — ordered by difficulty (do not skip ahead)
+
+**Tier 1 — ir_local stitch (current work)**
+Prove per-window IQ+IR stitch works reliably at scale: 64B → 128B → 256B.
+Success bar: stitch ≥60% AND all windows independently ≥40% before moving up.
+Configs: `hmn_chunk_local_64_v3` → `hmn_chunk_local_128_stitch` → `hmn_chunk_local_128_v3` → `hmn_chunk_local_256`
+
+**Tier 2 — random-warmup continuation (after Tier 1 at ≥128B)**
+Goal: "continue from any warmup position X in sequence."
+Step 1: zero-shot eval on Tier 1 model — seed warmup at arbitrary X≠0, no retraining.
+  Expected: works at window-start positions only.
+Step 2 if needed: add randomized warmup offset within window to ir_local training.
+  Low cost — same architecture, just change warmup position in batch construction.
+
+**Tier 3 — ir_winrefine: global IQ + per-window IR (hard, defer)**
+`chunk_positions_fb_winrefine`: ONE global IQ reads full source, windowed IRs refine per window.
+- No chaining problem (all windows share ONE global IQ SLOT, not window-specific SLOTs)
+- Natural home for random-warmup: global encoding, seed IR from any X
+- BUT: global IQ must compress full source into same small SLOT → was hard before
+  (earlier curriculum at 256B+64x compression failed at BPB~8.0)
+- Do NOT attempt until Tier 1+2 proven solid at ≥128B
+
+**Parked — ir_stitch** (`chunk_positions_fb_stitch`, configs `hmn_chunk_stitch_a/b/smoke.py`):
+Per-window IQ+IR + optional full-span final IQ. Has THE SAME chaining problem as ir_local v1.
+Do not revive before ir_winrefine is warranted — it doesn't solve the chaining issue.
 
 ### Run commands
 ```bash
-# Stage 1 (IQ, random init)
+# Stage 3 v3 (64B, targeted fix: stitch×3+win1+win2, from v1 end)
 caffeinate -i python3 -m kvmem.train_hmn_chunk \
-    --config configs/hmn_chunk_local_32.py --device mps
-
-# Stage 2 (IR refine, resumes stage 1)
-caffeinate -i python3 -m kvmem.train_hmn_chunk \
-    --config configs/hmn_chunk_local_32_stage1.py \
-    --pretrained logs/hmn_chunk_local_32/checkpoints/stage0_end.pt \
+    --config configs/hmn_chunk_local_64_v3.py \
+    --pretrained logs/hmn_chunk_local_64/checkpoints/stage0_end.pt \
     --device mps
 
-# Stage 3 (64B, 3 windows, resumes stage 2)
+# Stage 4a (128B, pure stitch only, B=4, from v3 end)
 caffeinate -i python3 -m kvmem.train_hmn_chunk \
-    --config configs/hmn_chunk_local_64.py \
-    --pretrained logs/hmn_chunk_local_32_stage1/checkpoints/stage0_end.pt \
+    --config configs/hmn_chunk_local_128_stitch.py \
+    --pretrained logs/hmn_chunk_local_64_v3/checkpoints/stage0_end.pt \
     --device mps
+
+# Stage 4b (128B, targeted mix: stitch×3+win1..win6, from 4a end)
+caffeinate -i python3 -m kvmem.train_hmn_chunk \
+    --config configs/hmn_chunk_local_128_v3.py \
+    --pretrained logs/hmn_chunk_local_128_stitch/checkpoints/stage0_end.pt \
+    --device mps
+
+# Stage 5 (256B, 15 windows, from 4b end)
+caffeinate -i python3 -m kvmem.train_hmn_chunk \
+    --config configs/hmn_chunk_local_256.py \
+    --pretrained logs/hmn_chunk_local_128_v3/checkpoints/stage0_end.pt \
+    --device mps
+
+# Qualitative eval (any checkpoint — auto-detects n_chunks and windows from hp)
+python3 eval_fb_qual.py --ckpt logs/hmn_chunk_local_64_v3/checkpoints/stage0_end.pt --device mps
+python3 eval_fb_qual.py --ckpt logs/hmn_chunk_local_128_stitch/checkpoints/stage0_end.pt --device mps
+python3 eval_fb_qual.py --ckpt logs/hmn_chunk_local_128_v3/checkpoints/stage0_end.pt --device mps
 ```
 
 ### KV cache decode — why it's valid and what the mask does
@@ -271,6 +334,53 @@ All variants plateau at ~95% with no monotone improvement across k turns.
 
 ---
 
+## Generalization Axes
+
+Current model holds all of these fixed to prevent train/test mismatch. Listed in order of unlock priority.
+
+### Source
+- `src_len` — fixed per stage (32B→64B→128B→256B), could be variable length
+- Content type — random bytes; real use needs natural text / structured data
+- Encoding resolution (`chunk_len`) — fixed at 16B/chunk
+
+### Window geometry
+- Window size — fixed at 32B (2 chunks)
+- Stride / overlap — fixed at 16B (50%)
+- Window boundary alignment — fixed to chunk grid; could be arbitrary byte positions
+- Window order during stitch — fixed left→right
+
+### Recall
+- **Warmup position** — fixed at window start; Tier 2 goal is any X in [0, src_len-8]
+- Warmup length — fixed at 8B
+- Query type — always "recall forward from warmup"; could generalize to random-access, fill-in-middle
+
+### Refinement
+- **`n_refine` per window** — fixed at 2; could vary per window, per difficulty, or adaptively (closed-loop SRS: R(t) = R₀·exp(-λt))
+- Refinement schedule across SRS sessions — currently open-loop; recipe calls for adaptive S(n) = S₀·αⁿ
+
+### Slot / memory
+- **`slot_len`** — fixed at 4; could grow (harder content needs more capacity) or shrink/consolidate as retention improves
+- `slot_count` — fixed at 2 (IDs 258/259); ablation tests dedicated SLOT_B IDs (260/261)
+- Slot scope — currently one slot per window (ir_local); `ir_winrefine` uses one global slot for full source
+- **Slot consolidation** — after multiple refines, compress multiple window slots into fewer tokens (SRS "strengthen trace")
+
+### Training distribution
+- Single source per batch — SRS recipe needs multi-sequence with independent retention clocks per sequence
+- Train/test sequence type — currently identical random bytes; real use has domain shift
+- Curriculum order — fixed stage sequence; could be adaptive per-window based on measured retention
+
+### Model
+- Model size (`d`, `n_layers`) — fixed at d=64, 4 layers
+- Positional encoding range — RoPE+YaRN handles some OOD extension but untested at long range
+
+### Unlock order (planned)
+1. Warmup position (Tier 2 — low code cost, same architecture)
+2. `n_refine` adaptive per window (closed-loop, needs retention signal)
+3. `slot_len` growing/shrinking (consolidation = SRS "strengthen" primitive)
+4. Variable `src_len` / natural text (real corpus ingestion)
+
+---
+
 ## Key Principles
 
 - `null_kv=True` always — 1.5–2× faster, better bpb
@@ -290,8 +400,10 @@ All variants plateau at ~95% with no monotone improvement across k turns.
 | KV capacity + SRS trajectories | [`docs/kv_dims.md`](docs/kv_dims.md) |
 | All configs | [`configs/`](configs/) |
 | **Chunk SRS / local-refine training** | [`kvmem/train_hmn_chunk.py`](kvmem/train_hmn_chunk.py) |
-| Current local-refine configs | [`configs/hmn_chunk_local_32.py`](configs/hmn_chunk_local_32.py), [`configs/hmn_chunk_local_64.py`](configs/hmn_chunk_local_64.py) |
-| Parked stitching-experiment configs | [`configs/hmn_chunk_stitch_a.py`](configs/hmn_chunk_stitch_a.py), `_b.py`, `_smoke.py` |
+| Local-refine configs (active) | `hmn_chunk_local_32.py`, `hmn_chunk_local_32_stage1.py`, `hmn_chunk_local_64_v3.py`, `hmn_chunk_local_128_stitch.py`, `hmn_chunk_local_128_v3.py`, `hmn_chunk_local_256.py` |
+| Local-refine eval (generic) | [`eval_fb_qual.py`](eval_fb_qual.py) — any stage, auto-detects n_chunks from checkpoint |
+| Parked — ir_stitch (chaining problem, do not revive) | [`configs/hmn_chunk_stitch_a.py`](configs/hmn_chunk_stitch_a.py), `_b.py`, `_smoke.py` |
+| Parked — ir_winrefine (global IQ, Tier 3) | `chunk_positions_fb_winrefine` in train_hmn_chunk.py |
 | Feedback training | [`kvmem/train_hmn_feedback.py`](kvmem/train_hmn_feedback.py) |
 | HMN v3 mono training | [`kvmem/train_hmn_mono.py`](kvmem/train_hmn_mono.py) |
 | Test set | [`datasets/suratalfatihah.txt`](datasets/suratalfatihah.txt) |

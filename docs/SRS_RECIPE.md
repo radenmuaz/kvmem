@@ -17,13 +17,13 @@ plus k IR turns (iterative argmax-feedback refinement). Proven at 32B / k=2:
 
 | Symbol | Meaning |
 |--------|---------|
-| W | window size (bytes), fixed at 32B |
-| s | stride (bytes), fixed at 16B (50% overlap) |
-| C | chunk_len (bytes), 16B — window and stride land on chunk boundaries |
-| n | number of review passes (IR turns) for a window |
+| W | window size (bytes); default 32B, can scale |
+| s | stride (bytes); default 16B (50% overlap = W/2) |
+| C | chunk_len (bytes); W = k·C for integer k (chunks per window) |
+| n | number of IR refinement passes per window per review |
 | R | retention: AR-decode match% (0–1) on a window |
 | B | BPB: NLL/ln(2) on the window's output under teacher forcing |
-| S | stability: how long a window stays above retention threshold after review |
+| S | stability: how long a window stays above R_thresh after one review |
 | λ | forgetting rate = 1/S |
 
 ---
@@ -88,6 +88,276 @@ greedy output. Closed-loop just stops the IR chain early based on a runtime chec
 
 ---
 
+## Parallel Batch Ingest with Merge-Resolve Operator
+
+### The problem
+
+Serial ingestion processes windows left-to-right, one sequence. Each IQ/IR turn
+sees the full accumulated KV context of all prior turns. This is correct but
+sequential — O(n_windows) latency even with a fast per-window unit.
+
+Parallel ingestion splits the corpus into independent batches, each producing its
+own KV state. But the resulting slot representations are **conditioned on disjoint
+contexts** — batch A's SLOTs only saw chunks 0..k, batch B's only saw k+1..n.
+Naive concatenation of their KV caches is incoherent: recall against the merged
+state does NOT match what single-pass serial ingestion would have produced.
+
+The merge-resolve operator must produce a merged state that is **recall-equivalent
+to serial single-pass** — i.e., IQ and IR recall from the merged state must produce
+byte-for-byte identical output to serial ingestion on the same corpus.
+
+### Merge via IR: the argmax bridge
+
+The existing IR mechanism is already a merge primitive:
+```
+SLOT_A  +  argmax_cue  +  SLOT_B  →  merged output
+```
+
+Treat batch A's IQ recall output as the argmax cue and batch B's SLOT as the
+starting representation. A "merge IR" turn then resolves the two branches:
+
+```
+Batch A: ENC_{0..k}  → IQ_w_A  → IR_w_A  ...  →  SLOT_A, gen_A (bytes 0..m)
+Batch B: ENC_{k+1..n} → IQ_w_B  → IR_w_B  ...  →  SLOT_B, gen_B (bytes m+1..L)
+
+Merge turn (shape identical to a normal IR turn):
+  [SLOT_A × slot_len]            ← branch A's compressed state
+  [argmax: gen_A, byte-concat gen_B]  ← both branches' recalled bytes as cue
+  [SLOT_B × slot_len]            ← merged output slot
+  [warmup: bytes 0:wl]           ← seeded from GT for validation
+  [output: bytes wl:L]           ← merged recall; loss here
+```
+
+After merge, run IQ recall (no argmax, just SLOT_B → output) and require exact
+match against serial single-pass output. This is the **validation gate**.
+
+### Hierarchical merge (tree reduce)
+
+For N batches, apply merge as a binary tree:
+
+```
+Level 0 (parallel, independent):
+  Batch 0: ENC_{0..k}    → SLOT_0, gen_0
+  Batch 1: ENC_{k+1..2k} → SLOT_1, gen_1
+  Batch 2: ENC_{2k+1..3k}→ SLOT_2, gen_2
+  Batch 3: ENC_{3k+1..4k}→ SLOT_3, gen_3
+
+Level 1 (pairwise merge, still parallelisable):
+  Merge(SLOT_0, gen_0, SLOT_1, gen_1) → SLOT_01, gen_01
+  Merge(SLOT_2, gen_2, SLOT_3, gen_3) → SLOT_23, gen_23
+
+Level 2 (root merge):
+  Merge(SLOT_01, gen_01, SLOT_23, gen_23) → SLOT_root, gen_root
+
+Validate: IQ recall from SLOT_root must match serial single-pass gen.
+```
+
+Depth = log2(N). Each level is fully parallel within it. Total latency:
+O(log N) merge passes instead of O(N) serial passes.
+
+### Rebase after merge
+
+If gen_01 at level 1 has errors (imperfect recall), they propagate into the
+level-2 argmax cue. A **rebase IR** turn corrects this:
+
+```
+Rebase = IR turn with argmax = merged_gen (from level-1 output)
+                      but warmup seeded from GT (not from merged_gen)
+```
+
+This is exactly the existing IR mechanism — the argmax carries the imperfect
+estimate from the parallel branch, and the model learns to refine it using the
+GT warmup as a reference signal. The GT warmup at training time is replaced at
+inference by whatever the model last decoded (standard AR decode contract).
+
+So rebase IS an IR turn. No new operator needed — just chain IR passes after merge.
+
+### Validation: exact recall equivalence
+
+The merge is valid iff the following holds for every span in the corpus:
+
+```
+serial_recall(span, IQ+2IR)  ==  merged_recall(span, IQ+2IR after merge)
+```
+
+Measured by: AR-decode match% = 100% (byte-for-byte exact), not just NLL.
+BPB near zero is necessary but not sufficient — the model must produce the EXACT
+same byte sequence, not just assign high probability to it.
+
+**Why exact matters**: the argmax cue in a later IR turn is the previous turn's
+greedy decode. If merged recall produces a different byte at position i, that
+byte becomes the argmax cue for all subsequent turns, causing cascading divergence.
+High-probability ≠ same-byte; only 100% exact match guarantees coherent chaining.
+
+### Training the merge operator
+
+The merge turn is a new trajectory type (`type='ir_merge'`) trained jointly with
+the per-window IQ+IR turns:
+
+```
+traj_mix = [
+    dict(type='ir_local', weight=0.5, windows=..., n_refine=2),   # serial ingest
+    dict(type='ir_merge', weight=0.3, split_at=k, n_refine=2),    # parallel+merge
+    dict(type='ir_rebase', weight=0.2, split_at=k, n_rebase=2),   # rebase after merge
+]
+```
+
+Training data: for each batch, run both serial (ground truth) and parallel (input)
+on the same corpus. Loss on the merge output against the serial ground truth ensures
+the model learns to reconcile the two branch representations.
+
+### Why this is necessary for scale
+
+At 1MB corpus with 65534 windows, serial ingestion takes ~65534 IQ+IR passes.
+With 1024-way parallel batches and log2(1024)=10 merge levels, total passes drop
+to ~10 merge levels × 64 batches = 640 passes (100× speedup). The merge operator
+amortizes the O(N) serial cost into O(log N) with full parallel hardware utilisation.
+
+---
+
+## Parallel KV Consolidation (major train change required)
+
+### Core idea
+
+Run N independent trajectories in parallel — each chunk gets its own full IQ+IR
+forward pass producing its own KV state. Then run a **consolidation forward pass**
+that concatenates all N KV states along the time dimension and produces a NEW,
+smaller slot that distills all N into a single compressed representation.
+
+The compressed slot must support recall at the same quality as the full N-slot union.
+Each consolidation round halves the slot budget, like a compression pass:
+
+```
+Round 0 (parallel, N independent passes):
+  chunk_0 → KV_0  (slot_len=2 slots → 2 KV entries)
+  chunk_1 → KV_1  (2 KV entries)
+  chunk_2 → KV_2  (2 KV entries)
+  chunk_3 → KV_3  (2 KV entries)
+
+Round 1 (consolidation forward pass):
+  cat(KV_0, KV_1, KV_2, KV_3)   ← 8 KV entries in time dim
+  → SLOT_consol × 2              ← consolidation bottleneck: back to 2 slots
+  → [warmup][output]             ← must recall full 4-chunk span from 2 slots
+
+Validation: IQ recall from SLOT_consol (no access to source KVs) == serial recall.
+```
+
+### Why this is different from merge-resolve
+
+Merge-resolve reconciles **two independent encodings of the same span** — the
+two branches computed different representations of overlapping bytes, and the
+merge picks the consistent one.
+
+Consolidation **compresses N non-overlapping spans into one** — the N chunks
+cover disjoint byte ranges, and consolidation must encode all of them into a
+slot budget that is smaller than their union:
+
+```
+Merge:       span_A ∩ span_B ≠ ∅  →  reconcile two views of the same bytes
+Consolidate: span_0 ∪ span_1 ∪ ... ∪ span_{N-1}  →  encode ALL bytes in fewer slots
+```
+
+### Sequence layout (consolidation pass)
+
+The consolidation pass is a new IQ-like turn appended after the parallel KVs:
+
+```
+──── parallel forward passes (independent, can run on separate devices) ────
+KV_0:  [ENC_0: chunk_0 | SL_0×2] [IQ_0: SL×2 | wm | out] [IR_0×2]
+KV_1:  [ENC_1: chunk_1 | SL_1×2] [IQ_1: SL×2 | wm | out] [IR_1×2]
+KV_2:  [ENC_2: chunk_2 | SL_2×2] [IQ_2: SL×2 | wm | out] [IR_2×2]
+KV_3:  [ENC_3: chunk_3 | SL_3×2] [IQ_3: SL×2 | wm | out] [IR_3×2]
+
+──── consolidation forward pass (single pass, reads from concat KV) ─────────
+Virtual seq: cat(KV_0, KV_1, KV_2, KV_3)    offset positions: 0, L, 2L, 3L
+[SLOT_consol × 2]                            ← consolidation bottleneck
+[warmup: bytes 0:wl of full 4-chunk span]
+[output: bytes wl:4×chunk_len]               ← recall ALL 4 chunks from 2 slots
+```
+
+Mask for consolidation SLOT: can attend to all N sets of source SLOTs
+(the IQ/IR output slots from each parallel pass), blocked from raw chunk bytes
+(same bottleneck contract as a standard IQ SLOT).
+
+### Position encoding during concat
+
+Each parallel pass starts at position 0 within its own sequence of length L.
+When concatenated for the consolidation pass, positions are re-indexed with
+offsets: pass i starts at position i×L. The consolidation SLOT is at position N×L.
+
+RoPE positions for the consolidation turn are thus large (N×L + ...) — the relative
+position distances between the consolidation SLOT and the source SLOTs reflect how
+far apart in the virtual sequence they are. This matters: if N=4 and L=204, the
+consolidation SLOT is at position 816, attending to source SLOTs at 0, 204, 408, 612.
+The RoPE distances encode "how far back in time" each chunk was ingested — a natural
+recency signal for the consolidation bottleneck.
+
+Alternative: use **segment-local positions** (each pass's internal positions stay at
+0..L-1; the consolidation SLOT uses a fresh position 0). This removes the recency
+signal but makes the consolidation SLOT's attention more uniform across all N passes.
+Ablate both.
+
+### Iterative consolidation (slot budget halving)
+
+Apply consolidation recursively to reduce slot count from N×2 to 2:
+
+```
+Level 0: N=4 chunks, 4×2=8 total slots (parallel passes)
+Level 1: consolidate 4→2 chunks at a time → 2×2=4 total slots
+Level 2: consolidate 2→1 → 1×2=2 total slots (final)
+```
+
+Or more aggressively, full fan-in at each level:
+
+```
+Level 0: 64 chunks × 2 slots = 128 slots  (64 parallel passes)
+Level 1: 1 consolidation pass, 128 source slots → 2 final slots
+```
+
+Whether 128→2 is achievable in one pass depends on model capacity. More likely:
+a binary tree like the merge-resolve hierarchy, but each node is a consolidation
+(compressing, not reconciling).
+
+### Training requirements (why this is a major change)
+
+Current training: one forward pass per training step, fixed sequence length.
+
+Consolidation requires:
+1. **Parallel forward passes**: run N independent passes, collect their KV caches
+2. **KV concatenation + re-offset**: concat along time dim, shift position indices
+3. **Consolidation forward pass**: new pass with the concat KV as `past_kv`,
+   consolidation SLOT and output at offset N×L
+4. **New mask type** (`chunk_mask_consolidation`): consolidation SLOT rows attend
+   to all source SLOTs across all N KV segments; blocked from raw chunk bytes
+   (same as IQ SLOT rule) and from all IR/IQ output regions (same as current fix)
+5. **Loss on consolidation output** (not the parallel IQ/IR outputs — those are
+   just scaffolding for producing the source KVs)
+6. **Validation pass**: after consolidation, run IQ recall from SLOT_consol
+   (discarding source KVs) and require exact match
+
+The parallel passes themselves are teacher-forced IQ+IR (same as current training),
+but their purpose changes: instead of measuring loss on their output, they generate
+KV context for the consolidation step. Gradients still flow through the consolidation
+pass and back into the parallel passes via the KV state.
+
+### Validation: exact match gating (same contract as merge-resolve)
+
+The consolidation is valid iff:
+
+```
+recall(SLOT_consol, IQ, full_span)  ==  serial_recall(full_span, IQ+2IR)
+```
+
+where serial_recall is what a standard (non-parallel) single-pass ingestion would
+produce. Exact byte-for-byte match required — not just BPB — for the same reason
+as merge: any divergent byte becomes an argmax cue and cascades through IR chains.
+
+If consolidation fails exact match, chain consolidation IR turns (same as rebase
+in merge-resolve): feed the imperfect consolidation output as argmax cue, re-run
+the consolidation SLOT, and iterate until exact match or max_rounds.
+
+---
+
 ## Scaling — Corpus Ingestion Recipe
 
 ### Window layout
@@ -135,6 +405,173 @@ Stage N checkpoint → Stage N+1: double src_len, add n_windows windows,
 
 ---
 
+## Scaling to Long Corpora — Sequence Layout at Each Scale
+
+### Fixed window (W=32B), growing corpus
+
+The simplest scaling axis: keep the proven 32B IQ+IR unit fixed, add more windows.
+Training sequence layout for a single SRS pass over a batch of B_w windows:
+
+```
+[ENC_0..ENC_{n_chunks-1}]                  ← one shared encoding pass
+[IQ_w0 | IR1_w0 | IR2_w0]                  ← window 0: bytes 0-31
+[IQ_w1 | IR1_w1 | IR2_w1]                  ← window 1: bytes 16-47
+[IQ_w2 | IR1_w2 | IR2_w2]                  ← window 2: bytes 32-63
+...
+[IQ_w_{B_w-1} | IR1 | IR2]                 ← last window in this session
+```
+
+At scale, the full sequence no longer fits in memory — SRS scheduling determines
+which B_w windows appear in each training session.
+
+| Corpus | n_windows | Seq L (all windows, W=32 s=16) | Fits single pass? |
+|--------|-----------|-------------------------------|-------------------|
+| 64B    | 3         | ~572                          | ✓ (stage 3)       |
+| 1KB    | 63        | ~10800                        | ✓ (fits easily)   |
+| 16KB   | 1023      | ~168K                         | ✓ (large batch)   |
+| 65KB   | 4095      | ~672K                         | ✗ — batch windows |
+| 1MB    | 65534     | ~10.7M                        | ✗ — batch windows |
+
+**Multi-pass SRS session** (corpus too large for single pass):
+```
+Session = ENC(all chunks) + [IQ_w | IR1_w | IR2_w for w in srs_due(t)]
+
+srs_due(t) = {w : R_w(t) < R_thresh}   # windows due for review at time t
+           ordered by urgency: lowest R_w first
+
+Each session processes B_w windows; B_w chosen to fit context budget.
+```
+
+After each session, update stability estimates:
+```
+if R_w(t) >= R_thresh after review:   S_w ← S_w · α   (interval grows)
+else:                                  S_w ← S_0        (reset — hard window)
+```
+
+### Raising window size: W=128B or W=1024B
+
+Instead of more windows at 32B, widen each window. Two sub-options:
+
+**A. Keep chunk_len=16, increase chunks per window (k=8 or k=64)**
+```
+W=128B: k=8 chunks, slot must encode 128B  (4× harder than proven 32B)
+W=1024B: k=64 chunks, slot must encode 1024B (32× harder)
+```
+Risk: the slot bottleneck (slot_len=4 tokens) may not have enough capacity.
+Current proof is at k=2 (32B). k=8 is an unknown. Must ablate before committing.
+
+**B. Raise chunk_len, keep k=2 chunks per window**
+```
+chunk_len=64,  W=128B:  k=2, same structure as proven recipe, 4× larger window
+chunk_len=512, W=1024B: k=2, 32× larger window
+```
+Advantage: training layout is IDENTICAL to the proven recipe (just larger tensors).
+The IQ+2IR mechanism has the same structural form. Risk: slot capacity per-chunk.
+
+| Config | chunk_len | k | W | Compression ratio (bytes→slot_len tokens) |
+|--------|-----------|---|---|------------------------------------------|
+| proven | 16        | 2 | 32B  | 16:4 = 4:1 per chunk                  |
+| →128B  | 64        | 2 | 128B | 64:4 = 16:1 per chunk (4× harder)     |
+| →1024B | 512       | 2 | 1024B | 512:4 = 128:1 per chunk (32× harder) |
+| →1024B | 16        | 64 | 1024B | 16:4 = 4:1 per chunk, 64 chunks      |
+
+Option B (raise chunk_len, keep k=2) is the natural next ablation — structure
+stays identical, only compression ratio increases. Start at chunk_len=32 (W=64B),
+verify IQ+2IR still converges, then step up.
+
+### Hierarchical chunking (future)
+
+At very large W, a two-level hierarchy avoids catastrophic compression:
+
+```
+Level 1: proven 32B windows (chunk_len=16, k=2) → SLOT_L1 per window
+Level 2: windows of 4 L1-windows (128B) → read L1 SLOTs → SLOT_L2
+Level N: windows of 4^(N-1) 32B base windows
+```
+
+Each level's IQ reads from the level below's SLOT tokens instead of raw bytes.
+Same IQ+IR mechanism, just the "source" is SLOTs not bytes.
+
+---
+
+## Inference-Aligned Training — Interleaved Ingest and Query
+
+### The problem
+
+Standard SRS training processes windows sequentially: ingest all, then recall.
+At inference, a user may **query mid-ingest** (e.g. "what did you just read?")
+or the model must **resume ingestion** after answering without forgetting earlier windows.
+
+Training must reflect this if the model is to handle it at inference.
+
+### Interleaved IQ-query + IR-ingest sequence
+
+Three turn types co-exist in a single training sequence:
+
+```
+type='ingest_iq'  : IQ turn scoped to a NEW window (never seen before in session)
+type='ingest_ir'  : IR turn refining a window already IQ'd this session
+type='query_iq'   : IQ recall of a window already ingested — NO source re-read,
+                    model must recall from the SLOT KVs already in context
+type='resume_ir'  : IR turn after a query (resumes refinement, proves no forgetting)
+```
+
+**Example sequence layout (8 chunks = 128B corpus, 7 windows):**
+
+```
+[ENC_0..ENC_7]                          ← encode all 8 chunks once
+
+[ingest_iq w0] [ingest_ir w0] [ingest_ir w0]   ← ingest window 0 (bytes 0-31)
+[ingest_iq w1] [ingest_ir w1] [ingest_ir w1]   ← ingest window 1 (bytes 16-47)
+[ingest_iq w2] [ingest_ir w2] [ingest_ir w2]   ← ingest window 2 (bytes 32-63)
+
+[query_iq w0]                                  ← user queries window 0 mid-ingest
+                                               ← model must recall bytes 8-31 of w0
+                                               ← only GT warmup[0:8] provided
+
+[resume_ir w3] [resume_ir w3]                  ← resume: ingest window 3 (no fresh IQ)
+[ingest_iq w4] [ingest_ir w4] [ingest_ir w4]
+...
+```
+
+The `query_iq` turn has **no source re-read**: the encoding blocks are in context
+but the model must use only SLOT KVs already in the KV cache. This forces the model
+to maintain slot representations across the full sequence — not just within a window.
+
+The `resume_ir` after a query has no preceding IQ — it reads from `argmax_src_c0`
+pointing to an IQ block earlier in the sequence, proving the IQ representation survived
+the query interruption.
+
+### Training mix
+
+In practice, mix multiple trajectory types per batch:
+
+```
+traj_mix = [
+    dict(type='ir_local', weight=0.6, windows=all_windows, n_refine=2),  # pure ingest
+    dict(type='ir_local_query', weight=0.3, windows=..., query_after=k),  # ingest+query
+    dict(type='ir_local_resume', weight=0.1, ...),                         # resume after query
+]
+```
+
+The `query_after=k` variant inserts a query_iq turn after window k's ingest, then
+continues ingesting windows k+1..: forcing retention of k during distraction.
+
+### Why this reflects inference
+
+At inference, a user streaming bytes into the model and periodically asking questions
+triggers exactly this pattern:
+- Model runs IQ+IR on each new 32B chunk as it arrives (streaming ingest)
+- User query = IQ recall without re-reading source
+- Model continues ingestion after answering
+- SRS scheduler resurfaces stale windows in the background
+
+This is equivalent to an **online, interactive LM** with fast-weight memory —
+the model "reads" a document and can answer questions about any part of it
+without backpropagation or fine-tuning.
+
+---
+
 ## Target: Train and Test NLL Matching Backprop LM
 
 A backprop LM achieves NLL by gradient descent over many passes through the corpus,
@@ -178,6 +615,7 @@ overlapping windows with the prolonged AR eval protocol.
 
 ## Open Questions
 
+### Near-term (stage 3 results will answer)
 1. **Does 87.5% match hold at 64B (stage 3)?** — each window is identical to stage 2,
    but the model must encode 4 chunks instead of 2 and the windows share an encoding pass.
 
@@ -188,8 +626,28 @@ overlapping windows with the prolonged AR eval protocol.
    bytes 0-63 with a single IQ turn (no IR, no SRS) after being trained on windowed IR?
    Expected to fail — motivates either full-span IQ stage or accepting windowed-only.
 
-4. **Closed-loop stopping criterion?** — what R_thresh avoids over-reviewing easy
+### Scaling questions (after stage 3)
+4. **chunk_len scaling**: does IQ+2IR still converge at chunk_len=32 (W=64B, 2×
+   compression)? chunk_len=64 (W=128B, 4×)? Find the compression ratio ceiling.
+
+5. **Multi-pass SRS session**: at 1KB+ corpus, does batching B_w windows per session
+   with SRS due-date scheduling maintain retention on early windows? Or does forgetting
+   occur between sessions?
+
+6. **Closed-loop stopping criterion**: what R_thresh avoids over-reviewing easy
    windows while still training hard ones? Ablate: R_thresh ∈ {0.8, 0.9, 0.95, 1.0}.
 
-5. **Long-range forgetting?** — does the model maintain retention on window 0 after
-   training on windows 1..N? SRS scheduling designed to prevent this, but not yet tested.
+7. **Long-range forgetting**: does the model maintain retention on window 0 after
+   training on windows 1..N in the same sequence? The mask prevents direct attention,
+   but the shared slot token IDs may cause interference.
+
+### Inference-alignment questions (after multi-pass SRS works)
+8. **Query mid-ingest**: does a `query_iq` turn correctly recall an earlier window
+   without re-reading the source, given only the SLOT KVs in context?
+
+9. **Resume without forgetting**: does an IR turn after a query (`resume_ir`) maintain
+   the quality of an IQ representation that was established N windows earlier?
+
+10. **Streaming ingest**: can the model process an arriving byte stream window-by-window
+    in real time, answering queries at any point, equivalent to an online LM with
+    in-context fast-weight memory?
