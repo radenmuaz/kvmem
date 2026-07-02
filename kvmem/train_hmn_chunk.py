@@ -434,7 +434,7 @@ def chunk_mask(pos: dict) -> np.ndarray:
     return np.where(visible, 0.0, -1e9).astype(np.float32)
 
 
-def chunk_mask_fb(pos: dict) -> np.ndarray:
+def chunk_mask_fb(pos: dict, nochain: bool = False) -> np.ndarray:
     """
     Mask for feedback-argmax IR layout. Same rules as chunk_mask for encoding
     blocks and IQ turns. Additional rules for IR turns:
@@ -444,6 +444,15 @@ def chunk_mask_fb(pos: dict) -> np.ndarray:
     7. SLOT_B rows: blocked from all chunks; sees SLOT_A + argmax causally.
     8. IR warmup/out rows: blocked from everything except own SLOT_B + own warmup/out.
        (Same strong bottleneck as IQ out rows, but SLOT_B is the gate — not SLOT_A or argmax.)
+
+    nochain=True adds:
+    3b. Each IQ SLOT row is blocked from ALL tokens in prior rec_blocks
+        (SLOT, warmup, argmax, AND output of earlier windows' IQ and IR turns).
+        This forces every window to encode independently from the enc-block SLOTs
+        only. Without this, the model chains through prior rec_block OUTPUT tokens
+        (not just SLOTs) — window 1 reads window 0's recalled output bytes 16-31,
+        which is in the 50% overlap, making independent recall impossible.
+        Blocking only prior SLOTs (the v4 attempt) was insufficient.
     """
     L = pos['L']
     r = np.arange(L); c = np.arange(L)
@@ -475,11 +484,30 @@ def chunk_mask_fb(pos: dict) -> np.ndarray:
             if j == k: continue
             blocked |= sl_row[:, None] & ((c >= bj['s0']) & (c < bj['s1']))[None, :]
 
-    for rb in rec_blocks:
+    for i_rb, rb in enumerate(rec_blocks):
         if rb['type'] == 'iq':
             # Rule 3 (IQ SLOT): blocked from all chunks
             sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
             blocked |= sl_row[:, None] & is_any_chunk[None, :]
+            # Rule 3b (nochain): IQ SLOT blocked from ALL tokens in prior rec_blocks
+            # (SLOT + warmup + argmax + output). Blocking only SLOTs is insufficient —
+            # the model chains through prior OUTPUT tokens (e.g., window 1 reads window
+            # 0's recalled bytes in the 50% overlap region). Full blackout of prior
+            # rec_blocks forces every window to encode from enc-block SLOTs only.
+            if nochain:
+                prior_all = np.zeros(L, dtype=bool)
+                for prev_rb in rec_blocks[:i_rb]:
+                    if prev_rb['type'] == 'iq':
+                        prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
+                        prior_all |= (c >= prev_rb['w0'])  & (c < prev_rb['w1'])
+                        prior_all |= (c >= prev_rb['c0'])  & (c < prev_rb['c1'])
+                    else:
+                        prior_all |= (c >= prev_rb['sla0']) & (c < prev_rb['sla1'])
+                        prior_all |= (c >= prev_rb['am0'])  & (c < prev_rb['am1'])
+                        prior_all |= (c >= prev_rb['slb0']) & (c < prev_rb['slb1'])
+                        prior_all |= (c >= prev_rb['w0'])   & (c < prev_rb['w1'])
+                        prior_all |= (c >= prev_rb['c0'])   & (c < prev_rb['c1'])
+                blocked |= sl_row[:, None] & prior_all[None, :]
             # Rule 4a: IQ warmup rows — own SLOT + own warmup only
             if rb['w0'] < rb['w1']:
                 wm_row = (r >= rb['w0']) & (r < rb['w1'])
@@ -1573,7 +1601,8 @@ _WINREFINE_WEIGHTS = {'half': 0.4, 'full': 0.2}
 
 def _build_trajectories(traj_mix_cfg: list[dict], n_chunks: int, chunk_len: int,
                         slot_len: int, warmup_len: int,
-                        schedule: list[tuple[int, int]], device) -> list[dict]:
+                        schedule: list[tuple[int, int]], device,
+                        nochain: bool = False) -> list[dict]:
     """
     Expand a traj_mix config (list of {type, weight}) into a flat list of
     concrete trajectories: {name, window, pos, mask_np, mask_t, has_ir, weight}.
@@ -1629,11 +1658,14 @@ def _build_trajectories(traj_mix_cfg: list[dict], n_chunks: int, chunk_len: int,
         elif ttype == 'ir_local':
             local_windows = entry['windows']
             n_refine = entry.get('n_refine', 2)
-            pos = chunk_positions_fb_localrefine(n_chunks, chunk_len, slot_len,
+            # per-traj n_chunks override: allows variable-context training
+            # where input source length varies but output window is fixed (vlen)
+            traj_nc = entry.get('n_chunks', n_chunks)
+            pos = chunk_positions_fb_localrefine(traj_nc, chunk_len, slot_len,
                                                  warmup_len, local_windows, n_refine=n_refine)
-            mask_np = chunk_mask_fb(pos)
+            mask_np = chunk_mask_fb(pos, nochain=nochain)
             out.append(dict(name=ttype, window=None, pos=pos, mask_np=mask_np,
-                            has_ir=(n_refine > 0), weight=w))
+                            has_ir=(n_refine > 0), weight=w, n_chunks=traj_nc))
         else:
             raise ValueError(f'unknown traj_mix type: {ttype!r}')
 
@@ -1730,8 +1762,10 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         traj_mix_cfg = stage.get('traj_mix')
         if traj_mix_cfg is None:
             traj_mix_cfg = [dict(type='ir_srs', weight=1.0)]
+        nochain = hp.get('mask_nochain', False)
         trajectories = _build_trajectories(traj_mix_cfg, n_chunks, chunk_len,
-                                           slot_len, warmup_len, schedule, device)
+                                           slot_len, warmup_len, schedule, device,
+                                           nochain=nochain)
         traj_weights = np.array([t['weight'] for t in trajectories], dtype=np.float64)
         traj_weights = traj_weights / traj_weights.sum()
 
@@ -1773,8 +1807,9 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
             traj = trajectories[rng.choice(len(trajectories), p=traj_weights)]
             pos, mask_t, has_ir = traj['pos'], traj['mask_t'], traj['has_ir']
+            traj_nc = traj.get('n_chunks', n_chunks)  # per-traj override for vlen
 
-            tok_np = _chunk_make_batch_fb(rng, B, n_chunks, chunk_len,
+            tok_np = _chunk_make_batch_fb(rng, B, traj_nc, chunk_len,
                                           slot_len, slot_count, schedule, pos)
             tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
 
@@ -1824,10 +1859,11 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     n_local_windows = (len(set(rb['span'] for rb in epos['rec_blocks']))
                                        if et['name'] == 'ir_local' else 1)
                     use_stitch = et['name'] == 'ir_local' and n_local_windows > 1
+                    et_nc = et.get('n_chunks', n_chunks)  # use traj's n_chunks for vlen
                     val_results = []
                     for sname, seq in val_seqs.items():
                         chunks_arr = np.array(
-                            [seq[k*chunk_len:(k+1)*chunk_len] for k in range(n_chunks)], np.int64)
+                            [seq[k*chunk_len:(k+1)*chunk_len] for k in range(et_nc)], np.int64)
                         if use_stitch:
                             r = ar_decode_chunk_fb_stitch_kv(model, chunks_arr, slot_len, slot_count,
                                                              emask, epos, device)

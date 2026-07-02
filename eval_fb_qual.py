@@ -104,16 +104,18 @@ OVERLAPS = [
 # ── Build per-window and full-window pos/mask ─────────────────────────────────
 schedule = [(0, N_CHUNKS)]
 
+NOCHAIN = hp.get('mask_nochain', False)
+
 per_window = []
 for win in WINDOWS:
     pos  = chunk_positions_fb_localrefine(N_CHUNKS, CHUNK_LEN, SLOT_LEN, WARMUP_LEN,
                                           [win], N_REFINE)
-    mask = chunk_mask_fb(pos)
+    mask = chunk_mask_fb(pos, nochain=NOCHAIN)
     per_window.append((win, pos, mask))
 
 full_pos  = chunk_positions_fb_localrefine(N_CHUNKS, CHUNK_LEN, SLOT_LEN, WARMUP_LEN,
                                            WINDOWS, N_REFINE)
-full_mask = chunk_mask_fb(full_pos)
+full_mask = chunk_mask_fb(full_pos, nochain=NOCHAIN)
 
 # ── Sequences ─────────────────────────────────────────────────────────────────
 seqs = make_test_sequences(SRC_LEN)

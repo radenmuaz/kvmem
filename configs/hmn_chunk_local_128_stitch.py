@@ -1,24 +1,22 @@
 """
 Stage 4 stitch-only: 128B src, 7 overlapping 32B windows.
-Pure stitch training to establish a strong 7-window baseline before adding independence.
+Pure stitch training. mask_nochain=True (full prior rec_block blackout — corrected v5 fix).
 
 Rationale:
-  b4 (mixed from v2 end): started from damaged baseline (6.2% stitch) → can't recover.
-  This config instead builds from v3's end (stitch≥60%, win1/2 independent≥40%).
+  Stage 3 v5 (64B, corrected nochain) must pass with win1/win2 independent ≥40% AND
+  stitch ≥50% before running this stage. Update --pretrained to v5 end checkpoint.
 
-  Phase A (this config): pure stitch — teach the model to stitch 7 windows together.
-  Phase B (hmn_chunk_local_128_v3.py): add win1..win6 independence fine-tuning.
-
-  Same lesson as stages 1→2: master the base task before adding complexity.
+  mask_nochain=True blocks IQ SLOT from ALL prior rec_block tokens (SLOT+warmup+output).
+  With this fix, pure stitch training suffices — independence is enforced by the mask.
 
 Sequence lengths:
   all-7-windows: enc(8×20=160) + 7×164 = 160+1148 = 1308 tokens
-  B=4 → 4×1308=5232 tokens/batch (proven safe for MPS, same as b4)
+  B=4 → 4×1308=5232 tokens/batch (proven safe for MPS)
 
 Run:
     caffeinate -i python3 -m kvmem.train_hmn_chunk \\
         --config configs/hmn_chunk_local_128_stitch.py \\
-        --pretrained logs/hmn_chunk_local_64_v3/checkpoints/stage0_end.pt \\
+        --pretrained logs/hmn_chunk_local_64_v5/checkpoints/stage0_end.pt \\
         --device mps
 """
 
@@ -30,6 +28,8 @@ hp = dict(
     rope=True, yarn=True, null_kv=True, compile=False,
     chunk_attn=256,
     name='hmn_chunk_local_128_stitch', seed=42,
+
+    mask_nochain=True,
 
     slot_len=4, slot_count=2,
     warmup_len=8,

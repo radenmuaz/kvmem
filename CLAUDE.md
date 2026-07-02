@@ -13,6 +13,41 @@ Fast-weight language model — HashMemNet (HMN). Two architectures: v3 (MEM bloc
 
 ---
 
+## Architecture in plain terms
+
+**The task**: memorize a byte sequence, then recall it from a short seed (warmup).
+
+**One recall unit** — the proven primitive (`hmn_feedback_32_ir`, 100% on 32 bytes):
+```
+[source bytes] [SLOT×4] [warmup: 8 bytes] → [output: 24 bytes]
+then refine 2× using model's own previous output as feedback (IR turns)
+```
+
+**Scaling up**: split source into 16-byte chunks (`chunk_len=16`). Each chunk gets encoded into 4 SLOT tokens. Run the 32-byte recall unit on overlapping windows of 2 chunks each.
+
+```
+source = 64 bytes = 4 chunks of 16 bytes     (nc=4)
+
+[chunk0|SLOT×4] [chunk1|SLOT×4] [chunk2|SLOT×4] [chunk3|SLOT×4]
+  enc_block[0]    enc_block[1]    enc_block[2]    enc_block[3]
+  positions 0-19  positions 20-39 positions 40-59 positions 60-79
+
+window A (0,2): recall bytes  0-31   (chunks 0+1)
+window B (1,3): recall bytes 16-47   (chunks 1+2)  ← 16B overlap with A
+window C (2,4): recall bytes 32-63   (chunks 2+3)  ← 16B overlap with B
+```
+
+- **nc** = number of chunks. nc=2 → 32B, nc=4 → 64B, nc=8 → 128B.
+- **enc_block[k]** = the k-th chunk's token region (raw bytes + SLOT tokens).
+- **SLOT tokens** = compressed memory for one chunk. The recall IQ turn reads from these (raw bytes are masked out) to reconstruct the window.
+- **Stitch decode**: run windows A→B→C in order. Each window's 8-byte warmup comes from the previous window's decoded output — works because warmup_len=8 < stride=16B, so the warmup always falls inside the 16B overlap that the prior window already generated. Only the very first warmup (bytes 0-7) is seeded from ground truth.
+
+**The position problem (current issue)**: in stitch training, windows always appear in sequence — window C's recall block is at token position ~408 (after A and B). The model learned to read enc_block[2,3] SLOTs from that far position. In independent eval (window C alone, right after enc_blocks), the recall block is at position ~80 and enc_block[3]'s SLOTs are only 1-4 positions away — a distance the model has never seen for window C, so it fails. Window B has the same problem but milder (position shift 244→80 vs 408→80).
+
+**Fix in progress**: v5b adds training examples of B and C in isolation. B is improving; C is stuck because enc_block[3] ends up at distance 1 in isolation — too different from distance ~330 in stitch. **vlen** (ready) trains C at multiple source lengths (nc=4/8) so the recall SLOT lands at positions 80 and 160, forcing position-invariant encoding.
+
+---
+
 ## Current Status
 
 **Feedback architecture solved the refinement problem. Now extending to multi-sequence SRS chunk memorization.**
@@ -24,7 +59,9 @@ Fast-weight language model — HashMemNet (HMN). Two architectures: v3 (MEM bloc
 | `hmn_chunk_local_32_stage1` (IR, 80k) | **87.5% match** with fixed KV decode ✓ |
 | `hmn_chunk_local_64` v1 (64B, pure stitch, 80k) | stitch=76.8%, win0=85.9%, win1=**0%**, win2=13% — chaining failure |
 | `hmn_chunk_local_64_v2` (64B, 4-way equal mix, 80k) | **stitch collapsed to 6.2%** — equal mix gave stitch only 25% of steps, insufficient |
-| `hmn_chunk_local_64_v3` (64B, targeted fix: stitch×3+win1×1+win2×1, from v1 end) | **running** — 60% stitch steps, 20% each problematic window |
+| `hmn_chunk_local_64_v3` (64B, targeted fix: stitch×3+win1×1+win2×1, from v1 end) | **failed** — stitch oscillated 58→43→35→45→41%, win2 collapsed at 60k. Killed. |
+| `hmn_chunk_local_64_v4` (64B, mask_nochain=True, pure stitch, from stage2 end) | **failed** — win1=0%, win2=12.5% indep; stitch=53.6% best. nochain blocked SLOTs only, model chained through OUTPUT tokens |
+| `hmn_chunk_local_64_v5` (64B, mask_nochain=True corrected, pure stitch, from stage2 end) | **running** — v5 fix: IQ SLOT blocked from ALL prior rec_block tokens (SLOT+warmup+output) |
 | All HMN v3 variants (mono, cerb, p2, p4, pinf, tlogit) | ~95% k=0, collapses at k>4 |
 
 ---
@@ -70,9 +107,10 @@ IDs (258/259). slot_count=4 was ablated but not adopted.
 | 2 | 2 (32B) | `[(0,2)]` | 2 | 80000 | `hmn_chunk_local_32_stage1.py` | **87.5%** ✓ |
 | 3 v1 | 4 (64B) | all-3 only | 2 | 80000 | `hmn_chunk_local_64.py` | stitch=76.8%, **win1=0%** — chaining failure |
 | 3 v2 | 4 (64B) | equal mix (4-way) from stage2 | 2 | 80000 | `hmn_chunk_local_64_v2.py` | **stitch=6.2%** — too few stitch steps |
-| 3 v3 | 4 (64B) | stitch×3+win1×1+win2×1 from v1 | 2 | 80000 | `hmn_chunk_local_64_v3.py` | **running** |
-| 4a | 8 (128B) | all-7 only (pure stitch) | 2 | 80000 | `hmn_chunk_local_128_stitch.py` from v3 | pending |
-| 4b | 8 (128B) | stitch×3+win1..win6×1 | 2 | 80000 | `hmn_chunk_local_128_v3.py` from 4a | pending |
+| 3 v3 | 4 (64B) | stitch×3+win1×1+win2×1 from v1 | 2 | 80000 | `hmn_chunk_local_64_v3.py` | **failed** — chaining structurally unavoidable, killed at 60k |
+| 3 v4 | 4 (64B) | pure stitch, mask_nochain=True (SLOTs only) from stage2 | 2 | 80000 | `hmn_chunk_local_64_v4.py` | **failed** — win1=0% indep, stitch=53.6%. Chained through OUTPUT tokens |
+| 3 v5 | 4 (64B) | pure stitch, mask_nochain=True (full blackout) from stage2 | 2 | 80000 | `hmn_chunk_local_64_v5.py` | **running** |
+| 4 | 8 (128B) | pure stitch, mask_nochain=True from v5 | 2 | 80000 | `hmn_chunk_local_128_stitch.py` (update pretrained path) | pending |
 | 5 | 16 (256B) | stitch×3+win1..win14×1 | 2 | 80000 | `hmn_chunk_local_256.py` from 4b | pending |
 
 **Stage 3 sequence layout** (L=572, slot_len=4, slot_count=2):
@@ -121,6 +159,20 @@ encoding blocks independently. Result:
 - Window 2 (relied on windows 0+1's SLOT): 13.0% in isolation ✗
 - Stitch (chaining present): 76.8% (windows benefit from prior SLOTs)
 
+**Root cause of v1/v2/v3 failures (architectural)**:
+`chunk_mask_fb` only blocked IQ SLOT rows from source chunks — NOT from prior rec_block SLOT tokens.
+Window 1's IQ SLOT could freely attend to window 0's IQ SLOT (chaining). No training distribution
+could fix this: stitch training reinforces chaining, singles training fights it, model oscillates.
+
+**v4 attempt (failed)**: `mask_nochain=True` blocked IQ SLOT rows from prior SLOT tokens only.
+The model found a new chaining path through prior OUTPUT tokens: window 1's IQ SLOT read window 0's
+recalled output bytes 16-31 (the 50% overlap region). Result: win1=0%, win2=12.5% independent;
+stitch=53.6% (only works because window 0 fills the overlap, not because window 1 encodes it).
+
+**Fix (v5)**: Rule 3b now blocks IQ SLOT rows from ALL tokens in prior rec_blocks — SLOT, warmup,
+argmax, AND output. Every window can only attend to enc-block SLOTs. All chaining paths cut off.
+See `chunk_mask_fb(..., nochain=True)` in `kvmem/train_hmn_chunk.py`.
+
 **v2 attempt (failed)**: 4-way equal-weight mix from stage 2 checkpoint.
 - Stitch got only 25% of steps → stitch collapsed from 76.8% (v1) to 6.2%
 - Per-window: win0=13.5%, win1=15.1%, win2=24.5% — independence improved but weak
@@ -134,15 +186,15 @@ encoding blocks independently. Result:
 
 **Staged approach for 4+ windows**: always establish pure stitch first (100% steps),
 THEN fine-tune independence. Never mix from a damaged-stitch starting point.
-- Stage 4a: pure stitch `hmn_chunk_local_128_stitch.py` (from v3 end)
-- Stage 4b: targeted mix `hmn_chunk_local_128_v3.py` (from 4a end), skip win0
+- Stage 4: pure stitch `hmn_chunk_local_128_stitch.py` (from v5 end, update pretrained path)
+- Stage 5: `hmn_chunk_local_256.py` (from 128 end)
 
 ### Experiment tiers — ordered by difficulty (do not skip ahead)
 
 **Tier 1 — ir_local stitch (current work)**
 Prove per-window IQ+IR stitch works reliably at scale: 64B → 128B → 256B.
 Success bar: stitch ≥60% AND all windows independently ≥40% before moving up.
-Configs: `hmn_chunk_local_64_v3` → `hmn_chunk_local_128_stitch` → `hmn_chunk_local_128_v3` → `hmn_chunk_local_256`
+Configs: `hmn_chunk_local_64_v5` → `hmn_chunk_local_128_stitch` → `hmn_chunk_local_256`
 
 **Tier 2 — random-warmup continuation (after Tier 1 at ≥128B)**
 Goal: "continue from any warmup position X in sequence."
@@ -165,34 +217,27 @@ Do not revive before ir_winrefine is warranted — it doesn't solve the chaining
 
 ### Run commands
 ```bash
-# Stage 3 v3 (64B, targeted fix: stitch×3+win1+win2, from v1 end)
+# Stage 3 v5 (64B, mask_nochain=True corrected — full prior rec_block blackout, from stage2 end)
 caffeinate -i python3 -m kvmem.train_hmn_chunk \
-    --config configs/hmn_chunk_local_64_v3.py \
-    --pretrained logs/hmn_chunk_local_64/checkpoints/stage0_end.pt \
+    --config configs/hmn_chunk_local_64_v5.py \
+    --pretrained logs/hmn_chunk_local_32_stage1/checkpoints/stage0_end.pt \
     --device mps
 
-# Stage 4a (128B, pure stitch only, B=4, from v3 end)
+# Stage 4 (128B, pure stitch, mask_nochain=True, from v5 end)
 caffeinate -i python3 -m kvmem.train_hmn_chunk \
     --config configs/hmn_chunk_local_128_stitch.py \
-    --pretrained logs/hmn_chunk_local_64_v3/checkpoints/stage0_end.pt \
+    --pretrained logs/hmn_chunk_local_64_v5/checkpoints/stage0_end.pt \
     --device mps
 
-# Stage 4b (128B, targeted mix: stitch×3+win1..win6, from 4a end)
+# Stage 5 (256B, 15 windows, from 128 end)
 caffeinate -i python3 -m kvmem.train_hmn_chunk \
-    --config configs/hmn_chunk_local_128_v3.py \
+    --config configs/hmn_chunk_local_256.py \
     --pretrained logs/hmn_chunk_local_128_stitch/checkpoints/stage0_end.pt \
     --device mps
 
-# Stage 5 (256B, 15 windows, from 4b end)
-caffeinate -i python3 -m kvmem.train_hmn_chunk \
-    --config configs/hmn_chunk_local_256.py \
-    --pretrained logs/hmn_chunk_local_128_v3/checkpoints/stage0_end.pt \
-    --device mps
-
 # Qualitative eval (any checkpoint — auto-detects n_chunks and windows from hp)
-python3 eval_fb_qual.py --ckpt logs/hmn_chunk_local_64_v3/checkpoints/stage0_end.pt --device mps
+python3 eval_fb_qual.py --ckpt logs/hmn_chunk_local_64_v5/checkpoints/stage0_end.pt --device mps
 python3 eval_fb_qual.py --ckpt logs/hmn_chunk_local_128_stitch/checkpoints/stage0_end.pt --device mps
-python3 eval_fb_qual.py --ckpt logs/hmn_chunk_local_128_v3/checkpoints/stage0_end.pt --device mps
 ```
 
 ### KV cache decode — why it's valid and what the mask does
