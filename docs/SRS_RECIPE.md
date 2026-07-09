@@ -767,10 +767,90 @@ data point for *why* addressing matters as much as raw capacity when designing t
 |-------|-----|---------|--------|
 | 1 | 32B | 1, n_refine=0 | 81.9% match (IQ only) |
 | 2 | 32B | 1, n_refine=2 | **87.5% match** |
-| 3 | 64B | 3, n_refine=2 | **in progress** — first SRS scaling experiment |
+| 3 | 64B | 3, n_refine=2 | superseded by the chat-tags track (see `docs/FEEDBACK_RESULTS.md`) |
 
-Stage 3 is the first test of whether the per-window IQ+IR unit composes across
-overlapping windows with the prolonged AR eval protocol.
+Stage 3 (as originally scoped, plain `iq_global_rw`) was superseded — the chat-tags
+experiment series (window-specific tags + wrong-token-weighted loss) solved the same
+64B/nc=4 recall problem more thoroughly (97.2% mean, all three windows ≥90%, converged)
+than continuing stage 3 alone would have. See `docs/FEEDBACK_RESULTS.md § Chat-tags
+experiment` for the full arc.
+
+---
+
+## Resuming true SRS (spaced-repetition span scheduling) — queued, planned
+
+**Why now**: the earlier depth-2 SRS attempt (`hmn_chunk_curric`/`hmn_chunk_srs_ir`,
+`configs/hmn_chunk_srs_ir.py`) **failed** — stage 0 (IQ-only, 256B src, `slot_len=2`, 64×
+compression per chunk) never escaped random-baseline BPB (~8.0) after 12000 steps. Root
+cause diagnosed then as *too-aggressive compression + far too few training steps*, not a
+windowing/refinement problem per se (see `docs/MDL_MODEL_SIZE.md`). The underlying IQ+IR
+primitive (`chunk_positions_fb_localrefine`, one local IQ + n chained argmax-IR turns
+per span) was never actually broken — it's the same mechanism validated at 87.5% (32B)
+and now 97.2% (64B, tagged + wrong-token loss). What's genuinely new and worth applying
+to true multi-span SRS: (1) `slot_len=8` not 2 (the compression ratio that actually
+works), (2) span-specific query tags (the fix that took chat-tags Win C from 27.8%→91.7%,
+directly transplantable — SRS spans have exactly the same "multiple regions share one
+addressing key" collision risk that windows did), (3) the wrong-token-weighted IR loss
+(fixed IR degradation cheaply, one-line change, no architecture cost).
+
+**What "true SRS" means here, vs. what chat-tags already does**: `iq_global_rw` (the
+chat-tags foundation) uses **one global SLOT** reading the whole source, queried at
+different byte offsets (windows A/B/C) — it does not implement spaced-repetition
+*scheduling* (review order, retention decay) at all. True SRS (`srs_schedule`/
+`srs_schedule_depth2` + `chunk_positions_fb_localrefine`, already implemented in
+`kvmem/train_hmn_chunk.py`) gives **each span its own local IQ+chained-IR unit**, visited
+in a schedule designed to combat forgetting across a growing sequence (singles → pairs →
+full, or halves → full for the depth-2 variant). This is the architecture the whole
+`docs/SRS_RECIPE.md` vision document is actually about — the chat-tags track was a
+detour to fix a specific `iq_global_rw` bottleneck, not the SRS mechanism itself.
+
+**Reused unchanged** (per this project's isolation convention — no `kvmem/` edits):
+- `kvmem.train_hmn_chunk.srs_schedule_depth2` / `srs_schedule` — span-order generation.
+- `kvmem.train_hmn_chunk.chunk_mask_fb` — already implements the "IQ SLOT blocked from
+  ALL tokens in prior rec_blocks" (nochain) rule generically (Rule 3b), which is exactly
+  the v5 chaining fix `ir_local` needed — this de-risks the SRS extension significantly,
+  since the hardest architectural problem in the whole local-refine family is already
+  solved in the shared mask function chat-tags already depends on.
+- `experiments/chat_tags/batch.py`'s `make_batch_tagged`/`_fill_argmax_fb` and
+  `ar_decode_iq_global_rw_tagged` — both are generic over `pos_content['rec_blocks']`
+  (don't assume `iq_global_rw`'s random-warmup-X structure specifically; the IQ branch's
+  fixed-span fallback path already does exactly what per-span SRS review needs: warmup =
+  first `warmup_len` bytes of the span, output = the rest). `turn_match_pcts` in the
+  decode result already reports per-rec_block match — exactly what's needed for per-span
+  SRS eval, no new decode function required.
+- `kvmem.utils.make_test_sequences` for val (same as every prior experiment) and
+  `kvmem.train_hmn_chunk.load_chunks_padded` + `datasets/suratalkauthar.txt` /
+  `datasets/suratalfatihah.txt` for held-out test — the val/test convention used by the
+  *original* (pre-chat-tags) SRS configs, not yet wired into `experiments/chat_tags/`'s
+  train.py (which only does val). Worth adding for the SRS run specifically, matching
+  `configs/hmn_chunk_srs_ir.py`'s `eval_file=` pattern.
+
+**New code needed** (new folder `experiments/srs_tagged/`, isolated, no `kvmem/` edits):
+- `chunk_positions_srs_tagged(n_chunks, chunk_len, slot_len, warmup_len, schedule,
+  n_refine)` — mirrors `chunk_positions_fb_localrefine`'s per-span-in-sequence structure
+  (one shared encoding pass, then each span in `schedule` gets its own tag-wrapped local
+  IQ + n_refine chained IR), reusing the exact tag-wrapping helper pattern from
+  `chunk_positions_iq_global_rw_tagged`, but assigning each span a query tag **by its
+  position in the schedule** rather than by byte offset X. `srs_schedule_depth2(4)` gives
+  exactly 3 spans `[(0,2),(2,4),(0,4)]` — conveniently exactly matching the 3 existing
+  `HMN_QUERY_A/B/C` tags with zero new vocab needed for the first run. The full
+  `srs_schedule(4)` (7 spans) would need 4 more tags — deferred to a follow-up once
+  depth-2 is validated.
+- A new `train.py` (not extending `experiments/chat_tags/train.py` in place) since the
+  eval-reporting loop differs enough to warrant it: chat-tags groups eval by X-offset
+  sweep over one shared trajectory; SRS needs to group by **distinct span**, reading each
+  span's own final rec_block from `turn_match_pcts`/`rb['span']`, plus wiring in the
+  `eval_file` test-set path the original SRS configs used but chat-tags never added.
+
+**First target** (matching proven scale, not jumping to where the old attempt failed):
+`n_chunks=4, chunk_len=16` (64B total, same scale as the whole chat-tags series),
+`slot_len=8`, `srs_schedule_depth2` (3 spans: two 32B halves + the 64B full span),
+`n_refine=2`, wrong-token-weighted loss enabled from the start (`wrong_token_weight=2.0`,
+already proven). Val: `make_test_sequences(64)`. Test: `datasets/suratalfatihah.txt`
+padded to `(4, 16)` via `load_chunks_padded`. Success bar: each of the 3 spans reaches
+≥90% match on both val and the held-out test file, matching the chat-tags bar. If depth-2
+succeeds, extend to full `srs_schedule` (7 spans, singles→pairs→full) as the next step —
+that's the actual multi-session spaced-repetition scaling test the vision doc is about.
 
 ---
 

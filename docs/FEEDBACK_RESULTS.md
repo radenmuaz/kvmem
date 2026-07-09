@@ -792,6 +792,72 @@ sequentially (never two training jobs at once), roughly in order of implementati
 — warm-started from B4's best checkpoint, `train.py` extended with a `wrong_token_loss_weight`
 hp (default 0, backward compatible with all prior configs).
 
+### Ablation 1 result (complete, confirmed converged) — crosses the original success bar
+
+At step 30000 (50% through): **all three windows hit 100% simultaneously** (mean=100%, loss=0.0009).
+Step 35000: mean=97.2%, Win A=100%, Win B=100%, Win C=91.7% — still comfortably above the
+original chat-tags queue's success bar (≥90% every window), and every per-turn breakdown across
+both checkpoints shows the IR-degradation pattern replaced by monotonic improvement (e.g.
+`odd`: IQ=20.8%→IR1=91.7%→IR2=100.0%). Running average across the first 7 eval checkpoints:
+Win A 97.4%, Win B 92.1%, Win C 81.3% (pulled down by the earlier, still-adjusting checkpoints —
+consistent with a genuinely rising trajectory, same pattern as B3/B4 where true stability emerged
+near the end of the cosine decay, not the early checkpoints).
+
+Trajectory so far: 90.7 → 91.7 → 81.0 → 83.3 → 88.0 → **100.0** → 97.2 (mean%, steps 5k-35k).
+
+**This is the first run in the entire chat-tags queue to hit the original ≥90%-all-windows bar,
+and it stayed there.** The last 6 consecutive eval checkpoints (steps 35000-60000) all sit in a
+tight 97.2-97.7% band — genuine stable convergence, not a lucky spike (contrast with B2's single
+misleading peak). **Final checkpoint (step 60000)**:
+
+| | Win A | Win B | Win C | overall |
+|---|---|---|---|---|
+| untagged `slot8_ir_v2` (original baseline) | 100% | 77.8% | 55.6% | 77.8% |
+| B4 (window-specific tags only) | 100% | 100% | 84.7% | 94.9% |
+| **wrong-token-weighted loss (this ablation)** | **100%** | **100%** | **91.7%** | **97.2%** |
+
+Best single checkpoint (step 30000) hit a perfect 100%/100%/100% (mean=100%, loss=0.0009) — the
+first time any run in this series reached that. The converged final-checkpoint number (91.7% Win
+C, not the 100% peak) is the honest figure per the same "don't cherry-pick a spike" discipline
+used throughout, and it's still comfortably above both B4 and the original ≥90% target.
+
+**Qualitative confirmation**: 6 of 8 val sequences now decode with **perfect (100%) Win C
+recall** (`up_counter`, `odd`, `even`, `linear`, `sawtooth`, `geometric`) — up from B4's 4/8. Of
+the remaining two: `down_counter` (75.0%) shows the exact reproducible pattern seen across the
+last ~25k steps of training — IQ=70.8%→**IR1=100%**→IR2=75.0% (IR1 fully fixes it, IR2
+re-breaks it, the *opposite* of the general degradation pattern this loss was designed to fix,
+and evidence the fix is not literally perfect). `palindrome` (20.8%) remains the single hardest
+case across the *entire* chat-tags series regardless of ablation — worth a dedicated look if this
+track continues (unconfirmed hypothesis: palindromic byte patterns may be uniquely hard to encode
+without confusion with their own reverse direction).
+
+**Mechanism validated**: the wrong-token-weighted loss — `w_i = 1 + α·1[argmax_i ≠ gt_i]`, a
+single-line change to the loss computation, α=2.0, no architecture change, warm-started cleanly
+from B4 with zero confound (unlike the DenseNet-KV comparison) — fixed the diagnosed root cause
+(uniform gradient weight on already-correct vs actively-wrong positions, diffusing signal away
+from the actual correction task) more directly and far more cheaply than window-specific tags
+alone did. This is strong evidence for the original hypothesis behind this whole loss-redesign
+queue: the IR mechanism's degradation problem was a **loss-shaping** issue, not fundamentally an
+addressing or capacity one — window tags helped (B3→B4), but the loss fix closed the remaining
+gap in a fraction of the engineering effort (one line vs a new tag vocabulary + position-builder
+changes).
+
+**Decision on ablations 2-4**: not launched. The original success bar (≥90% every window,
+converged) is met and confirmed. Margin-based monotonic loss (#2), the self-assessed error-flag
+head (#3), and attention-supervised copy loss (#4) remain documented and available as follow-ups
+if further refinement is wanted (e.g. specifically targeting the `down_counter`/`palindrome`
+residual failures), but are not necessary to close out this queue.
+
+> **TODO (skipped, not abandoned)**: ablations 2-4 above (margin-based monotonic-improvement
+> loss, self-assessed error-flag head, attention-supervised copy loss) were explicitly not run —
+> the success bar was already met by ablation 1 alone. Worth revisiting if `down_counter`
+> (IR1 fixes, IR2 re-breaks) or `palindrome` (hardest case across the entire chat-tags series)
+> need further work, or as a general loss-design comparison independent of whether they're
+> "needed." Full designs are in the "IR-refinement loss redesign — queued ablations" section
+> above.
+
+**Run**: `tail -f experiments/chat_tags/logs/chat_tags_slot8_wrongtok_ablation/train.log`
+
 ---
 
 ## Workshop paper assessment
