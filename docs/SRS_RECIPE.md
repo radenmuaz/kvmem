@@ -600,6 +600,167 @@ The train/test gap closes as:
 
 ---
 
+## Fast-Weight Rank and Addressing — connecting the chat-tags experiment to scaling theory
+
+Viewed through the fast-weight-programmer lens (Schmidhuber's original work; Schlag &
+Schmidhuber 2021 "Linear Transformers Are Secretly Fast Weight Programmers"), each SLOT
+token's key/value contributes one rank-1 outer-product update to an implicit associative
+memory matrix. With `slot_len=8`, each attention head's addressable memory is capped at
+**rank ≤ 8** — a real, literature-grounded ceiling, not a metaphor.
+
+**Live evidence this ceiling was not the actual bottleneck**: the `experiments/chat_tags/`
+track (see `docs/FEEDBACK_RESULTS.md § Chat-tags experiment`) hit exactly the failure this
+predicts — Win C (the third of three windows sharing one global SLOT block) stuck at a
+converged 27.8-30.6% plateau, with IR turns *degrading* quality rather than correcting it
+(classic destructive interference from multiple write-patterns colliding under one shared
+key). The fix that actually worked — window-specific query tags (`<query_a/b/c>` instead of
+one generic `<query>`) — changed **zero rank**: same `slot_len=8`, same `d=64`, same 4 heads.
+It only gave each window a distinct addressing key. Result: Win C jumped from 27.8% to
+84-92% within one run. If the ceiling were genuinely rank-limited, disambiguating addressing
+without adding capacity should not have recovered this much — the content would still be
+irretrievably tangled regardless of how cleanly it's addressed. This is strong, direct
+confirmation of `docs/MDL_MODEL_SIZE.md`'s standing verdict, written before this experiment
+ran: *"Current failure — capacity problem? No — training distribution problem. Fix: more
+parameters? Wrong — fix: stronger constraint."*
+
+**Where this generalizes and where it doesn't.** Window-specific tags is a hand-authored fix
+for exactly 3 known, discrete cases — it doesn't scale to "arbitrarily many distinguishable
+memories," which is what the corpus-scale goal above requires. Hypothetical directions for a
+principled version of the same fix, roughly nearest-to-current-architecture first:
+
+1. **Delta-rule fast weights** (DeltaNet — Schlag & Schmidhuber; Yang et al. 2024
+   "Parallelizing Linear Transformers with the Delta Rule"): replace naive additive
+   rank-1 accumulation (`S += k v^T`) with an error-correcting associative write
+   (`S += k(v - S^T k)^T`-style). This is the *learned, principled* version of what
+   window-specific tags did by hand — it architecturally reduces interference between
+   multiple writes sharing one memory, instead of requiring a human to pre-assign
+   non-colliding keys per window.
+2. **Content-derived addressing instead of identity tags**: a learned hash/routing of the
+   query context into a large key space (Reformer-style LSH attention), so the model
+   addresses arbitrarily many memories without a human enumerating and tagging each one.
+   This is the real generalization needed before Tier 2 (random-warmup, any X) can work
+   without per-position hand tags.
+3. **Hierarchical/tree memory** (already flagged as "future" — see Hierarchical chunking
+   below): the actual sublinear-scaling answer. A flat SLOT block cannot hold billions of
+   tokens' worth of distinguishable content regardless of addressing quality — this needs
+   O(log N) hierarchical depth with fixed per-node capacity, not O(N) flat rank.
+4. **`slot_len` growth**: the most surgical "more rank" lever (maps 1:1 onto rank-1
+   contribution count) but doesn't scale sublinearly — useful as a local capacity boost
+   only, not a scaling strategy. Should remain last-resort per the MDL ordering already
+   established in `docs/MDL_MODEL_SIZE.md`.
+5. **Explicit fast-weight layer**: a real linear-attention/associative-memory layer bolted
+   onto (or replacing part of) the softmax transformer, rather than an implicit
+   approximation via masked attention over a handful of SLOT tokens. Would make rank/capacity
+   tradeoffs mathematically explicit and tunable via known linear-attention/DeltaNet error
+   bounds, instead of discovered empirically through ablation.
+6. **Depth-wise growing/concatenated cross-layer SLOT memory**: instead of one `slot_len`
+   bottleneck reprocessed recurrently (which caps rank at `min(slot_len, d_head)` no matter
+   how many refinement passes run), let each layer emit its own `slot_len`-sized SLOT block
+   and have layer L's recall attend to the **concatenation** of layers `1..L`'s SLOT KV. By
+   the final layer this exposes `L × slot_len` keys instead of `slot_len` — for `d=64,
+   n_heads=4` (`d_head=16`) and `slot_len=8, n_layers=4`, that's `4×8=32` keys against
+   `d_head=16`, saturating the *full* per-head rank ceiling (`rank=min(32,16)=16`) instead of
+   being capped below it by token count (`min(8,16)=8`). Unlike recurrent depth (which only
+   helps get closer to an *existing* ceiling — see below), this is a genuine ceiling *raise*,
+   since it changes what's being attended over, not just how many times it's reprocessed.
+   Literature precedent: DenseNet's cross-layer concatenation (Huang et al. 2017) applied to
+   KV instead of conv features; Feedback Transformer (Fan et al. 2020) pools across all
+   previous layers rather than just the immediately-prior one; DenseFormer (Pagliardini et
+   al. 2024) shows depth-weighted averaging of all previous layers improves perplexity per
+   parameter. Note this is the deliberate *inverse* of the efficiency-motivated Cross-Layer
+   Attention / YOCO family (Brandon et al. 2024; Microsoft 2024), which *shares* KV across
+   layers to shrink cache for long-sequence LLMs — this project has the opposite problem (a
+   deliberately tiny fixed bottleneck, not a huge sequence-length cache), so growing rather
+   than sharing is the right direction here. Cost: attention at layer L grows to
+   O(L·slot_len) keys, cumulative O(L²·slot_len) across all layers vs today's O(L·slot_len)
+   — real but modest at this project's scale. Strongest candidate so far for "raise the
+   ceiling" specifically, since it grows capacity by depth×width rather than width alone,
+   without inflating per-layer KV footprint.
+
+**Queued next experiment** (after the chat-tags Phase B4 run confirms success — see
+`docs/FEEDBACK_RESULTS.md`): ablate this direction against B4 as baseline, comparing
+convergence speed (steps to reach a given Win C match%, not just final ceiling).
+
+Scoped design (deliberately narrower than "every token gets cross-layer KV" — DenseFormer's
+full generality isn't needed here and would be much more expensive):
+- Only **SLOT token positions** (encoding + recall) accumulate cross-layer KV. Regular
+  content/warmup/output positions keep normal single-layer attention — this keeps the extra
+  cost bounded to `slot_len` extra keys per layer, not the whole sequence.
+- Requires a new model variant, not just a config/traj_mix change — `MHAttention`/
+  `TransformerBlock`/`KVMemModel` in `kvmem/model.py` (unmodified, per this project's
+  isolation convention) assume ONE `(L,L)` mask reused identically at every layer;
+  supporting "layer L's SLOT rows attend to layers `1..L-1`'s SLOT KV too" needs a
+  genuinely different per-layer attention scope, which the current single-mask design
+  can't express. Build as a new, self-contained model class (e.g.
+  `experiments/densenet_kv/model.py`), reusing `kvmem.model`'s RoPE frequency computation,
+  `FFN`, and `RMSNorm` via import where unchanged, but with its own `MHAttention`/
+  `TransformerBlock` forward pass that threads a growing list of prior layers' SLOT
+  `(K,V)` and concatenates them into the attention computation at SLOT rows only.
+  `experiments/chat_tags/`'s position/mask/batch machinery (`chunk_positions_iq_global_rw_tagged`,
+  `chunk_mask_fb`, `make_batch_tagged`) is architecture-agnostic (produces token arrays +
+  masks, doesn't know about the model internals) and can be reused unchanged; only the
+  model-building and forward-pass code is new.
+- Baseline for comparison: B4's final converged numbers (both peak and running-average
+  match%, plus **steps-to-reach-90%-per-window** as the specific "faster convergence"
+  metric the user asked to compare) vs the same recipe/traj_mix on the new architecture,
+  warm-start not directly possible (different weight shapes/connectivity) — train from
+  scratch, matched step budget.
+
+**Result (built and run — see `docs/FEEDBACK_RESULTS.md` § DenseNet-KV ablation for full
+detail): inconclusive, not negative.** Implementation verified correct before launch (cross-layer
+KV growth confirmed numerically — layer *i* sees exactly `i×slot_len` extra keys; causality
+check confirmed zero leak). But the planned comparison against B4 turned out to be unfair: B4
+was warm-started from Phase B3's checkpoint (~348k cumulative prior steps), while densenet_kv
+trained from scratch in the same 80k-step budget. densenet_kv's mean match% rose essentially
+monotonically for the entire run (1.9%→20.8%, still climbing at cutoff, never converged) — B4
+reached 94.9%. This is not evidence the architecture fails; it's evidence the experiment design
+didn't control for starting point. **Correct follow-up**: a from-scratch **standard**-architecture
+control at the same 80k budget (no warm start, same tags/traj_mix) would establish the fair
+baseline densenet_kv should actually be compared against — not yet built.
+
+### Depth (even weight-shared/recurrent) is not a substitute for hierarchical memory
+
+A natural question: since IR turns already route/refine through the model recurrently, isn't
+scaling depth — even cheaply via weight-shared recurrent depth (Universal Transformer /
+"looped transformer" style: same weights, more sequential passes, no added parameters) —
+equivalent to O(log N) hierarchical routing, making explicit hierarchical memory unnecessary?
+
+No — depth and hierarchy are different axes. **Depth** (recurrent or not) buys more sequential
+*refinement* over a fixed-size bottleneck; **hierarchy** buys more total *storage*, organized
+so any one item is reachable in O(log N) steps instead of needing to fit in one flat buffer
+simultaneously. A fixed `slot_len=8` bottleneck has a hard information ceiling (rank ≤ 8 per
+head) that no amount of reprocessing — once or a hundred times — can exceed; computation can
+only get closer to that ceiling (reduce interference/routing errors), not raise it. The
+O(log N) property of hierarchical memory comes specifically from a pooling/tree topology
+(progressively aggregating many leaves into fewer coarser summaries at each level), not merely
+from having many sequential layers.
+
+**IR turns themselves are direct evidence for this distinction.** They *are* weight-shared
+recurrent depth applied to the SLOT representation, chained via argmax feedback. Before the
+window-specific-tag fix (see § above), more recurrent depth was actively *harmful* for Win
+C — IR1→IR2 degraded quality (e.g. 100%→75%→25% in one case) instead of improving it. Depth
+amplifies whatever's already in the bottleneck, good or bad; it only helps once the underlying
+representation is free of destructive interference to refine productively. So: recurrent depth
+is a real, cheap (parameter-count-free, MDL-aligned) lever for closing the gap to an *existing*
+capacity ceiling — worth pursuing further as an **adaptive** mechanism (loop refinement until
+retention R ≥ threshold, rather than fixed `n_refine=2/3` — already flagged as "Closed-Loop
+(adaptive, TODO)" below) — but it is complementary to, not a replacement for, hierarchical
+memory when the goal is raising total corpus capacity beyond what one SLOT block can hold.
+
+**Verdict on direction**: the project's stated goal — train/test NLL parity with a backprop
+LM, achieved via fast-weight IQ + IR refinement + SRS scheduling, *without weight updates at
+inference time* — is coherent and literature-grounded (fast weight programmers, modern
+linear-attention/DeltaNet resurgence, NTM/DNC external memory, retrieval-augmented LMs). The
+chat-tags result is genuinely useful evidence *for* this direction, not just a side
+experiment: it shows the SLOT/IR mechanism has materially more headroom than the stuck
+plateau suggested, and that the MDL principle (fix addressing/distribution before capacity)
+holds under real pressure, not just in theory. To reach the billions-of-tokens goal, the
+roadmap already on file — Tier 2 random-warmup generalization, hierarchical chunking (below),
+parallel KV consolidation — is the right next set of steps; this experiment adds a concrete
+data point for *why* addressing matters as much as raw capacity when designing those.
+
+---
+
 ## Current Experiments
 
 | Stage | Src | Windows | Result |

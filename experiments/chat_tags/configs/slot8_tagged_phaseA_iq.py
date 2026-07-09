@@ -16,7 +16,7 @@ Run:
     python3 -m experiments.chat_tags.train \\
         --config experiments/chat_tags/configs/slot8_tagged_phaseA_iq.py \\
         --device mps
-    tail -f logs/chat_tags_slot8_phaseA_iq/train.log
+    tail -f experiments/chat_tags/logs/chat_tags_slot8_phaseA_iq/train.log
 """
 
 hp = dict(

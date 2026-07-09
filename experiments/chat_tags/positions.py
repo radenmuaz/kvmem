@@ -26,6 +26,7 @@ from experiments.chat_tags.vocab import (
     HMN_MEM_OPEN, HMN_MEM_CLOSE,
     HMN_QUERY_OPEN, HMN_QUERY_CLOSE,
     HMN_RESPONSE_OPEN, HMN_RESPONSE_CLOSE,
+    WINDOW_QUERY_TAGS,
 )
 
 
@@ -64,14 +65,21 @@ def chunk_positions_iq_global_rw_tagged(n_chunks: int, chunk_len: int, slot_len:
 
     out_len = window_chunks * chunk_len - warmup_len
 
+    # Window-specific query tags: use <query_a/b/c> for the three canonical
+    # windows (warmup_x_fixed in {0,16,32}) so the model gets an explicit
+    # window-identity signal instead of one shared <query> anchor. Uniform-X
+    # training (warmup_x_fixed=None) keeps the generic tag since arbitrary X
+    # doesn't map to one named window.
+    query_open, query_close = WINDOW_QUERY_TAGS.get(warmup_x_fixed, (HMN_QUERY_OPEN, HMN_QUERY_CLOSE))
+
     def _emit_iq_block():
         nonlocal offset
         tags.append((offset, HMN_MEM_OPEN)); offset += 1
         sl0 = offset; sl1 = sl0 + slot_len; offset = sl1
         tags.append((offset, HMN_MEM_CLOSE)); offset += 1
-        tags.append((offset, HMN_QUERY_OPEN)); offset += 1
+        tags.append((offset, query_open)); offset += 1
         w0 = offset; w1 = w0 + warmup_len; offset = w1
-        tags.append((offset, HMN_QUERY_CLOSE)); offset += 1
+        tags.append((offset, query_close)); offset += 1
         tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
         c0 = offset; c1 = c0 + out_len; offset = c1
         tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
@@ -89,9 +97,9 @@ def chunk_positions_iq_global_rw_tagged(n_chunks: int, chunk_len: int, slot_len:
         tags.append((offset, HMN_MEM_OPEN)); offset += 1
         slb0 = offset; slb1 = slb0 + slot_len; offset = slb1
         tags.append((offset, HMN_MEM_CLOSE)); offset += 1
-        tags.append((offset, HMN_QUERY_OPEN)); offset += 1
+        tags.append((offset, query_open)); offset += 1
         w0 = offset; w1 = w0 + warmup_len; offset = w1
-        tags.append((offset, HMN_QUERY_CLOSE)); offset += 1
+        tags.append((offset, query_close)); offset += 1
         tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
         c0 = offset; c1 = c0 + out_len; offset = c1
         tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1

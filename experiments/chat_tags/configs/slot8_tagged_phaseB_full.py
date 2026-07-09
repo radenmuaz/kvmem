@@ -32,7 +32,7 @@ Run:
     caffeinate -i python3 -m experiments.chat_tags.train \\
         --config experiments/chat_tags/configs/slot8_tagged_phaseB_full.py \\
         --device mps
-    tail -f logs/chat_tags_slot8_phaseB_full/train.log
+    tail -f experiments/chat_tags/logs/chat_tags_slot8_phaseB_full/train.log
 """
 
 hp = dict(
