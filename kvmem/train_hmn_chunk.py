@@ -34,6 +34,22 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+
+class _StatusWriter:
+    """Truncate-and-rewrite file for tqdm — stays 1-2 lines, tail -f works."""
+    def __init__(self, path: str):
+        self._f = open(path, 'w', buffering=1)
+
+    def write(self, s: str):
+        self._f.seek(0)
+        self._f.truncate()
+        self._f.write(s)
+        self._f.flush()
+
+    def flush(self): pass
+
+    def close(self): self._f.close()
+
 from kvmem.model import build_model
 from kvmem.data import HMN_SLOT_0, HMN_VOCAB_SIZE
 from kvmem.utils import make_test_sequences, cer
@@ -373,6 +389,136 @@ def chunk_positions_fb_localrefine(n_chunks: int, chunk_len: int, slot_len: int,
                enc_end=enc_end, warmup_len=warmup_len, L=offset)
 
 
+def chunk_positions_iq_global_rw_full(n_chunks: int, chunk_len: int, slot_len: int,
+                                       warmup_len: int) -> dict:
+    """
+    Global IQ with full-continuation output: output runs from X+warmup_len to src_len.
+
+    out_len is fixed at max = src_len - warmup_len (when X=0). At batch time X is
+    sampled uniformly in [0, src_len-warmup_len-1]; only positions 0..actual_out_len-1
+    are valid — the rest are padded zeros with CE loss masked to 0.
+
+    Sequence: [enc_blocks] [SLOT×slot_len | warmup×warmup_len | out×max_out_len]
+    L = n_chunks*(chunk_len+slot_len) + slot_len + warmup_len + (src_len-warmup_len)
+    """
+    enc_block_len = chunk_len + slot_len
+    enc_blocks = []
+    for k in range(n_chunks):
+        s0  = k * enc_block_len
+        s1  = s0 + chunk_len
+        sl0 = s1; sl1 = sl0 + slot_len
+        enc_blocks.append(dict(s0=s0, s1=s1, sl0=sl0, sl1=sl1))
+
+    enc_end = n_chunks * enc_block_len
+    offset  = enc_end
+
+    src_len     = n_chunks * chunk_len
+    max_out_len = src_len - warmup_len          # 56 for nc=4 chunk=16 wl=8
+    x_max       = src_len - warmup_len - 1      # 55: ensure ≥1 output byte
+
+    sl0 = offset; sl1 = sl0 + slot_len; offset = sl1
+    w0  = offset; w1  = w0 + warmup_len; offset = w1
+    c0  = offset; c1  = c0 + max_out_len; offset = c1
+
+    # eval at chunk-aligned offsets: [0,16,32,48] for nc=4 → output lengths [56,40,24,8]
+    eval_offsets = [i * chunk_len for i in range(n_chunks)]
+
+    rec_blocks = [dict(
+        type='iq', sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1,
+        span=(0, n_chunks), span_len=src_len,
+        out_len=max_out_len, is_clean=True,
+        warmup_train_range=(0, x_max),
+        warmup_x_dist='uniform',
+        warmup_valid_offsets=eval_offsets,
+        window_chunks=None,
+        out_to_end=True,
+        max_out_len=max_out_len,
+    )]
+
+    return dict(enc_blocks=enc_blocks, rec_blocks=rec_blocks,
+                enc_end=enc_end, warmup_len=warmup_len, L=offset)
+
+
+def chunk_positions_iq_global_rw(n_chunks: int, chunk_len: int, slot_len: int,
+                                  warmup_len: int, window_chunks: int = 2,
+                                  warmup_x_fixed: int | None = None,
+                                  warmup_x_dist: str = 'uniform',
+                                  n_refine: int = 0) -> dict:
+    """
+    Global IQ with random-window-offset training, optionally followed by IR turns.
+
+    ONE IQ block with a single SLOT that always lives at the same token position
+    (enc_end). The SLOT attends to ALL enc_block SLOTs (full source). At batch
+    time a random 2-chunk window is sampled (chunk-aligned), and warmup/output
+    fill that window's bytes. SLOT position is always enc_end regardless of
+    which window is sampled — no train/eval position mismatch.
+
+    n_refine > 0: add n_refine chained IR turns after IQ (same warmup offset X,
+    argmax chained from the previous turn's output — identical to ir_local's
+    refinement mechanism but with a single global SLOT instead of per-window).
+
+    Sequence (n_refine=0): [enc_blocks] [SLOT | warmup | out]
+    Sequence (n_refine=2): [enc_blocks] [SLOT | warmup | out]
+                            [SLOT_A | argmax | SLOT_B | warmup | out]
+                            [SLOT_A | argmax | SLOT_B | warmup | out]
+    """
+    enc_block_len = chunk_len + slot_len
+    enc_blocks = []
+    for k in range(n_chunks):
+        s0  = k * enc_block_len
+        s1  = s0 + chunk_len
+        sl0 = s1; sl1 = sl0 + slot_len
+        enc_blocks.append(dict(s0=s0, s1=s1, sl0=sl0, sl1=sl1))
+
+    enc_end = n_chunks * enc_block_len
+    offset  = enc_end
+
+    out_len = window_chunks * chunk_len - warmup_len
+    sl0 = offset; sl1 = sl0 + slot_len; offset = sl1
+    w0  = offset; w1  = w0 + warmup_len; offset = w1
+    c0  = offset; c1  = c0 + out_len;   offset = c1
+
+    src_len = n_chunks * chunk_len
+    x_max = src_len - warmup_len - out_len  # max training offset (continuous range)
+    # chunk-aligned offsets for EVAL only: window i → src[i*cl : (i+wc)*cl]
+    n_windows = n_chunks - window_chunks + 1
+    eval_offsets = [i * chunk_len for i in range(n_windows)]
+
+    train_range = (warmup_x_fixed, warmup_x_fixed) if warmup_x_fixed is not None else (0, x_max)
+    _dist = 'fixed' if warmup_x_fixed is not None else warmup_x_dist
+    rec_blocks = [dict(
+        type='iq', sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1,
+        span=(0, n_chunks), span_len=src_len,
+        out_len=out_len, is_clean=(n_refine == 0),
+        warmup_train_range=train_range,
+        warmup_x_dist=_dist,
+        warmup_valid_offsets=eval_offsets,
+        window_chunks=window_chunks,
+    )]
+
+    prev_c0 = c0
+    for _ in range(n_refine):
+        sla0 = offset; sla1 = sla0 + slot_len
+        am0  = sla1;   am1  = am0  + out_len
+        slb0 = am1;    slb1 = slb0 + slot_len
+        ww0  = slb1;   ww1  = ww0  + warmup_len
+        cc0  = ww1;    cc1  = cc0  + out_len
+        rec_blocks.append(dict(
+            type='ir', sla0=sla0, sla1=sla1, am0=am0, am1=am1,
+            slb0=slb0, slb1=slb1, w0=ww0, w1=ww1, c0=cc0, c1=cc1,
+            span=(0, n_chunks), span_len=src_len, out_len=out_len,
+            argmax_src_c0=prev_c0, is_clean=True,
+            warmup_train_range=train_range,
+            warmup_valid_offsets=eval_offsets,
+            window_chunks=window_chunks,
+        ))
+        prev_c0 = cc0
+        offset  = cc1
+
+    return dict(enc_blocks=enc_blocks, rec_blocks=rec_blocks,
+                enc_end=enc_end, warmup_len=warmup_len, L=offset)
+
+
 # ---------------------------------------------------------------------------
 # Attention mask
 # ---------------------------------------------------------------------------
@@ -434,7 +580,7 @@ def chunk_mask(pos: dict) -> np.ndarray:
     return np.where(visible, 0.0, -1e9).astype(np.float32)
 
 
-def chunk_mask_fb(pos: dict, nochain: bool = False) -> np.ndarray:
+def chunk_mask_fb(pos: dict) -> np.ndarray:
     """
     Mask for feedback-argmax IR layout. Same rules as chunk_mask for encoding
     blocks and IQ turns. Additional rules for IR turns:
@@ -445,14 +591,12 @@ def chunk_mask_fb(pos: dict, nochain: bool = False) -> np.ndarray:
     8. IR warmup/out rows: blocked from everything except own SLOT_B + own warmup/out.
        (Same strong bottleneck as IQ out rows, but SLOT_B is the gate — not SLOT_A or argmax.)
 
-    nochain=True adds:
-    3b. Each IQ SLOT row is blocked from ALL tokens in prior rec_blocks
-        (SLOT, warmup, argmax, AND output of earlier windows' IQ and IR turns).
-        This forces every window to encode independently from the enc-block SLOTs
-        only. Without this, the model chains through prior rec_block OUTPUT tokens
-        (not just SLOTs) — window 1 reads window 0's recalled output bytes 16-31,
-        which is in the 50% overlap, making independent recall impossible.
-        Blocking only prior SLOTs (the v4 attempt) was insufficient.
+    Rule 3b (always on): Each IQ SLOT row is blocked from ALL tokens in prior rec_blocks
+    (SLOT, warmup, argmax, AND output of earlier windows' IQ and IR turns).
+    Forces every window to encode independently from enc-block SLOTs only. Without
+    this, the model chains through prior OUTPUT tokens — window 1 reads window 0's
+    recalled bytes in the 50% overlap region. Blocking only prior SLOTs is insufficient
+    (v4 lesson).
     """
     L = pos['L']
     r = np.arange(L); c = np.arange(L)
@@ -489,25 +633,24 @@ def chunk_mask_fb(pos: dict, nochain: bool = False) -> np.ndarray:
             # Rule 3 (IQ SLOT): blocked from all chunks
             sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
             blocked |= sl_row[:, None] & is_any_chunk[None, :]
-            # Rule 3b (nochain): IQ SLOT blocked from ALL tokens in prior rec_blocks
+            # Rule 3b: IQ SLOT blocked from ALL tokens in prior rec_blocks
             # (SLOT + warmup + argmax + output). Blocking only SLOTs is insufficient —
-            # the model chains through prior OUTPUT tokens (e.g., window 1 reads window
-            # 0's recalled bytes in the 50% overlap region). Full blackout of prior
-            # rec_blocks forces every window to encode from enc-block SLOTs only.
-            if nochain:
-                prior_all = np.zeros(L, dtype=bool)
-                for prev_rb in rec_blocks[:i_rb]:
-                    if prev_rb['type'] == 'iq':
-                        prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
-                        prior_all |= (c >= prev_rb['w0'])  & (c < prev_rb['w1'])
-                        prior_all |= (c >= prev_rb['c0'])  & (c < prev_rb['c1'])
-                    else:
-                        prior_all |= (c >= prev_rb['sla0']) & (c < prev_rb['sla1'])
-                        prior_all |= (c >= prev_rb['am0'])  & (c < prev_rb['am1'])
-                        prior_all |= (c >= prev_rb['slb0']) & (c < prev_rb['slb1'])
-                        prior_all |= (c >= prev_rb['w0'])   & (c < prev_rb['w1'])
-                        prior_all |= (c >= prev_rb['c0'])   & (c < prev_rb['c1'])
-                blocked |= sl_row[:, None] & prior_all[None, :]
+            # the model chains through prior OUTPUT tokens (window 1 reads window 0's
+            # recalled bytes in the 50% overlap). Full blackout forces every window to
+            # encode from enc-block SLOTs only.
+            prior_all = np.zeros(L, dtype=bool)
+            for prev_rb in rec_blocks[:i_rb]:
+                if prev_rb['type'] == 'iq':
+                    prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
+                    prior_all |= (c >= prev_rb['w0'])  & (c < prev_rb['w1'])
+                    prior_all |= (c >= prev_rb['c0'])  & (c < prev_rb['c1'])
+                else:
+                    prior_all |= (c >= prev_rb['sla0']) & (c < prev_rb['sla1'])
+                    prior_all |= (c >= prev_rb['am0'])  & (c < prev_rb['am1'])
+                    prior_all |= (c >= prev_rb['slb0']) & (c < prev_rb['slb1'])
+                    prior_all |= (c >= prev_rb['w0'])   & (c < prev_rb['w1'])
+                    prior_all |= (c >= prev_rb['c0'])   & (c < prev_rb['c1'])
+            blocked |= sl_row[:, None] & prior_all[None, :]
             # Rule 4a: IQ warmup rows — own SLOT + own warmup only
             if rb['w0'] < rb['w1']:
                 wm_row = (r >= rb['w0']) & (r < rb['w1'])
@@ -603,13 +746,17 @@ def _chunk_make_batch_fb(rng: np.random.Generator, B: int,
                          n_chunks: int, chunk_len: int,
                          slot_len: int, slot_count: int,
                          schedule: list[tuple[int, int]],
-                         pos: dict) -> np.ndarray:
+                         pos: dict) -> tuple[np.ndarray, np.ndarray | None]:
     """
     Batch builder for feedback-argmax layout.
 
     IQ turns: warmup = GT prefix, out = GT suffix (teacher-forced clean).
     IR turns: argmax = GT suffix (teacher-forced, same as GT — upgrade to
               actual model argmax by calling _fill_argmax_fb before pass 2).
+
+    Returns (tok_np, ce_mask_np).
+    ce_mask_np is None for fixed-length outputs; for out_to_end=True blocks it is
+    (B, max_out_len) float32 where 1=valid byte, 0=padding — apply to CE loss.
     """
     sids = np.array(_slot_ids(slot_len, slot_count), dtype=np.int64)
     wl   = pos['warmup_len']
@@ -621,26 +768,66 @@ def _chunk_make_batch_fb(rng: np.random.Generator, B: int,
         tok[:, b['s0']:b['s1']]   = segs[:, k, :]
         tok[:, b['sl0']:b['sl1']] = sids
 
+    rw_xs: np.ndarray | None = None   # per-batch X offsets from the latest rw IQ block
+    ce_mask_np: np.ndarray | None = None  # (B, max_out_len) for out_to_end blocks
+
     for rb in pos['rec_blocks']:
         span_s, span_e = rb['span']
         gt = np.concatenate([segs[:, i, :] for i in range(span_s, span_e)], axis=1)
-        gt_out = gt[:, wl:]   # (B, out_len)
+        gt_out = gt[:, wl:]   # (B, out_len) — fallback for fixed-warmup IR
 
         if rb['type'] == 'iq':
             tok[:, rb['sl0']:rb['sl1']] = sids
-            if wl > 0:
-                tok[:, rb['w0']:rb['w1']] = gt[:, :wl]
-            tok[:, rb['c0']:rb['c1']] = gt_out     # clean GT at out_0
+            if 'warmup_train_range' in rb:
+                x_min, x_max = rb['warmup_train_range']
+                _xdist = rb.get('warmup_x_dist', 'uniform')
+                if _xdist == 'arcsine':
+                    # Beta(0.5,0.5) arc-sine: upweights endpoints, equalizes byte coverage
+                    rw_xs = np.clip(np.round(x_min + (x_max - x_min) * rng.beta(0.5, 0.5, size=B)).astype(int), x_min, x_max)
+                elif _xdist == 'early_bias':
+                    # Beta(0.5,2.0): peaks at X=0, smooth decay toward X=max, covers all positions
+                    rw_xs = np.clip(np.round(x_min + (x_max - x_min) * rng.beta(0.5, 2.0, size=B)).astype(int), x_min, x_max)
+                else:
+                    rw_xs = np.array([int(rng.integers(x_min, x_max + 1)) for _ in range(B)])
+                if rb.get('out_to_end'):
+                    # Variable-length continuation: output = src[X+wl : src_len], pad rest
+                    max_out_len = rb['max_out_len']
+                    src_len = rb['span_len']
+                    ce_mask_np = np.zeros((B, max_out_len), dtype=np.float32)
+                    for b_idx in range(B):
+                        X = rw_xs[b_idx]
+                        actual_out = src_len - (X + wl)   # bytes from X+wl to end
+                        tok[b_idx, rb['w0']:rb['w1']] = gt[b_idx, X:X+wl]
+                        tok[b_idx, rb['c0']:rb['c0']+actual_out] = gt[b_idx, X+wl:]
+                        ce_mask_np[b_idx, :actual_out] = 1.0
+                else:
+                    for b_idx in range(B):
+                        X = rw_xs[b_idx]
+                        tok[b_idx, rb['w0']:rb['w1']] = gt[b_idx, X:X+wl]
+                        tok[b_idx, rb['c0']:rb['c1']] = gt[b_idx, X+wl:X+wl+rb['out_len']]
+            else:
+                rw_xs = None
+                if wl > 0:
+                    tok[:, rb['w0']:rb['w1']] = gt[:, :wl]
+                tok[:, rb['c0']:rb['c1']] = gt_out
 
         else:  # 'ir'
             tok[:, rb['sla0']:rb['sla1']] = sids   # SLOT_A
-            tok[:, rb['am0']:rb['am1']]   = gt_out  # argmax (teacher-forced = GT)
             tok[:, rb['slb0']:rb['slb1']] = sids   # SLOT_B
-            if wl > 0:
-                tok[:, rb['w0']:rb['w1']] = gt[:, :wl]
-            tok[:, rb['c0']:rb['c1']] = gt_out     # clean GT at out_1
+            if 'warmup_train_range' in rb and rw_xs is not None:
+                # IR follows a rw IQ block — use the same per-batch X offset
+                for b_idx in range(B):
+                    X = rw_xs[b_idx]
+                    tok[b_idx, rb['am0']:rb['am1']]   = gt[b_idx, X+wl:X+wl+rb['out_len']]
+                    tok[b_idx, rb['w0']:rb['w1']]     = gt[b_idx, X:X+wl]
+                    tok[b_idx, rb['c0']:rb['c1']]     = gt[b_idx, X+wl:X+wl+rb['out_len']]
+            else:
+                tok[:, rb['am0']:rb['am1']]   = gt_out
+                if wl > 0:
+                    tok[:, rb['w0']:rb['w1']] = gt[:, :wl]
+                tok[:, rb['c0']:rb['c1']] = gt_out
 
-    return tok
+    return tok, ce_mask_np
 
 
 def _fill_argmax_fb(tok_np: np.ndarray, logits: torch.Tensor,
@@ -738,7 +925,7 @@ def ar_decode_chunk(model, chunks_arr: list | np.ndarray,
 
     # valid_mask applies to the output positions
     if valid_mask is not None:
-        vm       = valid_mask.flatten()[wl:wl + out_len]
+        vm       = valid_mask.flatten()[:out_len]
         gen_v    = gen[:len(vm)][vm]
         target_v = target[:len(vm)][vm]
     else:
@@ -767,7 +954,7 @@ def ar_decode_chunk(model, chunks_arr: list | np.ndarray,
     nll_vals   = -lp_full.gather(1, tgt_tensor.unsqueeze(1)).squeeze(1).cpu().numpy()
 
     if valid_mask is not None:
-        vm_flat  = valid_mask.flatten()[wl:wl + out_len]
+        vm_flat  = valid_mask.flatten()[:out_len]
         nll_vals = nll_vals[vm_flat[:len(nll_vals)]]
 
     nll = float(nll_vals.mean())
@@ -883,7 +1070,7 @@ def ar_decode_chunk_kv(model, chunks_arr, slot_len: int, slot_count: int,
     out_len     = full_rb['out_len']
 
     if valid_mask is not None:
-        vm       = valid_mask.flatten()[wl:wl + out_len]
+        vm       = valid_mask.flatten()[:out_len]
         gen_v    = gen[:len(vm)][vm]
         target_v = target[:len(vm)][vm]
     else:
@@ -910,7 +1097,7 @@ def ar_decode_chunk_kv(model, chunks_arr, slot_len: int, slot_count: int,
     nll_vals   = -lp_full.gather(1, tgt_tensor.unsqueeze(1)).squeeze(1).cpu().numpy()
 
     if valid_mask is not None:
-        vm_flat  = valid_mask.flatten()[wl:wl + out_len]
+        vm_flat  = valid_mask.flatten()[:out_len]
         nll_vals = nll_vals[vm_flat[:len(nll_vals)]]
 
     nll = float(nll_vals.mean())
@@ -998,7 +1185,7 @@ def ar_decode_chunk_fb(model, chunks_arr, slot_len: int, slot_count: int,
     out_len = pos['rec_blocks'][-1]['out_len']
 
     if valid_mask is not None:
-        vm       = valid_mask.flatten()[wl:wl + out_len]
+        vm       = valid_mask.flatten()[:out_len]
         gen_v    = final_gen[:len(vm)][vm]
         target_v = target[:len(vm)][vm]
     else:
@@ -1018,7 +1205,7 @@ def ar_decode_chunk_fb(model, chunks_arr, slot_len: int, slot_count: int,
     lp_full    = F.log_softmax(logits_tf[full_ir_rb['c0']-1:full_ir_rb['c1']-1], dim=-1)
     nll_vals   = -lp_full.gather(1, tgt_tensor.unsqueeze(1)).squeeze(1).cpu().numpy()
     if valid_mask is not None:
-        vm_flat  = valid_mask.flatten()[wl:wl + out_len]
+        vm_flat  = valid_mask.flatten()[:out_len]
         nll_vals = nll_vals[vm_flat[:len(nll_vals)]]
     nll = float(nll_vals.mean())
     bpb = nll / math.log(2)
@@ -1031,7 +1218,8 @@ def ar_decode_chunk_fb(model, chunks_arr, slot_len: int, slot_count: int,
 def ar_decode_chunk_fb_kv(model, chunks_arr, slot_len: int, slot_count: int,
                           schedule: list[tuple[int, int]], mask_np: np.ndarray,
                           pos: dict, device,
-                          valid_mask: np.ndarray | None = None) -> dict:
+                          valid_mask: np.ndarray | None = None,
+                          warmup_offset: int = 0) -> dict:
     """
     KV-cached greedy AR decode for feedback-argmax IR layout. Same semantics
     as ar_decode_chunk_fb, ~L× faster — see ar_decode_chunk_kv for the
@@ -1108,6 +1296,7 @@ def ar_decode_chunk_fb_kv(model, chunks_arr, slot_len: int, slot_count: int,
     # both the same-span IQ source in chunk_positions_fb and the byte-sliced /
     # chained source in chunk_positions_fb_winrefine), then decode their own
     # SLOT_A/argmax/SLOT_B/warmup/out region.
+    turn_match_pcts: list[float] = []  # per-rec_block exact-match%, same target as final block
     for rb in pos['rec_blocks']:
         span_s, span_e = rb['span']
         gt_span = np.concatenate(chunks_list[span_s:span_e])
@@ -1115,7 +1304,8 @@ def ar_decode_chunk_fb_kv(model, chunks_arr, slot_len: int, slot_count: int,
         if rb['type'] == 'iq':
             tok[rb['sl0']:rb['sl1']] = sids
             if wl > 0:
-                tok[rb['w0']:rb['w1']] = gt_span[:wl].astype(np.int64)
+                X = warmup_offset if 'warmup_train_range' in rb else 0
+                tok[rb['w0']:rb['w1']] = gt_span[X:X+wl].astype(np.int64)
             _decode_segment(rb['sl0'], rb)
         else:  # 'ir'
             tok[rb['sla0']:rb['sla1']] = sids
@@ -1123,8 +1313,16 @@ def ar_decode_chunk_fb_kv(model, chunks_arr, slot_len: int, slot_count: int,
             tok[rb['am0']:rb['am1']] = tok[src_c0:src_c0 + rb['out_len']]
             tok[rb['slb0']:rb['slb1']] = sids
             if wl > 0:
-                tok[rb['w0']:rb['w1']] = gt_span[:wl].astype(np.int64)
+                ir_X = warmup_offset if 'warmup_train_range' in rb else 0
+                tok[rb['w0']:rb['w1']] = gt_span[ir_X:ir_X+wl].astype(np.int64)
             _decode_segment(rb['sla0'], rb)
+
+        # snapshot match against the same target window used for the final result
+        rw_off_rb = warmup_offset if 'warmup_train_range' in rb else 0
+        rb_target = gt_span[rw_off_rb + wl : rw_off_rb + wl + rb['out_len']]
+        rb_gen    = tok[rb['c0']:rb['c1']]
+        rb_match  = 100.0 * float(np.sum(rb_gen[:len(rb_target)] == rb_target)) / max(len(rb_target), 1)
+        turn_match_pcts.append(rb_match)
 
     # ── Result: last rec_block's own output (its own span, not necessarily
     #    the full sequence — for ir_winrefine the last block is a windowed IR) ─
@@ -1133,36 +1331,40 @@ def ar_decode_chunk_fb_kv(model, chunks_arr, slot_len: int, slot_count: int,
     gt_final  = np.concatenate(chunks_list[span_s:span_e])
     out_len   = final_rb['out_len']
     final_gen = tok[final_rb['c0']:final_rb['c1']]
-    target    = gt_final[wl:wl + out_len]
+    # warmup_offset shifts which bytes are warmup vs target for iq_global_rw
+    rw_off = warmup_offset if 'warmup_train_range' in final_rb else 0
+    target = gt_final[rw_off+wl:rw_off+wl + out_len]
+    # For large warmup offsets, target may be shorter than out_len (clipped at source end)
+    eff_out = len(target)
 
-    byte_lo = span_s * chunk_len + wl
-    byte_hi = span_e * chunk_len
     if valid_mask is not None:
-        vm       = valid_mask.flatten()[byte_lo:byte_hi]
-        gen_v    = final_gen[:len(vm)][vm]
-        target_v = target[:len(vm)][vm]
+        vm       = valid_mask.flatten()[:eff_out]
+        gen_v    = final_gen[:eff_out][vm]
+        target_v = target[vm]
     else:
-        gen_v    = final_gen[:out_len]
-        target_v = target[:out_len]
+        gen_v    = final_gen[:eff_out]
+        target_v = target
 
     match_pct = 100.0 * float(np.sum(gen_v == target_v)) / max(len(target_v), 1)
 
     # Teacher-forced BPB on the final block's own output (single extra full forward pass)
     tok_tf = torch.tensor(tok, dtype=torch.long, device=device)
-    tok_tf[final_rb['c0']:final_rb['c1']] = torch.tensor(
-        target[:out_len].astype(np.int64), dtype=torch.long, device=device)
+    if eff_out > 0:
+        tok_tf[final_rb['c0']:final_rb['c0']+eff_out] = torch.tensor(
+            target.astype(np.int64), dtype=torch.long, device=device)
     logits_tf  = model(tok_tf, full_mask)
-    tgt_tensor = torch.tensor(target[:out_len], dtype=torch.long, device=device)
-    lp_full    = F.log_softmax(logits_tf[final_rb['c0']-1:final_rb['c1']-1], dim=-1)
+    tgt_tensor = torch.tensor(target.astype(np.int64), dtype=torch.long, device=device)
+    lp_full    = F.log_softmax(logits_tf[final_rb['c0']-1:final_rb['c0']-1+eff_out], dim=-1)
     nll_vals   = -lp_full.gather(1, tgt_tensor.unsqueeze(1)).squeeze(1).cpu().numpy()
     if valid_mask is not None:
-        vm_flat  = valid_mask.flatten()[byte_lo:byte_hi]
+        vm_flat  = valid_mask.flatten()[:eff_out]
         nll_vals = nll_vals[vm_flat[:len(nll_vals)]]
-    nll = float(nll_vals.mean())
+    nll = float(nll_vals.mean()) if len(nll_vals) > 0 else float('nan')
     bpb = nll / math.log(2)
 
     return dict(bpb=bpb, nll=nll, match_pct=match_pct,
-                decoded_bytes=final_gen.tolist(), n_valid=len(target_v))
+                decoded_bytes=final_gen.tolist(), n_valid=len(target_v),
+                turn_match_pcts=turn_match_pcts)
 
 
 @torch.no_grad()
@@ -1276,7 +1478,7 @@ def ar_decode_chunk_fb_stitch_kv(model, chunks_arr, slot_len: int, slot_count: i
     gen_v    = decoded_bytes[wl:]
     target_v = gt_full[wl:]
     if valid_mask is not None:
-        vm       = valid_mask.flatten()[:src_len][wl:]
+        vm       = valid_mask.flatten()[:len(gen_v)]
         gen_v    = gen_v[vm]
         target_v = target_v[vm]
     match_pct = 100.0 * float(np.sum(gen_v == target_v)) / max(len(target_v), 1)
@@ -1318,7 +1520,9 @@ def ar_decode_chunk_fb_stitch_kv(model, chunks_arr, slot_len: int, slot_count: i
         nll_buf[win_byte_lo + wl:win_byte_lo + wl + out_len] = nv
 
     if valid_mask is not None:
-        vm  = valid_mask.flatten()[:src_len]
+        vm_out = valid_mask.flatten()[:src_len - wl]
+        vm = np.zeros(src_len, dtype=bool)
+        vm[wl:wl + len(vm_out)] = vm_out
         sel = ~np.isnan(nll_buf) & vm
     else:
         sel = ~np.isnan(nll_buf)
@@ -1332,6 +1536,31 @@ def ar_decode_chunk_fb_stitch_kv(model, chunks_arr, slot_len: int, slot_count: i
 # ---------------------------------------------------------------------------
 # Test-set loader
 # ---------------------------------------------------------------------------
+
+def _fmt_cmp(ref: np.ndarray, gen: np.ndarray, warmup_len: int, label: str = '') -> str:
+    """Format ref/gen/diff comparison rows; match counted over output bytes only (after warmup_len)."""
+    lines = []
+    if label:
+        lines.append(f'  [{label}]')
+    bounds = {warmup_len}
+
+    def _row(name, vals):
+        parts = [f'{name:<6}|']
+        for i, v in enumerate(vals):
+            parts.append((' |' if i in bounds else '') + f'{v:3d}')
+        return ''.join(parts)
+
+    lines.append(_row('ref', ref))
+    lines.append(_row('gen', gen))
+    diff_parts = ['diff  |']
+    for i, (r, g) in enumerate(zip(ref, gen)):
+        diff_parts.append((' |' if i in bounds else '') + ('  .' if r == g else '  X'))
+    lines.append(''.join(diff_parts))
+    out_ref, out_gen = ref[warmup_len:], gen[warmup_len:]
+    n_ok = int(np.sum(out_ref == out_gen))
+    lines.append(f'  match {n_ok}/{len(out_ref)} = {100*n_ok/max(len(out_ref),1):.1f}%')
+    return '\n'.join(lines)
+
 
 def load_chunks_padded(path: str, n_chunks: int,
                        chunk_len: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1387,8 +1616,9 @@ def train_chunk(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     ckpt_dir = os.path.join(log_dir, 'checkpoints')
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    log_file   = open(os.path.join(log_dir, 'train.log'),   'a', buffering=1)
-    jsonl_file = open(os.path.join(log_dir, 'train.jsonl'), 'a', buffering=1)
+    log_file     = open(os.path.join(log_dir, 'train.log'),    'a', buffering=1)
+    jsonl_file   = open(os.path.join(log_dir, 'train.jsonl'), 'a', buffering=1)
+    status_file  = _StatusWriter(os.path.join(log_dir, 'train_status.log'))
 
     def _log(msg):
         print(msg)
@@ -1425,7 +1655,7 @@ def train_chunk(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     # Eval file
     eval_file   = hp.get('eval_file')
     eval_every  = hp.get('eval_every', 5000)
-    log_every   = hp.get('log_every', 500)
+    log_every   = hp.get('log_every', 1000)
     use_stablemax = hp.get('stablemax', False)
     log_probs_fn  = (lambda lg: F.log_softmax(lg, dim=-1))
 
@@ -1478,7 +1708,8 @@ def train_chunk(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         if val_n_seqs is not None:
             val_seqs = dict(list(val_seqs.items())[:val_n_seqs])
 
-        pbar = tqdm(range(1, n_steps + 1), desc=f'stage{stage_i}', dynamic_ncols=True)
+        pbar = tqdm(range(1, n_steps + 1), desc=f'stage{stage_i}',
+                    dynamic_ncols=True, file=status_file)
         for local_step in pbar:
             global_step += 1
             lr = _lr(local_step)
@@ -1516,6 +1747,7 @@ def train_chunk(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
             if local_step % log_every == 0:
                 _jlog(dict(step=global_step, loss=round(loss_f, 5), lr=lr))
+                print(str(pbar), file=log_file, flush=True)
 
             # Eval
             if local_step % eval_every == 0 or local_step == n_steps:
@@ -1564,6 +1796,9 @@ def train_chunk(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     _log(f'\nDone. {h:02d}:{m:02d}:{s:02d}')
     log_file.close()
     jsonl_file.close()
+    status_file.close()
+    try: os.remove(os.path.join(log_dir, 'train_status.log'))
+    except FileNotFoundError: pass
 
 
 # ---------------------------------------------------------------------------
@@ -1601,8 +1836,7 @@ _WINREFINE_WEIGHTS = {'half': 0.4, 'full': 0.2}
 
 def _build_trajectories(traj_mix_cfg: list[dict], n_chunks: int, chunk_len: int,
                         slot_len: int, warmup_len: int,
-                        schedule: list[tuple[int, int]], device,
-                        nochain: bool = False) -> list[dict]:
+                        schedule: list[tuple[int, int]], device) -> list[dict]:
     """
     Expand a traj_mix config (list of {type, weight}) into a flat list of
     concrete trajectories: {name, window, pos, mask_np, mask_t, has_ir, weight}.
@@ -1663,9 +1897,30 @@ def _build_trajectories(traj_mix_cfg: list[dict], n_chunks: int, chunk_len: int,
             traj_nc = entry.get('n_chunks', n_chunks)
             pos = chunk_positions_fb_localrefine(traj_nc, chunk_len, slot_len,
                                                  warmup_len, local_windows, n_refine=n_refine)
-            mask_np = chunk_mask_fb(pos, nochain=nochain)
+            mask_np = chunk_mask_fb(pos)
             out.append(dict(name=ttype, window=None, pos=pos, mask_np=mask_np,
-                            has_ir=(n_refine > 0), weight=w, n_chunks=traj_nc))
+                            has_ir=(n_refine > 0), weight=w, n_chunks=traj_nc,
+                            windows=local_windows))
+        elif ttype == 'iq_global_rw_full':
+            traj_nc = entry.get('n_chunks', n_chunks)
+            pos = chunk_positions_iq_global_rw_full(traj_nc, chunk_len, slot_len, warmup_len)
+            mask_np = chunk_mask_fb(pos)
+            out.append(dict(name='iq_global_rw_full', window=None, pos=pos, mask_np=mask_np,
+                            has_ir=False, weight=w, n_chunks=traj_nc,
+                            windows=[(0, traj_nc)]))
+        elif ttype in ('iq_global_rw', 'iq_global_rw_ir'):
+            traj_nc = entry.get('n_chunks', n_chunks)
+            window_chunks = entry.get('window_chunks', 2)
+            rw_n_refine = entry.get('n_refine', 0)
+            pos = chunk_positions_iq_global_rw(traj_nc, chunk_len, slot_len,
+                                               warmup_len, window_chunks,
+                                               warmup_x_fixed=entry.get('warmup_x_fixed'),
+                                               warmup_x_dist=entry.get('warmup_x_dist', 'uniform'),
+                                               n_refine=rw_n_refine)
+            mask_np = chunk_mask_fb(pos)
+            out.append(dict(name='iq_global_rw', window=None, pos=pos, mask_np=mask_np,
+                            has_ir=(rw_n_refine > 0), weight=w, n_chunks=traj_nc,
+                            windows=[(0, traj_nc)]))
         else:
             raise ValueError(f'unknown traj_mix type: {ttype!r}')
 
@@ -1697,8 +1952,9 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     log_dir  = os.path.join(log_base, name)
     ckpt_dir = os.path.join(log_dir, 'checkpoints')
     os.makedirs(ckpt_dir, exist_ok=True)
-    log_file   = open(os.path.join(log_dir, 'train.log'),   'a', buffering=1)
-    jsonl_file = open(os.path.join(log_dir, 'train.jsonl'), 'a', buffering=1)
+    log_file    = open(os.path.join(log_dir, 'train.log'),    'a', buffering=1)
+    jsonl_file  = open(os.path.join(log_dir, 'train.jsonl'), 'a', buffering=1)
+    status_file = _StatusWriter(os.path.join(log_dir, 'train_status.log'))
 
     def _log(msg): print(msg); print(msg, file=log_file)
     def _jlog(d):  jsonl_file.write(json.dumps(d) + '\n')
@@ -1762,15 +2018,26 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         traj_mix_cfg = stage.get('traj_mix')
         if traj_mix_cfg is None:
             traj_mix_cfg = [dict(type='ir_srs', weight=1.0)]
-        nochain = hp.get('mask_nochain', False)
         trajectories = _build_trajectories(traj_mix_cfg, n_chunks, chunk_len,
-                                           slot_len, warmup_len, schedule, device,
-                                           nochain=nochain)
+                                           slot_len, warmup_len, schedule, device)
         traj_weights = np.array([t['weight'] for t in trajectories], dtype=np.float64)
         traj_weights = traj_weights / traj_weights.sum()
 
         eval_traj_name = stage.get('eval_traj', traj_mix_cfg[0]['type'])
-        eval_trajs = [t for t in trajectories if t['name'] == eval_traj_name]
+        # For iq_global_rw, multiple traj_mix entries with different warmup_x_fixed
+        # share the same eval (warmup_valid_offsets are identical). Deduplicate by
+        # (name, warmup_valid_offsets tuple) so eval runs once per unique eval config.
+        _seen_eval_keys: set = set()
+        eval_trajs = []
+        for t in trajectories:
+            if t['name'] != eval_traj_name:
+                continue
+            rb0 = t['pos']['rec_blocks'][0] if t['pos']['rec_blocks'] else {}
+            eval_key = (t['name'], tuple(rb0.get('warmup_valid_offsets', [])),
+                        tuple(t.get('windows', [])))
+            if eval_key not in _seen_eval_keys:
+                _seen_eval_keys.add(eval_key)
+                eval_trajs.append(t)
 
         # Use the dominant (highest-weight) trajectory's L just for logging.
         primary = trajectories[int(np.argmax(traj_weights))]
@@ -1780,7 +2047,28 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
              f'eval_traj={eval_traj_name} L~{primary["pos"]["L"]}  B={B}  steps={n_steps}  '
              f'actual_argmax={use_actual_am}')
 
-        def _lr(s): return lr_max * s / max(warmup_steps, 1) if s <= warmup_steps else lr_max
+        lr_min           = hp.get('lr_min', 0.0)
+        cosine_T0        = hp.get('cosine_T0', 20000)
+        cosine_Tmul      = hp.get('cosine_T_mult', 2)
+        cosine_cycle_wup = hp.get('cosine_cycle_warmup', 0)  # per-restart warmup steps (0=off)
+        lr_schedule      = hp.get('lr_schedule', 'constant')
+
+        def _lr(s):
+            if s <= warmup_steps:
+                return lr_max * s / max(warmup_steps, 1)
+            if lr_schedule != 'cosine_restarts':
+                return lr_max
+            t = s - warmup_steps
+            T_i = cosine_T0
+            while t >= T_i:
+                t -= T_i
+                T_i = int(T_i * cosine_Tmul)
+            # per-cycle warmup: ramp lr_min→lr_max over first cosine_cycle_wup steps
+            if cosine_cycle_wup > 0 and t < cosine_cycle_wup:
+                return lr_min + (lr_max - lr_min) * t / cosine_cycle_wup
+            t_cos = t - cosine_cycle_wup
+            T_cos = T_i  - cosine_cycle_wup
+            return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * t_cos / max(T_cos, 1)))
 
         test_chunks = test_vm = None
         if eval_file:
@@ -1797,7 +2085,8 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
         stage_best_val = -1.0
 
-        pbar = tqdm(range(1, n_steps + 1), desc=f'stage{stage_i}', dynamic_ncols=True)
+        pbar = tqdm(range(1, n_steps + 1), desc=f'stage{stage_i}',
+                    dynamic_ncols=True, file=status_file)
         for local_step in pbar:
             global_step += 1
             lr = _lr(local_step)
@@ -1809,8 +2098,8 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             pos, mask_t, has_ir = traj['pos'], traj['mask_t'], traj['has_ir']
             traj_nc = traj.get('n_chunks', n_chunks)  # per-traj override for vlen
 
-            tok_np = _chunk_make_batch_fb(rng, B, traj_nc, chunk_len,
-                                          slot_len, slot_count, schedule, pos)
+            tok_np, ce_mask_np = _chunk_make_batch_fb(rng, B, traj_nc, chunk_len,
+                                                      slot_len, slot_count, schedule, pos)
             tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
 
             if use_actual_am and has_ir:
@@ -1822,12 +2111,19 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
             # Pass 2 (or only pass if teacher-forced/no-IR): compute loss on clean blocks
             logits = model(tok_t, mask_t)
+            ce_mask_t = (torch.tensor(ce_mask_np, device=device, dtype=torch.float32)
+                         if ce_mask_np is not None else None)
             nlls = []
             for rb in pos['rec_blocks']:
                 if not rb['is_clean']: continue     # IR turns, or IQ turns when with_ir=False
                 lp  = F.log_softmax(logits[:, rb['c0']-1:rb['c1']-1], dim=-1)
                 tgt = tok_t[:, rb['c0']:rb['c1']]
-                nlls.append(_positional_ls_nll(lp, tgt, ls_max).mean())
+                nll_per = _positional_ls_nll(lp, tgt, ls_max)   # (B, out_len)
+                if ce_mask_t is not None and rb.get('out_to_end'):
+                    # masked mean over valid (non-padding) positions
+                    nlls.append((nll_per * ce_mask_t).sum() / ce_mask_t.sum().clamp(min=1))
+                else:
+                    nlls.append(nll_per.mean())
             loss = torch.stack(nlls).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1837,6 +2133,7 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             pbar.set_postfix(loss=f'{loss_f:.3f}', lr=f'{lr:.1e}', traj=traj['name'], refresh=False)
             if local_step % log_every == 0:
                 _jlog(dict(step=global_step, loss=round(loss_f, 5), lr=lr, traj=traj['name']))
+                print(str(pbar), file=log_file, flush=True)
 
             if local_step % stage_eval_every == 0 or local_step == n_steps:
                 model.eval()
@@ -1844,13 +2141,23 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 h, m = divmod(int(elapsed), 3600); m, s = divmod(m, 60)
                 _log(f'\n--- stage={stage_i} step={local_step}/{n_steps}'
                      f'  g={global_step}  loss={loss_f:.4f}  {h:02d}:{m:02d}:{s:02d} ---')
+                _eval_log_f = open(os.path.join(log_dir, f'eval_{global_step}.log'), 'w', buffering=1)
+                def _elog(msg): print(msg, file=_eval_log_f)
 
                 # Evaluate every variant of the chosen eval_traj (e.g. each
                 # window for ir_winrefine), report mean across them.
                 eval_val_means = []
                 for et in eval_trajs:
                     epos, emask = et['pos'], et['mask_np']
-                    tag = et['name'] + (f'[{et["window"]}]' if et.get('window') else '')
+                    et_wins = et.get('windows')
+                    et_nc   = et.get('n_chunks', n_chunks)
+                    if et_wins and len(et_wins) == 1:
+                        ws, we = et_wins[0]
+                        tag = f'{et["name"]}[win({ws},{we})_nc{et_nc}]'
+                    elif et_wins and len(et_wins) > 1:
+                        tag = f'{et["name"]}[stitch_nc{et_nc}]'
+                    else:
+                        tag = et['name'] + (f'[{et["window"]}]' if et.get('window') else '')
                     # ir_local with >1 window: use the full-sequence stitched
                     # "prolonged AR" decode (decode 0..src_len, only the very
                     # first window's warmup seeded from GT). Everything else
@@ -1860,23 +2167,115 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                        if et['name'] == 'ir_local' else 1)
                     use_stitch = et['name'] == 'ir_local' and n_local_windows > 1
                     et_nc = et.get('n_chunks', n_chunks)  # use traj's n_chunks for vlen
+                    # iq_global_rw: evaluate at each chunk-aligned window offset,
+                    # report per-window results in the same win(a,b)_ncX format
+                    if et['name'] == 'iq_global_rw_full':
+                        rw_rb = epos['rec_blocks'][0]
+                        rw_valid_offsets = rw_rb.get('warmup_valid_offsets', [0])
+                        src_len = et_nc * chunk_len
+                        window_means = []
+                        for X in rw_valid_offsets:
+                            actual_out_len = src_len - (X + warmup_len)
+                            win_tag = f'{et["name"]}[x{X}_out{actual_out_len}_nc{et_nc}]'
+                            seq_results = []
+                            for sname, seq in val_seqs.items():
+                                chunks_arr = np.array(
+                                    [seq[k*chunk_len:(k+1)*chunk_len] for k in range(et_nc)], np.int64)
+                                # eval with valid_mask covering only actual output bytes
+                                valid_mask = np.zeros(rw_rb['max_out_len'], dtype=bool)
+                                valid_mask[:actual_out_len] = True
+                                r = ar_decode_chunk_fb_kv(model, chunks_arr, slot_len, slot_count,
+                                                         schedule, emask, epos, device,
+                                                         warmup_offset=X, valid_mask=valid_mask)
+                                # match_pct from ar_decode already uses valid_mask
+                                # but decoded_bytes may be full max_out_len — slice to actual
+                                match_pct = r['match_pct']
+                                seq_results.append(match_pct)
+                                ref_b = np.array(seq[X:X+warmup_len+actual_out_len], dtype=np.int64)
+                                gen_b = np.concatenate([ref_b[:warmup_len],
+                                                        np.array(r['decoded_bytes'][:actual_out_len], dtype=np.int64)])
+                                _log(f'  val/{win_tag}/{sname:<15} BPB={r["bpb"]:.3f}  match={match_pct:.1f}%')
+                                _elog(f'\n{win_tag}/{sname}  BPB={r["bpb"]:.3f}  match={match_pct:.1f}%')
+                                _elog(_fmt_cmp(ref_b, gen_b, warmup_len))
+                            win_mean = sum(seq_results) / len(seq_results)
+                            window_means.append(win_mean)
+                            _log(f'  val/{win_tag}/MEAN               match={win_mean:.1f}%')
+                        vmean = sum(window_means) / len(window_means)
+                        eval_val_means.append(vmean)
+                        _log(f'  val/{tag}/MEAN               match={vmean:.1f}%')
+                        continue
+                    if et['name'] == 'iq_global_rw':
+                        rw_rb = epos['rec_blocks'][0]
+                        rw_valid_offsets = rw_rb.get('warmup_valid_offsets', [0])
+                        rw_wc = rw_rb.get('window_chunks', 2)
+                        window_means = []
+                        for X in rw_valid_offsets:
+                            ws = X // chunk_len
+                            we = ws + rw_wc
+                            win_tag = f'{et["name"]}[win({ws},{we})_nc{et_nc}]'
+                            seq_results = []
+                            for sname, seq in val_seqs.items():
+                                chunks_arr = np.array(
+                                    [seq[k*chunk_len:(k+1)*chunk_len] for k in range(et_nc)], np.int64)
+                                r = ar_decode_chunk_fb_kv(model, chunks_arr, slot_len, slot_count,
+                                                         schedule, emask, epos, device,
+                                                         warmup_offset=X)
+                                seq_results.append(r['match_pct'])
+                                tpcts = r.get('turn_match_pcts', [])
+                                n_turns = len(tpcts)
+                                if n_turns > 1:
+                                    turn_names = ['IQ'] + [f'IR{i}' for i in range(1, n_turns)]
+                                    turns_str = '  '.join(f'{tn}={p:.1f}%' for tn, p in zip(turn_names, tpcts))
+                                    _log(f'  val/{win_tag}/{sname:<15} BPB={r["bpb"]:.3f}  match={r["match_pct"]:.1f}%  [{turns_str}]')
+                                else:
+                                    _log(f'  val/{win_tag}/{sname:<15} BPB={r["bpb"]:.3f}  match={r["match_pct"]:.1f}%')
+                                byte_lo = ws * chunk_len
+                                ref_b = np.array(seq[byte_lo:byte_lo + rw_wc*chunk_len], dtype=np.int64)
+                                gen_b = np.concatenate([ref_b[:warmup_len],
+                                                        np.array(r['decoded_bytes'], dtype=np.int64)])
+                                _elog(f'\n{win_tag}/{sname}  BPB={r["bpb"]:.3f}  match={r["match_pct"]:.1f}%')
+                                _elog(_fmt_cmp(ref_b, gen_b, warmup_len))
+                            win_mean = sum(seq_results) / len(seq_results)
+                            window_means.append(win_mean)
+                            _log(f'  val/{win_tag}/MEAN               match={win_mean:.1f}%')
+                        vmean = sum(window_means) / len(window_means)
+                        eval_val_means.append(vmean)
+                        _log(f'  val/{tag}/MEAN               match={vmean:.1f}%')
+                        continue  # skip the shared val_results block below
                     val_results = []
+                    _elog(f'\n=== {tag} ===')
                     for sname, seq in val_seqs.items():
                         chunks_arr = np.array(
                             [seq[k*chunk_len:(k+1)*chunk_len] for k in range(et_nc)], np.int64)
-                        if use_stitch:
+                        if False:  # placeholder to keep elif chain below
+                            pass
+                        elif use_stitch:
                             r = ar_decode_chunk_fb_stitch_kv(model, chunks_arr, slot_len, slot_count,
                                                              emask, epos, device)
+                            val_results.append(r['match_pct'])
+                            _log(f'  val/{tag}/{sname:<15} BPB={r["bpb"]:.3f}  match={r["match_pct"]:.1f}%')
+                            ref_b = np.array(seq, dtype=np.int64)
+                            gen_b = np.array(r['decoded_bytes'], dtype=np.int64)
+                            _elog(f'\n{tag}/{sname}  BPB={r["bpb"]:.3f}  match={r["match_pct"]:.1f}%')
+                            _elog(_fmt_cmp(ref_b, gen_b, warmup_len))
                         else:
                             r = ar_decode_chunk_fb_kv(model, chunks_arr, slot_len, slot_count,
                                                      schedule, emask, epos, device)
-                        val_results.append(r['match_pct'])
-                        _log(f'  val/{tag}/{sname:<15} BPB={r["bpb"]:.3f}  match={r["match_pct"]:.1f}%')
+                            val_results.append(r['match_pct'])
+                            _log(f'  val/{tag}/{sname:<15} BPB={r["bpb"]:.3f}  match={r["match_pct"]:.1f}%')
+                            ws2, we2 = (et_wins[0] if et_wins else (0, et_nc))
+                            byte_lo2 = ws2 * chunk_len
+                            ref_b = np.array(seq[byte_lo2:we2*chunk_len], dtype=np.int64)
+                            gen_b = np.concatenate([ref_b[:warmup_len],
+                                                    np.array(r['decoded_bytes'], dtype=np.int64)])
+                            _elog(f'\n{tag}/{sname}  BPB={r["bpb"]:.3f}  match={r["match_pct"]:.1f}%')
+                            _elog(_fmt_cmp(ref_b, gen_b, warmup_len))
                     vmean = sum(val_results) / len(val_results)
                     eval_val_means.append(vmean)
                     _log(f'  val/{tag}/MEAN               match={vmean:.1f}%')
                 val_mean = sum(eval_val_means) / len(eval_val_means)
                 _log(f'  val/MEAN (all {eval_traj_name} variants)  match={val_mean:.1f}%')
+                _eval_log_f.close()
 
                 if val_mean > stage_best_val:
                     stage_best_val = val_mean
@@ -1917,6 +2316,9 @@ def train_chunk_fb(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     h, m = divmod(int(elapsed), 3600); m, s = divmod(m, 60)
     _log(f'\nDone. {h:02d}:{m:02d}:{s:02d}')
     log_file.close(); jsonl_file.close()
+    status_file.close()
+    try: os.remove(os.path.join(log_dir, 'train_status.log'))
+    except FileNotFoundError: pass
 
 
 if __name__ == '__main__':

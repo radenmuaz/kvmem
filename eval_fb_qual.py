@@ -123,7 +123,7 @@ if args.val_n_seqs < len(seqs):
     seqs = dict(list(seqs.items())[:args.val_n_seqs])
 
 # ── Display helpers ───────────────────────────────────────────────────────────
-def _print_comparison(ref_bytes, gen_bytes, label='', window_boundaries=None):
+def _print_comparison(ref_bytes, gen_bytes, label='', window_boundaries=None, output_start=0):
     n = len(ref_bytes)
     bounds = set(window_boundaries or [])
 
@@ -144,8 +144,11 @@ def _print_comparison(ref_bytes, gen_bytes, label='', window_boundaries=None):
         sep = ' |' if i in bounds else ''
         parts.append(sep + ('  .' if r == g else '  X'))
     print(''.join(parts))
-    n_wrong = sum(r != g for r, g in zip(ref_bytes, gen_bytes))
-    print(f'  match {n-n_wrong}/{n} = {100*(n-n_wrong)/n:.1f}%')
+    out_ref = ref_bytes[output_start:]
+    out_gen = gen_bytes[output_start:]
+    n_out = len(out_ref)
+    n_ok = sum(r == g for r, g in zip(out_ref, out_gen))
+    print(f'  match {n_ok}/{n_out} = {100*n_ok/n_out:.1f}%')
 
 # ── Per-window eval ───────────────────────────────────────────────────────────
 print('=' * 72)
@@ -171,7 +174,8 @@ for (win, wpos, wmask) in per_window:
         gen_bytes = np.concatenate([ref_bytes[:WARMUP_LEN], gen_out])
 
         print(f'  {sname:<15} BPB={r["bpb"]:.3f}  match={r["match_pct"]:.1f}%')
-        _print_comparison(ref_bytes, gen_bytes, sname)
+        _print_comparison(ref_bytes, gen_bytes, sname,
+                          window_boundaries=[WARMUP_LEN], output_start=WARMUP_LEN)
         print()
     print(f'  MEAN match={np.mean(matches):.1f}%')
 

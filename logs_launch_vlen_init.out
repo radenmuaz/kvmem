@@ -1,0 +1,171 @@
+Model: 231,296 params  device=mps  chunk_attn=256
+Loaded: logs/hmn_chunk_local_64_vlen_ext2/checkpoints/stage0_best.pt
+
+[stage 0] n_chunks=4 chunk_len=16 slot=4 wl=8 depth=2 traj_mix=[('iq_global_rw', None, np.float64(1.0))] eval_traj=iq_global_rw L~116  B=8  steps=50000  actual_argmax=False
+
+--- stage=0 step=5000/50000  g=5000  loss=4.1460  00:33:16 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=4.608  match=4.2%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=3.456  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=3.964  match=4.2%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=2.8%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=6.301  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=5.877  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=5.788  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=8.053  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=8.199  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=7.934  match=4.2%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=1.4%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=1.4%
+  val/MEAN (all iq_global_rw variants)  match=1.4%
+  [new best] stage=0 step=5000 val_mean=1.4% -> logs/hmn_chunk_global_iq_rw_nc4_vlen_init/checkpoints/stage0_best.pt
+
+--- stage=0 step=10000/50000  g=10000  loss=4.8130  00:50:43 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=4.002  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=3.718  match=8.3%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=3.740  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=2.8%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=5.791  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=5.701  match=20.8%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=5.675  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=6.9%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=8.044  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=8.088  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=7.939  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=3.2%
+  val/MEAN (all iq_global_rw variants)  match=3.2%
+  [new best] stage=0 step=10000 val_mean=3.2% -> logs/hmn_chunk_global_iq_rw_nc4_vlen_init/checkpoints/stage0_best.pt
+
+--- stage=0 step=15000/50000  g=15000  loss=3.8583  00:56:04 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=3.903  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=3.800  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=3.798  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=5.654  match=8.3%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=5.701  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=5.660  match=16.7%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=8.3%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=8.042  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=7.987  match=4.2%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=8.000  match=4.2%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=2.8%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=3.7%
+  val/MEAN (all iq_global_rw variants)  match=3.7%
+  [new best] stage=0 step=15000 val_mean=3.7% -> logs/hmn_chunk_global_iq_rw_nc4_vlen_init/checkpoints/stage0_best.pt
+
+--- stage=0 step=20000/50000  g=20000  loss=4.1489  01:12:47 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=4.208  match=4.2%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=4.102  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=3.885  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=1.4%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=5.173  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=5.433  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=5.349  match=16.7%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=5.6%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=8.066  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=7.991  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=8.060  match=4.2%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=1.4%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=2.8%
+  val/MEAN (all iq_global_rw variants)  match=2.8%
+
+--- stage=0 step=25000/50000  g=25000  loss=3.9907  01:45:20 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=5.011  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=4.362  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=4.579  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=4.937  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=4.934  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=5.027  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=8.004  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=7.893  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=8.130  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=0.0%
+  val/MEAN (all iq_global_rw variants)  match=0.0%
+
+--- stage=0 step=30000/50000  g=30000  loss=4.2037  01:56:41 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=4.714  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=3.958  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=4.495  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=4.434  match=4.2%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=3.980  match=4.2%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=4.538  match=4.2%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=4.2%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=7.301  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=7.285  match=12.5%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=7.492  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=4.2%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=2.8%
+  val/MEAN (all iq_global_rw variants)  match=2.8%
+
+--- stage=0 step=35000/50000  g=35000  loss=3.2118  02:14:36 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=4.744  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=4.470  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=4.598  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=4.017  match=4.2%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=4.073  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=3.559  match=8.3%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=4.2%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=7.337  match=8.3%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=7.374  match=8.3%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=7.395  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=5.6%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=3.2%
+  val/MEAN (all iq_global_rw variants)  match=3.2%
+
+--- stage=0 step=40000/50000  g=40000  loss=3.5961  02:31:57 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=4.465  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=3.923  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=4.234  match=4.2%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=1.4%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=3.886  match=8.3%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=3.612  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=3.939  match=8.3%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=5.6%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=7.389  match=8.3%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=7.511  match=8.3%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=7.489  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=5.6%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=4.2%
+  val/MEAN (all iq_global_rw variants)  match=4.2%
+  [new best] stage=0 step=40000 val_mean=4.2% -> logs/hmn_chunk_global_iq_rw_nc4_vlen_init/checkpoints/stage0_best.pt
+
+--- stage=0 step=45000/50000  g=45000  loss=2.7979  02:48:37 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=4.136  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=4.208  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=4.260  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=3.947  match=4.2%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=3.689  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=4.110  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=1.4%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=7.350  match=8.3%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=7.462  match=4.2%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=7.573  match=4.2%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=5.6%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=2.3%
+  val/MEAN (all iq_global_rw variants)  match=2.3%
+
+--- stage=0 step=50000/50000  g=50000  loss=3.1138  02:58:15 ---
+  val/iq_global_rw[win(0,2)_nc4]/up_counter      BPB=4.382  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/down_counter    BPB=3.860  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/odd             BPB=4.384  match=0.0%
+  val/iq_global_rw[win(0,2)_nc4]/MEAN               match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/up_counter      BPB=3.568  match=4.2%
+  val/iq_global_rw[win(1,3)_nc4]/down_counter    BPB=3.918  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/odd             BPB=3.502  match=0.0%
+  val/iq_global_rw[win(1,3)_nc4]/MEAN               match=1.4%
+  val/iq_global_rw[win(2,4)_nc4]/up_counter      BPB=7.302  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/down_counter    BPB=7.475  match=4.2%
+  val/iq_global_rw[win(2,4)_nc4]/odd             BPB=7.772  match=0.0%
+  val/iq_global_rw[win(2,4)_nc4]/MEAN               match=1.4%
+  val/iq_global_rw[win(0,4)_nc4]/MEAN               match=0.9%
+  val/MEAN (all iq_global_rw variants)  match=0.9%
+  [ckpt] logs/hmn_chunk_global_iq_rw_nc4_vlen_init/checkpoints/stage0_end.pt
+
+Done. 02:58:15

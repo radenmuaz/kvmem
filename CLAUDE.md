@@ -2,6 +2,15 @@
 
 Fast-weight language model — HashMemNet (HMN). Two architectures: v3 (MEM blocks) and **Feedback** (argmax loop, current focus).
 
+**Convention — always include traj_mix table when launching or describing a run:**
+Eval output rows appear in traj_mix order with no labels. Without the table it's impossible to match `val/ir_local/MEAN = 26%` to the right window/nc. Format:
+
+| weight | windows | nc | SLOT pos | trains |
+|---|---|---|---|---|
+| 2.0 | [(0,2),(1,3),(2,4)] | 4 | 80/244/408 | stitch 64B |
+| 1.0 | [(0,2)] | 2 | 40 | win A independent |
+| 0.5 | [(2,4)] | 8 | 160 | win C bridge |
+
 **Read these docs to resume:**
 
 | Priority | Doc | Why |
@@ -10,6 +19,7 @@ Fast-weight language model — HashMemNet (HMN). Two architectures: v3 (MEM bloc
 | 2 | [`docs/FEEDBACK_RESULTS.md`](docs/FEEDBACK_RESULTS.md) | **Key result**: feedback arch achieves 100% k=0..12, why it works, bug history |
 | 3 | [`docs/BOOK.md`](docs/BOOK.md) § 8 | HMN v3 architecture reference (predecessor) |
 | 4 | [`docs/kv_dims.md`](docs/kv_dims.md) | KV capacity math, model size, SRS multi-sequence design |
+| 5 | [`docs/MDL_MODEL_SIZE.md`](docs/MDL_MODEL_SIZE.md) | **Model size theory**: MDL analysis, gradient-descent tax, why vlen = MDL regularization |
 
 ---
 
@@ -50,7 +60,10 @@ window C (2,4): recall bytes 32-63   (chunks 2+3)  ← 16B overlap with B
 
 ## Current Status
 
-**Feedback architecture solved the refinement problem. Now extending to multi-sequence SRS chunk memorization.**
+**Feedback architecture solved the refinement problem. Active scaling approaches:**
+1. **ir_local** (local IQ per window, stitch decode) — chaining bug fixed in v5, running
+2. **iq_global_rw + IR** (single global IQ, all windows, argmax feedback IR) — **slot8_ir RUNNING**, Win B at 100%
+3. **chat-tags** (`experiments/chat_tags/`, isolated from `kvmem/`) — explicit `<src>/<mem>/<query>/<response>` boundary tokens wrapping the `iq_global_rw` layout, testing whether runtime-visible region tags help Win C generalization beyond what `slot8_ir_v2` reached. Phase A (plumbing sanity) ✓ passed. Phase B (full staged run, mirrors `slot8_ir_v2` recipe) **RUNNING**. See `docs/FEEDBACK_RESULTS.md § Chat-tags experiment` and the plan at `/Users/muaz/.claude/plans/design-experiment-which-use-atomic-kay.md`.
 
 | Run | Result |
 |-----|--------|
@@ -62,7 +75,26 @@ window C (2,4): recall bytes 32-63   (chunks 2+3)  ← 16B overlap with B
 | `hmn_chunk_local_64_v3` (64B, targeted fix: stitch×3+win1×1+win2×1, from v1 end) | **failed** — stitch oscillated 58→43→35→45→41%, win2 collapsed at 60k. Killed. |
 | `hmn_chunk_local_64_v4` (64B, mask_nochain=True, pure stitch, from stage2 end) | **failed** — win1=0%, win2=12.5% indep; stitch=53.6% best. nochain blocked SLOTs only, model chained through OUTPUT tokens |
 | `hmn_chunk_local_64_v5` (64B, mask_nochain=True corrected, pure stitch, from stage2 end) | **running** — v5 fix: IQ SLOT blocked from ALL prior rec_block tokens (SLOT+warmup+output) |
+| **Global IQ rw track** | |
+| `hmn_chunk_global_iq_rw_nc4_slot4` → ext2 (slot4, IQ only, 150k+ steps) | 18.1% best — Win A BPB ~3.5-4.0, slot capacity bottleneck confirmed |
+| `hmn_chunk_global_iq_rw_nc4_wina_ovs` (slot4 + 2× Win A oversample, from ext2) | 18.1% best — Win A BPB 2.128 (new low), 12.5% match peak. Capacity not distribution. |
+| `hmn_chunk_global_iq_rw_nc4_slot8` → ext (slot8, IQ only, 80k+45k=125k total) | **44.0% best** — Win B/C improving, Win A BPB=1.283 (plateau) |
+| `hmn_chunk_global_iq_rw_nc4_slot8_ir` (slot8 + n_refine=2 IR, from slot8_ext best) | **57.4% best** (step 75k) — Win B 97%, Win C 74%, Win A 3% (IQ=0% throughout — is_clean bug) |
+| `hmn_chunk_global_iq_rw_nc4_slot8_ir_v2` (slot8 + IQ fix + Win A oversample, 100k) | **77.8% best** @ step 60k — Win A **100%** ✓, Win B 77.8%, Win C 55.6%. Final (100k): 75.5% |
 | All HMN v3 variants (mono, cerb, p2, p4, pinf, tlogit) | ~95% k=0, collapses at k>4 |
+
+### IR vs IQ-only — the decisive comparison
+
+Win B down_counter BPB: **0.350** (IQ-only after 80k steps) → **0.039** (IR after 15k steps) — 9× BPB reduction in 5× fewer steps. IQ-only was plateaued; IR unlocked it in one stage. This mirrors the 32B result where IR lifted 50%→100% match. See `docs/FEEDBACK_RESULTS.md` for full analysis.
+
+### slot8_ir_v2 key findings (see `docs/FEEDBACK_RESULTS.md` for full tables)
+
+- **IQ=0% root cause fixed**: `is_clean=(n_refine==0)` excluded IQ from loss when n_refine>0. Fix: add `iq_global_rw` (n_refine=0) entries at 33% of traj_mix — IQ loss is present, model learns one-shot recall.
+- **Win A solved at step 45k** (100% MEAN), stays solved at 100k. IQ training (Win A X=0 at 22% of steps) + IR training (Win A X=0 at 44%) unlocks it.
+- **Best checkpoint is cycle 2 end (step 60k)**: cosine_T0=20k → cycle ends at 20k/60k/140k. Cycle 3 restart introduces volatility; Win C collapses at step 70k, never fully recovers.
+- **IR2 corrects IR1 regressions**: Win A at step 100k shows IR1=45-62% but IR2=100% — the two-turn chain is qualitatively different from single IR.
+- **Win C `up_counter` unsolved** (4.2% at end): IQ reaches 37.5% at step 100k but IR1 destroys it. Root cause: traj_mix gives Win C X=0 only ~0.7% of IR steps (uniform coverage) vs Win A X=0 at 44%. IR learned on other (window, X) pairs applies wrong corrections for Win C at X=0. Fix: add `warmup_x_fixed=16` (Win B) and `warmup_x_fixed=32` (Win C) IR entries to traj_mix. **Source distribution (infinite random bytes) is correct** — EXP1 showed it converges fastest; Win C IQ BPB trends down steadily, confirming algorithm learning not distribution noise. See `docs/FEEDBACK_RESULTS.md § Dataset design`.
+- **Ablation queue running**: slot4/slot8/slot12 wina_s0 (IQ-only from scratch) → then slot8 2x model, mixed slot_len, from-scratch 2-stage recipe.
 
 ---
 
@@ -336,6 +368,48 @@ Turn t≥1 (IR — argmax feedback):
 
 **IQ pretraining required** before IR — model must learn slot compression before feedback is meaningful.
 
+### Global IQ with Random Warmup (`iq_global_rw` / `iq_global_rw_ir` traj types)
+
+Alternative to local-refine: ONE global IQ reads all nc enc_blocks, predicts any 32B window (warmup_len=8, out_len=24). Training samples random warmup offset X ∈ [0, src_len-32]; eval uses fixed window-start offsets {0, 16, 32}.
+
+```
+[ENC_0: src[0:16] | SLOT×slot_len]   (4×16 + 4×slot_len = enc_end tokens)
+[ENC_1: src[16:32] | SLOT×slot_len]
+[ENC_2: src[32:48] | SLOT×slot_len]
+[ENC_3: src[48:64] | SLOT×slot_len]
+[IQ:  SLOT×slot_len | warmup[X:X+8] | out[X+8:X+32]]
+[IR1: SLOT_A×slot_len | argmax×24 | SLOT_B×slot_len | warmup[X:X+8] | out]  ← n_refine≥1
+[IR2: SLOT_A×slot_len | argmax×24 | SLOT_B×slot_len | warmup[X:X+8] | out]  ← n_refine≥2
+```
+
+- **slot_len** is the bandwidth knob: slot_len=4 → 4 tokens compress 32B → capacity bottleneck. slot_len=8 unlocks Win B/C. Win A remains hardest at all slot sizes tested.
+- **n_refine=2**: two chained IR turns after IQ. Same warmup offset X for all turns per example.
+- **IR vs long IQ**: IQ-only Win B down_counter BPB plateaued at 0.350 after 80k steps. IR reduced it to 0.039 in 15k steps (9× lower, 5× fewer steps). IR is structurally necessary, not just beneficial — the delta-encoding bottleneck through SLOT_B cannot be replicated by more IQ training.
+- **Argmax is the right feedback signal** (not soft probabilities): training fills argmax positions with hard GT tokens; eval fills them with model's hard argmax predictions. Train/eval distributions match. Soft feedback (`softmax(logits) @ E`) would create a distribution mismatch and require retraining with Gumbel-softmax.
+
+Run commands:
+```bash
+# slot8 IR stage (RUNNING)
+caffeinate -i python3 -m kvmem.train_hmn_chunk \
+    --config configs/hmn_chunk_global_iq_rw_nc4_slot8_ir.py \
+    --pretrained logs/hmn_chunk_global_iq_rw_nc4_slot8_ext/checkpoints/stage0_best.pt \
+    --device mps
+tail -f logs/hmn_chunk_global_iq_rw_nc4_slot8_ir/train.log
+```
+
+Traj mix (`slot8_ir`, IQ=0% bug — do not use as reference):
+| weight | nc | n_refine | warmup X (train) | warmup X (eval) | SLOT pos | L |
+|--------|----|----------|------------------|-----------------|----------|---|
+| 1.0 | 4 | 2 | uniform [0,32] | {0, 16, 32} | 96 | 280 |
+
+Traj mix (`slot8_ir_v2`, IQ fix + Win A oversample — current best):
+| weight | type | nc | n_refine | warmup X (train) | share | purpose |
+|--------|------|----|----------|------------------|-------|---------|
+| 1.0 | `iq_global_rw_ir` | 4 | 2 | uniform [0,32] | 22% | IR all windows |
+| 0.5 | `iq_global_rw` | 4 | 0 | uniform [0,32] | 11% | IQ-only all windows |
+| 2.0 | `iq_global_rw_ir` | 4 | 2 | fixed X=0 | 44% | Win A IR heavy |
+| 1.0 | `iq_global_rw` | 4 | 0 | fixed X=0 | 22% | Win A IQ-only heavy |
+
 ### Run
 
 ```bash
@@ -433,6 +507,14 @@ Current model holds all of these fixed to prevent train/test mismatch. Listed in
 - IQ stage before IR — always required for feedback arch
 - Feedback eval: use inline script above (no `--eval-only` in train_hmn_feedback yet)
 
+### Model size vs task — MDL principle (see [`docs/MDL_MODEL_SIZE.md`](docs/MDL_MODEL_SIZE.md))
+
+- **Parameter count scales with algorithm complexity, not sequence length.** The same 231k model should handle 128B and 256B — the per-chunk encoding algorithm is identical at all scales.
+- **Current model is ~4–8× the theoretical minimum** for single-window 32B. Overhead is the gradient-descent tax for SGD learnability, not waste.
+- **Position-dependent encoding = longer MDL description.** Vlen training is MDL regularization: training at multiple nc values penalizes position-dependent solutions (higher description length) and forces the model toward position-invariant ones (shorter description).
+- **If a run stalls: do not add parameters first.** Correct order: (1) broaden training distribution, (2) simplify algorithm (IQ-only fallback), (3) increase model size only as last resort.
+- **Dataset is infinite random bytes** — classical overfitting analysis does not apply. The relevant quantity is model description length vs target function description length, not model size vs dataset size.
+
 ---
 
 ## Docs
@@ -440,15 +522,17 @@ Current model holds all of these fixed to prevent train/test mismatch. Listed in
 | What | Where |
 |------|-------|
 | **SRS recipe, scaling theory, open/closed-loop** | [`docs/SRS_RECIPE.md`](docs/SRS_RECIPE.md) |
-| **Feedback results + architecture** | [`docs/FEEDBACK_RESULTS.md`](docs/FEEDBACK_RESULTS.md) |
+| **Feedback results + global IQ rw + IR evidence** | [`docs/FEEDBACK_RESULTS.md`](docs/FEEDBACK_RESULTS.md) |
 | HMN v3 reference book | [`docs/BOOK.md`](docs/BOOK.md) |
 | KV capacity + SRS trajectories | [`docs/kv_dims.md`](docs/kv_dims.md) |
 | All configs | [`configs/`](configs/) |
-| **Chunk SRS / local-refine training** | [`kvmem/train_hmn_chunk.py`](kvmem/train_hmn_chunk.py) |
-| Local-refine configs (active) | `hmn_chunk_local_32.py`, `hmn_chunk_local_32_stage1.py`, `hmn_chunk_local_64_v3.py`, `hmn_chunk_local_128_stitch.py`, `hmn_chunk_local_128_v3.py`, `hmn_chunk_local_256.py` |
+| **Chunk SRS / local-refine + global IQ rw training** | [`kvmem/train_hmn_chunk.py`](kvmem/train_hmn_chunk.py) |
+| Local-refine configs (active) | `hmn_chunk_local_32.py`, `hmn_chunk_local_32_stage1.py`, `hmn_chunk_local_64_v5.py`, `hmn_chunk_local_128_stitch.py`, `hmn_chunk_local_256.py` |
+| **Global IQ rw configs (active)** | `hmn_chunk_global_iq_rw_nc4_slot8_ir_v2.py` (**DONE** 77.8% best), `hmn_chunk_global_iq_rw_nc4_slot4_wina_s0.py` (**RUNNING**), `hmn_chunk_global_iq_rw_nc4_slot8_wina_s0.py`, `hmn_chunk_global_iq_rw_nc4_slot12_wina_s0.py` (queued) |
 | Local-refine eval (generic) | [`eval_fb_qual.py`](eval_fb_qual.py) — any stage, auto-detects n_chunks from checkpoint |
 | Parked — ir_stitch (chaining problem, do not revive) | [`configs/hmn_chunk_stitch_a.py`](configs/hmn_chunk_stitch_a.py), `_b.py`, `_smoke.py` |
 | Parked — ir_winrefine (global IQ, Tier 3) | `chunk_positions_fb_winrefine` in train_hmn_chunk.py |
-| Feedback training | [`kvmem/train_hmn_feedback.py`](kvmem/train_hmn_feedback.py) |
+| **Chat-tags experiment (isolated, no kvmem/ edits)** | [`experiments/chat_tags/`](experiments/chat_tags/) — `vocab.py`, `positions.py`, `batch.py`, `train.py`, `configs/slot8_tagged_phaseA_iq.py` (**DONE**, passed), `configs/slot8_tagged_phaseB_full.py` (**RUNNING**) |
+| Feedback training (32B) | [`kvmem/train_hmn_feedback.py`](kvmem/train_hmn_feedback.py) |
 | HMN v3 mono training | [`kvmem/train_hmn_mono.py`](kvmem/train_hmn_mono.py) |
 | Test set | [`datasets/suratalfatihah.txt`](datasets/suratalfatihah.txt) |
