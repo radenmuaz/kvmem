@@ -37,3 +37,19 @@ WINDOW_QUERY_TAGS = {
     16: (HMN_QUERY_B_OPEN, HMN_QUERY_B_CLOSE),
     32: (HMN_QUERY_C_OPEN, HMN_QUERY_C_CLOSE),
 }
+
+# Extra window-identity tags (D-G) for schedules with more than 3 spans — e.g. the
+# 7-window stitched schedule at n_chunks=8 (windows (0,2)..(6,8)). Added when scaling
+# srs_stitch beyond nc=4; kept disjoint from the V2 IDs above so V2 checkpoints still
+# load cleanly (see experiments/srs_tagged/train.py's partial-load-by-shape-prefix
+# logic, which grows special_embed rows automatically).
+HMN_QUERY_D_OPEN   = HMN_VOCAB_SIZE + 14   # 282  <query_d>  window (3,5)
+HMN_QUERY_D_CLOSE  = HMN_VOCAB_SIZE + 15   # 283  </query_d>
+HMN_QUERY_E_OPEN   = HMN_VOCAB_SIZE + 16   # 284  <query_e>  window (4,6)
+HMN_QUERY_E_CLOSE  = HMN_VOCAB_SIZE + 17   # 285  </query_e>
+HMN_QUERY_F_OPEN   = HMN_VOCAB_SIZE + 18   # 286  <query_f>  window (5,7)
+HMN_QUERY_F_CLOSE  = HMN_VOCAB_SIZE + 19   # 287  </query_f>
+HMN_QUERY_G_OPEN   = HMN_VOCAB_SIZE + 20   # 288  <query_g>  window (6,8)
+HMN_QUERY_G_CLOSE  = HMN_VOCAB_SIZE + 21   # 289  </query_g>
+
+HMN_TAG_VOCAB_SIZE_V3 = HMN_VOCAB_SIZE + 22  # 290 — adds D-G on top of V2

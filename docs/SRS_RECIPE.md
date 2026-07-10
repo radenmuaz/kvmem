@@ -847,10 +847,255 @@ detour to fix a specific `iq_global_rw` bottleneck, not the SRS mechanism itself
 `slot_len=8`, `srs_schedule_depth2` (3 spans: two 32B halves + the 64B full span),
 `n_refine=2`, wrong-token-weighted loss enabled from the start (`wrong_token_weight=2.0`,
 already proven). Val: `make_test_sequences(64)`. Test: `datasets/suratalfatihah.txt`
-padded to `(4, 16)` via `load_chunks_padded`. Success bar: each of the 3 spans reaches
-≥90% match on both val and the held-out test file, matching the chat-tags bar. If depth-2
-succeeds, extend to full `srs_schedule` (7 spans, singles→pairs→full) as the next step —
-that's the actual multi-session spaced-repetition scaling test the vision doc is about.
+padded to `(4, 16)` via `load_chunks_padded`.
+
+**Success bar (stricter than the chat-tags bar): the run only passes if TEST match hits
+exactly 100%** on every span (not ≥90% — real held-out text is the actual target, val is
+just a training-time proxy). If test falls short, iterate and fix rather than accepting a
+partial result — do not declare success at <100% test. If depth-2 reaches 100% test,
+extend to the full `srs_schedule` (7 spans, singles→pairs→full) as the next step — that's
+the actual multi-session spaced-repetition scaling test the vision doc is about.
+
+**Known practical constraint**: this run is markedly slower than any prior chat-tags run
+— L=902 (one sequence packs all 3 spans + their full IR chains) vs 322 for `iq_global_rw`,
+and attention cost scales roughly quadratically, so throughput dropped from ~20-25 it/s to
+~4.1 it/s (~5x slower per step). At 60k steps this is ~4 hours, not the ~50-75 min prior
+runs took — factor this into monitoring cadence and iteration turnaround time.
+
+### Scaling roadmap beyond depth-2 (`suratalfatihah` → `juz1` → full Quran)
+
+The test-file progression is deliberate, each step a real order-of-magnitude jump in
+corpus size — not just "bigger for its own sake," but the actual scaling axis this whole
+research program is about:
+
+| Stage | Test file | Approx. scale | What it stresses |
+|---|---|---|---|
+| Current (depth-2) | `datasets/suratalfatihah.txt` | 1 short surah | Can the SRS-tagged mechanism recall a real (not synthetic) short text at all, at 100% |
+| Next | `datasets/juz1.txt` | 1/30 of the Quran — much longer | Corpus size the depth-2 (3-span) schedule almost certainly can't cover — will need the full `srs_schedule` (singles→pairs→full, more spans) and likely more SLOT capacity or hierarchical chunking |
+| Then | `datasets/quran_uthmani.txt` | full Quran | The actual target scale for "SRS corpus ingestion" as originally envisioned in this doc's Core Idea — genuinely tests whether spaced-repetition scheduling prevents forgetting across a large, real corpus, not a toy one |
+
+**"Longer sequences need more diverse traj_mix and richer SRS" is the load-bearing
+constraint at each step of this progression, not a one-time fix**: `srs_schedule_depth2`
+(3 spans) is already close to its ceiling for `juz1`-scale input — a corpus that size
+needs the full `srs_schedule` (singles → pairs → full, more review spans) at minimum, and
+likely genuinely more SLOT capacity (`slot_len` growth) or the hierarchical/tree-memory
+direction already discussed (§ Fast-Weight Rank and Addressing, direction 3) once a flat
+SLOT block can no longer plausibly hold a corpus that size regardless of addressing
+quality. Each scale step should be treated as its own experiment with its own diagnosis,
+not assumed to inherit success automatically from the previous scale.
+
+**North star for every stage of this roadmap — feature parity with a backprop-trained LM,
+not just "high match% on a fixed eval set"**: the model should be able to **overfit** a
+given corpus (memorize it exactly, same as an overparameterized backprop LM would given
+enough capacity/steps — this is what "100% test match" is actually testing right now) AND
+**generalize** beyond exact memorization (perform sensibly on held-out text drawn from a
+similar distribution but never seen verbatim, the way a backprop LM generalizes from train
+to a broader distribution via learned statistical/algorithmic structure, not just
+verbatim recall). Every stage of this roadmap should be evaluated on both properties, not
+just the corpus-specific exact-match number — a model that only ever hits 100% on the
+exact text it was trained on, with no generalization signal, has only proven the
+"overfit" half of the goal. This is the standard the whole SRS/fast-weight research
+program is ultimately answerable to, per the Core Idea section at the top of this doc.
+
+**Known methodology gap, discovered while grounding this roadmap in real file sizes —
+must be fixed before "test=100%" is treated as a real pass**:
+`kvmem.train_hmn_chunk.load_chunks_padded` **truncates** each line-group to `chunk_len`
+bytes (`g[:chunk_len]`), it does not pad/cover the whole file. `datasets/suratalfatihah.txt`
+is 562 bytes across 6 lines; at the currently-running `n_chunks=4, chunk_len=16`, the test
+eval only actually exercises the **first 16 bytes of each of 4 line-groups = 64 bytes
+total** — the remaining ~498 bytes of the surah are silently dropped, never seen by
+`ar_decode_iq_global_rw_tagged` during test eval at all. A "test=100%" result from the
+currently-running depth-2 config would therefore only prove recall of a 64-byte truncated
+slice, **not the whole surah** — this does not meet the spirit of "real held-out text"
+testing and should not be reported as a full pass even if the raw number hits 100%.
+
+**Fix for the next iteration** (not applied to the already-running config, to avoid
+restarting mid-run): size `chunk_len` (or `n_chunks`) so the target file's full byte
+length fits within `n_chunks × chunk_len` — e.g. for a 562-byte `suratalfatihah.txt`,
+something like `n_chunks=4, chunk_len=140` (560 capacity) or growing `n_chunks` instead
+(preferred, since MDL_MODEL_SIZE.md's principle is that the per-chunk encoding algorithm
+is position-invariant and parameter count shouldn't need to grow with corpus size — more
+chunks, not bigger chunks, is the correct scaling axis, and is also what the SRS
+`schedule` mechanism is built to handle). This same truncation trap will recur at every
+step of the `juz1`/full-Quran roadmap above unless `n_chunks`/`chunk_len` sizing is
+explicitly checked against the real target file's byte length each time, not just copied
+forward from the previous stage's config.
+
+**Compute-cost reality check** (important before naively scaling `n_chunks`/`chunk_len`
+to "cover the whole file" in one leap): attention is O(L²), and L scales with total byte
+coverage in this architecture — dominated by the `(0, n_chunks)` full-span block, whose
+IQ+`n_refine`×IR turns each cost ~`total_bytes` of output. A literal "pad the whole
+562-byte surah to 1024 bytes via `n_chunks=4, chunk_len=256`" was computed and found
+**infeasible**: L jumps from 996 to 12,620, a **161x** compute-cost increase — 60k steps
+at that rate is ~27 days, not hours. Going from 64B→1024B coverage is only 16x more
+content but 161x more compute because both the sequence length AND the per-position
+attention cost grow with coverage simultaneously.
+
+### Stitching vs atomic full-span — pivot away from the nc8 scale-up
+
+`srs_depth2_nc4_slot8`'s live eval data (step 5000) directly answered "should stitching
+be the priority" before nc8 was even launched: the `span(0,4)` full-span block (one IQ+IR
+unit decoding all 64 bytes in a single shot) was the clear bottleneck on **every**
+sequence, val and test alike, even where both half-spans were near-perfect:
+
+```
+val/srs/span(0, 2)/MEAN   match=100.0%
+val/srs/span(2, 4)/MEAN   match=65.3%
+val/srs/span(0, 4)/MEAN   match=3.6%      <- full-span block, the weak link
+test/srs/span(0, 2)/MEAN  match=79.2%
+test/srs/span(2, 4)/MEAN  match=4.2%
+test/srs/span(0, 4)/MEAN  match=8.9%      <- full-span block, the weak link
+```
+
+**Diagnosis**: the atomic full-span block is a genuinely new, never-before-validated
+mechanism (a single IQ+IR unit outputting 56+ bytes) — nothing in this project's history
+(chat-tags, `iq_global_rw_ir_v2`, or any prior `hmn_feedback_*` result) has proven that
+works reliably. Meanwhile the half-spans reuse the already-proven 32B/24-byte-output IQ+IR
+unit. Doubling `n_chunks` (the queued `srs_depth2_nc8_slot8.py`) would only make the
+already-failing mechanism's output *longer* (112 bytes) — compounding the problem, not
+fixing it — while also being the config that drives the O(L²) compute wall above (the
+full-span block's output length scales with total corpus size, which is exactly why
+compute blows up quadratically with coverage).
+
+**Fix — stitching, not one bigger atomic block**: the `ir_local` track already solved
+"cover more content" a different way — chain several small, fixed-cost, already-proven
+32B windows via `ar_decode_chunk_fb_stitch_kv`'s mechanism: each later window's warmup is
+seeded from the *previous* window's own just-decoded output (valid because `warmup_len=8`
+always fits inside the 50%-overlap between adjacent windows, `stride=16B` at
+`window=32B`). No single decode step ever has to produce more than ~24-32 bytes,
+regardless of total corpus length — so total compute scales roughly **linearly** with
+corpus length (more windows chained, each fixed-cost) instead of quadratically (one
+block whose own output grows with corpus length). This is also the right shape for the
+`juz1`/full-Quran roadmap above, whose growth rule (`n_windows = (src_len-32)/16 + 1`) is
+linear by construction.
+
+**Implemented**: `experiments/srs_tagged/stitch_decode.py` (`ar_decode_srs_stitched_tagged`)
+— adapts `ar_decode_chunk_fb_stitch_kv`'s chaining logic to the tag-wrapped SRS layout, no
+new position-builder code needed (`chunk_positions_srs_tagged` already accepts an
+arbitrary `schedule`; the stitched config just passes overlapping windows
+`[(0,2),(1,3),(2,4)]` — the exact `ir_local` window geometry — instead of
+`srs_schedule_depth2`'s disjoint halves+full-span). `experiments/srs_tagged/train.py`
+gained two small, backward-compatible additions: a `windows` curriculum-stage key that
+overrides the depth-based schedule generator, and `eval_mode='stitch'` that switches eval
+from per-span GT-seeded decode to the chained stitch decode (reports a `STITCHED_MEAN`
+row = match% against the fully-chained reconstructed source). Smoke-tested: causal mask
+confirmed, cross-window nochain (Rule 3b) confirmed intact under the new overlapping
+schedule, end-to-end training+eval loop runs clean.
+
+**`srs_depth2_nc4_slot8` final result (60k steps, complete)**: val 100%/100%/100% (span(0,2)/span(2,4)/span(0,4)), test 100%/100%/**69.6%**. Under the strict pass bar ("run only passes if test match is 100%"), this is a **fail** — the atomic full-span block never reached 100% on held-out real text even after val saturated at 100% and stayed there for the final 20k+ steps (loss dropped to ~0.01, fully converged). The gap is a genuine val/test generalization failure specific to the full-span mechanism, not undertraining: both half-spans hit 100%/100% on val AND test throughout. This is the clean confirmation baseline the stitching pivot was waiting on — **launched `srs_stitch_nc4_slot8.py`** immediately after, warm-started from `stage0_best.pt`.
+
+**Revised queue**: `srs_depth2_nc8_slot8.py` marked **SUPERSEDED, do not launch** (kept
+for the record, not deleted). Next run after `srs_depth2_nc4_slot8` finishes is
+`experiments/srs_tagged/configs/srs_stitch_nc4_slot8.py` — same 64B/nc=4/slot_len=8 scale,
+warm-started from `srs_depth2_nc4_slot8`'s best checkpoint, success bar `STITCHED_MEAN`
+≥90% val AND test (directly comparable to the atomic block's 3.6%/8.9% at step 5000).
+Only once stitching is validated at 64B does the queue return to scaling coverage — and
+the correct next scale-up step becomes **more chained windows** (nc=8 → windows
+`[(0,2),(1,3),...,(6,8)]`, 7 windows), not a single bigger atomic block — restoring the
+"128B coverage" milestone but via the stitched mechanism instead of `nc8_slot8`'s atomic
+one.
+
+**Results, `srs_stitch_nc4_slot8` (warm-started from `srs_depth2_nc4_slot8`'s
+`stage0_best.pt`, complete, all 60000 steps)**: reached `STITCHED_MEAN`=100% val AND 100%
+test by step 15000, hit a **perfect sweep** by step 35000 (every individual span
+(0,2)/(1,3)/(2,4) and the chained `STITCHED_MEAN` at 100.0% on both val and test
+simultaneously), and **held that perfect sweep through every remaining checkpoint to the
+final step 60000** (loss 0.0001). This clears — and holds — the strict 100%-test bar that
+the atomic run (`srs_depth2_nc4_slot8`, final test span(0,4)=69.6%, never reached 100% at
+any checkpoint) failed. Directly confirms the diagnosis above: chaining several small,
+already-proven windows generalizes to held-out real text where one large atomic
+single-shot block does not, even measuring the exact same "recall the full 64B sequence"
+capability. (Some early-training oscillation observed between steps 5000-25000 — test
+dipping to 41.7-75% on individual checkpoints before recovering — same cosine-restart
+volatility pattern documented elsewhere in this doc; did not recur once past step 25000,
+30000+ steps of sustained 100%/100%.) Training was also faster per-step (~5.9 it/s vs
+~4.1 it/s for the atomic run) since the stitched layout's packed sequence is shorter
+(`L=742` vs `L=902` — no 56-byte atomic full-span block to fit).
+
+**Stitching vs atomic — verdict: stitching wins outright.** Same scale (64B), same
+warm-start, same step budget, strictly better result (100% sustained vs 69.6% ceiling),
+faster per-step. No tradeoff found in this comparison — stitching should be the default
+mechanism for all further scale-up, not an alternative to weigh against atomic blocks.
+
+### Is `juz1.txt` scaling ready? No — concrete gaps, not just "more steps"
+
+Asked directly after the stitch result above. The honest answer is no, even though 64B
+stitching just passed the strict bar. `datasets/juz1.txt` is 44,443 bytes — about **700x**
+the validated 64B scale — and three specific mechanisms would break before getting there,
+not just "need more training time":
+
+1. **Window-identity tags are hardcoded to 3.** `_SRS_SPAN_TAGS` in
+   `experiments/chat_tags/positions.py` defines exactly 3 window tags
+   (`<query_a/b/c>`), and `chunk_positions_srs_tagged` raises `ValueError` if the
+   schedule has more spans than that. `juz1` at the proven `chunk_len=16`/`window=32B`/
+   `stride=16B` geometry needs `(44443-32)/16+1 ≈ 2778` overlapping windows — nowhere
+   near 3. A per-window unique tag doesn't scale to thousands of windows regardless
+   (vocab would need to grow by one ID per window); the tag scheme needs to become
+   window-index-agnostic before any real scale-up.
+
+2. **Whole-schedule-in-one-sequence training doesn't scale to that window count.**
+   Every SRS run so far (`srs_depth2_*`, `srs_stitch_nc4_slot8`) packs the *entire*
+   schedule — all windows plus their full IR chains — into ONE training sequence
+   (`L=742`-`902` for 3 windows). Thousands of windows can't be packed into one
+   context window; this needs to become genuine streaming/epoch-style corpus ingestion
+   (sample a random window or short chain per training step, not "the whole book visible
+   in one forward pass") — this is exactly what `§ Scaling — Corpus Ingestion Recipe`
+   above already specifies, but it has never actually been implemented; every SRS
+   experiment run to date has used the simpler whole-schedule-packed design instead.
+
+3. **No intermediate validation step yet.** Every stitching result so far is 3 windows.
+   Jumping straight to ~2778 windows would conflate "does chaining generalize at all
+   beyond 3 windows" with "does it generalize at scale" — if it fails, there'd be no way
+   to tell which assumption broke.
+
+**Recommended order before `juz1`**: (a) redesign window-tagging to not require one
+unique ID per window (drop per-window tags entirely and rely on stitching + RoPE
+position alone — this is the more principled fix, since position-invariant encoding is
+already this project's stated MDL goal; or fall back to a small fixed set of *relative*
+tags reused cyclically across windows), (b) implement the streaming/epoch corpus-ingestion
+training loop from `§ Scaling — Corpus Ingestion Recipe` (a real architecture change to
+`experiments/srs_tagged/train.py`, not a config tweak), (c) validate at an intermediate
+scale with many chained windows (e.g. 128B-256B, 7-15 windows) using the new training
+loop before attempting `juz1`'s ~2778. Treat `juz1` as 2-3 design steps away, not a
+next-config-launch away.
+
+**Step (c) started** (still whole-schedule-packed design, not yet the streaming loop —
+picked as the lowest-risk next autonomous step, since it only requires extending
+`_SRS_SPAN_TAGS` from 3 to 7 entries, not the harder streaming-training rewrite):
+`experiments/srs_tagged/configs/srs_stitch_nc8_slot8.py` — 128B coverage via 7 chained
+windows `[(0,2),(1,3),...,(6,8)]` (same stitching mechanism as the 64B win, just more
+windows), added `HMN_QUERY_D..G` tags (`vocab.py`, `HMN_TAG_VOCAB_SIZE_V3=290`) and
+extended `_SRS_SPAN_TAGS` to 7. Smoke-tested (10-step run + warm-start-with-vocab-growth
+both confirmed working, `special_embed.weight` grows 26->34 rows automatically). Warm-
+started from `srs_stitch_nc4_slot8`'s `stage0_best.pt`. `L=1694` (vs 742 for 3 windows);
+estimated ~1.1-1.3 it/s, ~13-15hr for 60k steps. Launched 2026-07-10 08:48 local.
+
+**`srs_stitch_nc8_slot8` final result (60k steps, complete)**: val 100%×6 windows +
+window G (last) stuck at **4.2%** (STITCHED_MEAN 80.8%); test even weaker (100/100/
+16.7/8.3/4.2/0/33.3, STITCHED_MEAN 38.3%). **Fails the strict 100%-test bar** — unlike
+the clean 64B win, this run also shows real test degradation on the MIDDLE windows
+(C-F), not just window G, a broader val/test generalization gap at this larger scale.
+
+**Diagnosis (qualitative decode inspection)**: window G's own IQ->IR1->IR2 chain shows
+IQ=0% (expected, IQ alone is a rough guess) -> **IR1=100%** (fully recovers) ->
+**IR2=4.2%** (collapses back to near-total failure). This is the "IR2 destroys IR1's
+gain" pathology documented elsewhere in this project (`down_counter`, 64B scale) —
+`wrong_token_weight` only upweights loss where the fed-back argmax was WRONG; it does
+nothing to protect already-correct positions from being overwritten by IR2's transform.
+Root cause specific to this run: window G only becomes reliably correct at IR1 very
+late in the single 60k-step cosine cycle (after windows A-F, which converge earlier,
+absorb most of the LR budget) — by the time IR1 is reliable for G, LR has decayed to
+~1e-6, leaving no gradient room to teach IR2 "leave this alone" in that regime. Windows
+A-F didn't hit this because they became reliably correct while LR was still high.
+
+**Fix launched**: `experiments/srs_tagged/configs/srs_stitch_nc8_slot8_continue.py` —
+warm-started from `stage0_end.pt`, fresh short cosine cycle (`cosine_T0=20000`,
+`lr_max=5e-5`, lower peak than the original 1.5e-4) to give the model renewed gradient
+signal specifically in the "IR1 already correct" regime window G only reached at the
+very end of the prior run. If this doesn't resolve window G within 20k steps, the next
+fix is oversampling window G specifically — not attempted first since the current
+single-fixed-schedule design has no traj_mix/weighted-sampling machinery (restructuring
+that is a bigger change than this LR-based attempt). Launched 2026-07-10 21:33 local.
 
 ---
 

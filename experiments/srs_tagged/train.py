@@ -43,6 +43,7 @@ from kvmem.utils import make_test_sequences
 from experiments.chat_tags.vocab import HMN_TAG_VOCAB_SIZE_V2
 from experiments.chat_tags.positions import chunk_positions_srs_tagged
 from experiments.chat_tags.batch import make_batch_tagged, _fill_argmax_fb, ar_decode_iq_global_rw_tagged
+from experiments.srs_tagged.stitch_decode import ar_decode_srs_stitched_tagged
 
 
 def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
@@ -117,8 +118,17 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         n_steps    = stage.get('n_steps', 60000)
         stage_eval_every = stage.get('eval_every', 5000)
         ls_max     = hp.get('ls_max', 0.0)
+        eval_mode  = stage.get('eval_mode', 'per_span')  # 'per_span' (GT-seeded, atomic) or 'stitch' (chained)
 
-        schedule = srs_schedule_depth2(n_chunks) if depth == 2 else srs_schedule(n_chunks)
+        # 'windows' overrides the depth-based srs_schedule/srs_schedule_depth2
+        # generator with an explicit (possibly overlapping) window list — used
+        # by the stitched track (see docs/SRS_RECIPE.md "Stitching vs atomic
+        # full-span"). Falls back to the original depth-based schedules
+        # unchanged when absent.
+        if 'windows' in stage:
+            schedule = stage['windows']
+        else:
+            schedule = srs_schedule_depth2(n_chunks) if depth == 2 else srs_schedule(n_chunks)
         built = chunk_positions_srs_tagged(n_chunks, chunk_len, slot_len, warmup_len,
                                            schedule, n_refine=n_refine)
         pos_content, pos_mask, tags, L = (built['pos_content'], built['pos_mask'],
@@ -228,14 +238,21 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
                 def _eval_on(seqs_iter, tag_prefix):
                     span_means = {span: [] for span in schedule}
+                    stitched_means = []
                     for sname, chunks_arr in seqs_iter:
-                        r = ar_decode_iq_global_rw_tagged(model, chunks_arr, slot_len, slot_count,
-                                                          mask_np, pos_content, tags, device,
-                                                          warmup_offset=0)
+                        if eval_mode == 'stitch':
+                            r = ar_decode_srs_stitched_tagged(model, chunks_arr, slot_len, slot_count,
+                                                              mask_np, pos_content, tags, device)
+                            stitched_means.append(r['match_pct'])
+                        else:
+                            r = ar_decode_iq_global_rw_tagged(model, chunks_arr, slot_len, slot_count,
+                                                              mask_np, pos_content, tags, device,
+                                                              warmup_offset=0)
                         for span in schedule:
                             idx = span_last_idx[span]
                             span_means[span].append(r['turn_match_pcts'][idx])
-                        _log(f'  {tag_prefix}/{sname:<15} per-span={[round(r["turn_match_pcts"][span_last_idx[s]],1) for s in schedule]}')
+                        tail = f'  stitched={r["match_pct"]:.1f}%' if eval_mode == 'stitch' else ''
+                        _log(f'  {tag_prefix}/{sname:<15} per-span={[round(r["turn_match_pcts"][span_last_idx[s]],1) for s in schedule]}{tail}')
                     means = []
                     for span in schedule:
                         m_ = sum(span_means[span]) / len(span_means[span])
@@ -243,6 +260,10 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         _log(f'  {tag_prefix}/span{span}/MEAN               match={m_:.1f}%')
                     overall = sum(means) / len(means)
                     _log(f'  {tag_prefix}/MEAN               match={overall:.1f}%')
+                    if eval_mode == 'stitch':
+                        stitched_overall = sum(stitched_means) / len(stitched_means)
+                        _log(f'  {tag_prefix}/STITCHED_MEAN               match={stitched_overall:.1f}%')
+                        return stitched_overall
                     return overall
 
                 val_iter = ((sname, np.array([seq[k*chunk_len:(k+1)*chunk_len] for k in range(n_chunks)], np.int64))

@@ -30,6 +30,10 @@ from experiments.chat_tags.vocab import (
     HMN_QUERY_A_OPEN, HMN_QUERY_A_CLOSE,
     HMN_QUERY_B_OPEN, HMN_QUERY_B_CLOSE,
     HMN_QUERY_C_OPEN, HMN_QUERY_C_CLOSE,
+    HMN_QUERY_D_OPEN, HMN_QUERY_D_CLOSE,
+    HMN_QUERY_E_OPEN, HMN_QUERY_E_CLOSE,
+    HMN_QUERY_F_OPEN, HMN_QUERY_F_CLOSE,
+    HMN_QUERY_G_OPEN, HMN_QUERY_G_CLOSE,
 )
 
 
@@ -148,13 +152,16 @@ def chunk_positions_iq_global_rw_tagged(n_chunks: int, chunk_len: int, slot_len:
 
 # Query tags assigned by POSITION IN THE SCHEDULE (not by byte offset — SRS spans
 # aren't keyed by a fixed X the way iq_global_rw's 3 canonical windows are).
-# srs_schedule_depth2(n) always yields exactly 3 spans, so this covers the first
-# SRS experiment with zero new vocab. A 7-span full srs_schedule(4) would need
-# 4 more tags — not yet defined, deferred to a follow-up once depth-2 is validated.
+# srs_schedule_depth2(4) and the 3-window stitch schedule both use A/B/C. Extended
+# to 7 (D-G added) for the stitched nc=8 schedule (windows (0,2)..(6,8)).
 _SRS_SPAN_TAGS = [
     (HMN_QUERY_A_OPEN, HMN_QUERY_A_CLOSE),
     (HMN_QUERY_B_OPEN, HMN_QUERY_B_CLOSE),
     (HMN_QUERY_C_OPEN, HMN_QUERY_C_CLOSE),
+    (HMN_QUERY_D_OPEN, HMN_QUERY_D_CLOSE),
+    (HMN_QUERY_E_OPEN, HMN_QUERY_E_CLOSE),
+    (HMN_QUERY_F_OPEN, HMN_QUERY_F_CLOSE),
+    (HMN_QUERY_G_OPEN, HMN_QUERY_G_CLOSE),
 ]
 
 
