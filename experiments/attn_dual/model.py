@@ -36,7 +36,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.utils.checkpoint import checkpoint as _ckpt
+
 from kvmem.model import MHAttention, _make_norm, rope_freqs, yarn_freqs
+
+
+def _attn_sublayer(attn, norm, x, mask):
+    return x + attn(norm(x), mask)
 
 
 class DualAttnBlock(nn.Module):
@@ -55,9 +61,18 @@ class DualAttnBlock(nn.Module):
                                  null_kv=null_kv, qk_norm=qk_norm,
                                  logit_cap=logit_cap, attn_temp=attn_temp)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn1(self.norm1(x), mask)
-        x = x + self.attn2(self.norm2(x), mask)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor,
+                ckpt_attn: bool = False) -> torch.Tensor:
+        # ckpt_attn: checkpoint EACH attn sublayer individually (finer-grained
+        # than DualAttnModel's own per-block checkpointing option below) — lets
+        # "checkpoint each self-attn" be tested as its own granularity, per the
+        # question of whether finer or coarser checkpointing is faster on MPS.
+        if ckpt_attn and self.training:
+            x = _ckpt(_attn_sublayer, self.attn1, self.norm1, x, mask, use_reentrant=False)
+            x = _ckpt(_attn_sublayer, self.attn2, self.norm2, x, mask, use_reentrant=False)
+        else:
+            x = _attn_sublayer(self.attn1, self.norm1, x, mask)
+            x = _attn_sublayer(self.attn2, self.norm2, x, mask)
         return x
 
 
@@ -82,8 +97,18 @@ class DualAttnModel(nn.Module):
                  rope: bool = False, yarn: bool = False,
                  L_train: int = 512, L_max: int = 4096,
                  null_kv: bool = False, V_out: int = 256,
-                 rmsnorm: bool = False):
+                 rmsnorm: bool = False, grad_checkpoint: str | None = None):
+        """
+        grad_checkpoint: None (default, off) | 'block' (checkpoint each
+        DualAttnBlock as a whole, matching KVMemModel's granularity) | 'attn'
+        (checkpoint each attn1/attn2 sublayer individually — finer-grained,
+        see DualAttnBlock.forward's ckpt_attn). Speed comparison between the
+        two granularities (and off) is the open question this flag exists to
+        let us measure empirically rather than guess.
+        """
         super().__init__()
+        assert grad_checkpoint in (None, 'block', 'attn')
+        self.grad_checkpoint = grad_checkpoint
         n_special          = V - 256
         self.data_embed    = nn.Embedding(256, d)
         self.special_embed = nn.Embedding(n_special, d)
@@ -130,7 +155,12 @@ class DualAttnModel(nn.Module):
             tokens = tokens.unsqueeze(0)
         x = self._embed(tokens)
         for block in self.blocks:
-            x = block(x, mask)
+            if self.grad_checkpoint == 'block' and self.training:
+                x = _ckpt(block, x, mask, use_reentrant=False)
+            elif self.grad_checkpoint == 'attn':
+                x = block(x, mask, ckpt_attn=True)
+            else:
+                x = block(x, mask)
         h_out  = self.norm_out(x)
         logits = self.W_out(h_out)
         if not batched:
@@ -146,7 +176,8 @@ def build_dualattn_model(hp: dict, device=None) -> DualAttnModel:
     model = DualAttnModel(V=V_in, d=hp['d'], n_layers=hp['n_layers'],
                           n_heads=hp['n_heads'], rope=hp.get('rope', True),
                           yarn=hp.get('yarn', True), null_kv=hp.get('null_kv', True),
-                          V_out=hp.get('V_out', 256), rmsnorm=hp.get('rmsnorm', False))
+                          V_out=hp.get('V_out', 256), rmsnorm=hp.get('rmsnorm', False),
+                          grad_checkpoint=hp.get('grad_checkpoint', None))
     if device is not None:
         model = model.to(device)
     # Chunked attention (memory only, not a FLOP reduction — see kvmem/model.py's

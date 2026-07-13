@@ -600,6 +600,140 @@ The train/test gap closes as:
 
 ---
 
+## Chain memory — bounded, persistent, resumable SLOT state across windows
+
+**The gap this addresses**: every window currently produces an INDEPENDENT, throwaway
+SLOT — `nochain` (Rule 3b) deliberately prevents any cross-window sharing, and nothing
+persists once a window's own decode finishes. This is the opposite of the original SRS
+vision (accumulating fast-weight memory that survives across sessions, savable and
+resumable) — current windows are stateless, one-shot recall units, not a true
+persistent memory. Real SRS requires the last `N` SLOT KV positions to hold ACTUAL
+accumulated weights that can be checkpointed and continued, not independent per-window
+scratch space.
+
+**Design: `CHAIN_SLOT` (bounded size `M in {1, 2, 4}`)**. For window `i`, add two new
+blocks around the existing IQ/IR structure:
+
+```
+[CHAIN_SLOT_in: M tokens]   <- read-only; window 0 = learned init, window i>0 = window i-1's CHAIN_SLOT_out
+[chunk_i, chunk_i+1: raw bytes + local enc SLOTs]   <- unchanged
+[IQ: window SLOT | warmup | output]                <- NEW: also reads CHAIN_SLOT_in
+[IR1, IR2: same, refine]                             <- unchanged internal mechanism
+[CHAIN_SLOT_out: M tokens]  <- NEW; consolidates CHAIN_SLOT_in + this window's own IR2 SLOT_B into a fresh M-token summary
+```
+
+**Masking changes** (the only real changes needed to `chunk_mask_fb`): (1) window `i`'s
+`IQ SLOT` gets a narrow exception to Rule 3 — allowed to attend to `CHAIN_SLOT_in`
+(not raw bytes, preserving the compression bottleneck); (2) `CHAIN_SLOT_out` attends to
+`CHAIN_SLOT_in` + this window's own final `SLOT_B` (not raw bytes — consolidates from
+already-compressed representations, same bottleneck principle one level up). `nochain`
+stays exactly as-is for everything else — windows still can't read each other's raw
+content, only through this one deliberately narrow `CHAIN_SLOT` pipe.
+
+**Save/resume reuses existing infrastructure**: `kvmem/model.py`'s `h_inject` parameter
+(`dict` mapping `(sl0, sl1) -> (B, slot_len, d)` tensor, overrides the embedding at
+specific positions before the transformer blocks run — currently used for
+"diff-residual inference," injecting an accumulated correction state at each turn) is
+exactly the right primitive. Serialize the previous session's `CHAIN_SLOT_out`
+residual-stream values to disk; on resume, `h_inject` them at the new sequence's
+`CHAIN_SLOT_in` position instead of a learned/random embedding. No new save/load
+mechanism needed.
+
+**Training: bounded BPTT + gradient-stopped carry across steps**. Full backprop through
+hundreds of windows isn't feasible (same `L`-blowup problem as the packed-whole-
+schedule design that `juz1`'s streaming-loop redesign already addresses). Recommend:
+chain 3-4 windows with FULL gradient flow within one packed training example (short
+enough to stay at the already-proven `L` scale), and DETACH `CHAIN_SLOT_in` from the
+graph when carried in from a PREVIOUS training step's output — truncated BPTT, the same
+"gradient-stopped hidden state" idea flagged as a Tier-2 fallback in the `juz1`
+discussion, now with a concrete architectural home instead of staying deferred.
+
+**Warm-starting from current checkpoints**: per-chunk encoding, per-window IQ/IR, and
+`argmax`-refinement machinery are all UNCHANGED — only `CHAIN_SLOT_in`'s read path and
+`CHAIN_SLOT_out`'s write path are new. Warm-starting from e.g. `dualattn_nc4_slot8_ir`
+or the nc8 run works the same way vocab growth already worked for the window D-G tags
+this session: copy every matching-shape tensor directly, only the new
+`CHAIN_SLOT`-specific token embeddings start randomly initialized — no need to relearn
+per-chunk compression or per-window recall from scratch, only the new consolidation
+pathway.
+
+**Scope**: real new architecture work (mask changes, position-builder changes, a
+save/resume harness) — not a config tweak. Queued as the next design phase after the
+current `dualattn_nc8_slot8_ir` window-G run and the grad-checkpoint speed test finish,
+same "don't start until the prerequisite is settled" discipline used for `juz1`.
+
+**Queued validation test once implemented — full-source recovery via the last window's
+IQ round.** Confirmed by direct mask inspection: IQ SLOT rows are NOT blocked from the
+encoding SLOTs of any chunk — only from raw chunk bytes and from other windows'
+rec_block content. This means every window's IQ SLOT already has unblocked visibility
+into ALL 8 chunks' compressed encodings, not just its own window's relevant 2 — a
+pre-existing capability that's currently unexploited (nothing in training pushes the
+model to use chunks outside its own window, since the loss only rewards recalling its
+own local span). Combined with `CHAIN_SLOT`'s accumulated history, this creates a
+genuinely new test the old atomic full-span approach never had access to: **once
+`CHAIN_SLOT` is implemented, test whether the LAST window's IQ round — given
+`CHAIN_SLOT_in` (accumulated from every preceding window) plus its own pre-existing
+global visibility into all 8 encoding SLOTs — can fully recover the ENTIRE original
+source sequence in one IQ pass**, not just its own local 32-byte span. This is a
+different mechanism from the FAILED atomic full-span run (`srs_depth2_nc4_slot8`, val
+100%/test 69.6%) — that run had no chain-memory and no training signal ever rewarding
+whole-source recall from a single IQ turn; this test specifically exploits (a) global
+encoding-SLOT visibility that already exists architecturally and (b) `CHAIN_SLOT`'s
+genuine accumulated state, neither of which the atomic run had. If this works, it would
+be a much cheaper full-sequence recovery path than chaining through every individual
+window's warmup-seeded decode — worth testing as soon as `CHAIN_SLOT` exists, before
+assuming stitching-through-every-window is the only way to reconstruct a full corpus.
+
+### Sparse block-attention memory bank — trading memory for multiple IQ+IR forward rounds
+
+**Motivation**: a single bounded `CHAIN_SLOT` (`M` tokens) forces EVERYTHING accumulated
+so far through one tiny bottleneck — increasingly lossy as the corpus grows. A MEMORY
+BANK of `K` blocks x `M` tokens gives more retained capacity, but dense attention over
+the whole bank in one shot defeats the point of "bounded" and costs `O(K*M)` per call.
+
+**Design: unify IQ and IR into `K` sparse rounds, each touching one block.** Instead of
+`[IQ: dense read of everything] -> [IR1: refine] -> [IR2: refine]`, generalize to:
+
+```
+[Round 1 (was "IQ"): read memory block 1 only]
+[Round 2: read memory block 2 + argmax from round 1, refine]
+[Round 3: read memory block 3 + argmax from round 2, refine]
+...
+[Round K: read memory block K (or a coarsened/summarized older block) + argmax from round K-1, refine]
+```
+
+This collapses "IQ" and "IR" into the SAME mechanism — round 1 is structurally just an
+IR-style block with no incoming `argmax` (or a zero/placeholder one); every subsequent
+round (whether conceptually "still building the initial guess" or "refining") uses the
+identical block structure, differing ONLY in which memory-bank block each round is
+allowed to attend to. Both the initial recall (formerly one-shot "IQ") and the
+refinement (formerly "IR") become the same multi-round sparse-access primitive.
+
+**Reuses already-built infrastructure — `ir_slot_window`.** This is exactly what
+`ir_slot_window` (built earlier this session for a different stated purpose — within-
+window IR turn visibility) already controls: "how many prior turns' SLOT tokens can
+this round see." Reinterpreting "turn" as "memory-bank block" makes it directly
+applicable — `ir_slot_window=1` gives each round visibility into ONLY the current
+block, the sparse one-block-at-a-time access pattern, no new masking code needed beyond
+what already exists.
+
+**Tradeoff, quantified — same total compute, lower peak memory.** `K` rounds x `M`
+tokens/block ~ same TOTAL attention work as one dense pass over `K*M` tokens, but PEAK
+per-round cost is bounded by `O(M)` (one block), not `O(K*M)` (the whole bank) —
+directly analogous to `chunk_attn`'s trick (compute in row-chunks, not all at once),
+applied at the granularity of "which memory block is visible this round" instead of
+"which query rows are computed this batch."
+
+**Does this break the 2-forward-pass training trick? No.** If all `K` rounds for one
+window are packed into one sequence (same as today's `IQ+IR1+IR2` packing), the same
+causal-masking-parallelism argument holds: each round's own output only depends on
+strictly earlier context (its own sparse block + its predecessor's argmax, itself
+already correctly computed in pass 1). Still exactly 2 total forward passes per
+training step, regardless of `K` — whether `K=2` for one window or `K=20` for a deep
+memory-bank walk. The "argmax chain is always exactly one-round-behind, resolvable in
+one parallel sweep" property is unaffected by WHICH content each round attends to, only
+by the ORDER dependencies between rounds, which stay linear either way.
+
 ## `ir_slot_window` — controllable within-window SLOT recurrence depth
 
 **Question that prompted this**: is there a parameter controlling how much a memory
@@ -1101,12 +1235,36 @@ next-config-launch away.
 ### Concrete `juz1.txt` scaling design — data/capacity check, block sizing, candidate traj_mix strategies
 
 **Data check**: `datasets/juz1.txt` = 44,443 bytes (`wc -c`, confirmed). At the proven
-`chunk_len=16`, that needs `ceil(44443/16) = 2778` chunks minimum. Rounding to the
-nearest clean multiple of 128 (as requested — prefer power-of-2/nice-multiple sizing):
-**`n_chunks=2816` (128x22) = 45,056 bytes, only 613B (1.4%) padding** — clearly better
-than the nearest true power of 2 (`4096` chunks = 65,536B = 47.5% padding, wasteful) or
-under-covering (`2048` chunks = 32,768B, doesn't cover the file at all). Recommend
-**`n_chunks=2816`** as the padded target.
+`chunk_len=16`, that needs `ceil(44443/16) = 2778` chunks minimum.
+
+**REVISED — switched from `n_chunks=2816` (128-multiple) to `n_chunks=4096` (true
+power of 2, `65,536` bytes padded)**, superseding the original recommendation below.
+Rationale for the switch: `2816 = 2^8 x 11` is a clean multiple of 128 but NOT a power
+of 2 (the `11` factor breaks it) — every OTHER hyperparameter in this design
+(`chunk_len=16=2^4`, `window=32=2^5`, `stride=16=2^4`, `slot_len=8=2^3`, `block_nc=8=2^3`)
+is already a clean power of 2, so `2816` was the one inconsistent number. Switching to
+`n_chunks=4096=2^12` makes the ENTIRE hyperparameter set power-of-2, and — importantly —
+this exactly matches the `65,536`-byte "Worked example" already built out below
+(585 sequential blocks, two-phase bootstrap+SRS-review protocol) — adopting `4096` here
+means that worked example simply IS the juz1 plan, rather than two inconsistent designs
+that need reconciling. **Cost of the switch**: padding grows from 613B (1.4%) to
+21,093B (47.5%) — the true content is still only 44,443 bytes, so ~47.5% of trained
+chunks are padding with no real recall target. This is a real efficiency cost (extra
+blocks/steps spent on content that doesn't matter), but it's bounded and linear (not a
+new scaling risk) — roughly 1.475x more blocks/steps than the byte-count alone would
+require, not a different order of magnitude. **Scoring must exclude padding**: eval
+match% should be computed only over the true `44,443` bytes (same `valid_mask`
+convention `ar_decode_chunk_fb_stitch_kv`/`load_chunks_padded` already use elsewhere in
+this project) — the padded region should never be required to hit the "100% match"
+bar, since it holds no real content to recall. Original `n_chunks=2816` reasoning kept
+below for the record, since it's still the better choice on padding-efficiency grounds
+alone if hyperparameter-elegance weren't a factor.
+
+**Original `n_chunks=2816` recommendation (superseded above, kept for the record)**:
+rounding to the nearest clean multiple of 128 gives `n_chunks=2816` (128x22) =
+45,056 bytes, only 613B (1.4%) padding — better than the nearest true power of 2
+(`4096` chunks = 65,536B = 47.5% padding) on efficiency grounds alone, or under-covering
+(`2048` chunks = 32,768B, doesn't cover the file at all).
 
 **Capacity check**: current models are 166k-232k params (`d=64, n_layers=4`). Per this
 project's own MDL principle (`docs/MDL_MODEL_SIZE.md`: parameter count should scale with
@@ -1114,13 +1272,13 @@ project's own MDL principle (`docs/MDL_MODEL_SIZE.md`: parameter count should sc
 with no architecture change), **no model-size growth is expected to be needed for
 juz1** — this is a scaling-the-training-loop problem, not a scaling-the-model problem.
 
-**Why the CURRENT training/eval design cannot reach 2816 chunks — the actual blocker,
+**Why the CURRENT training/eval design cannot reach 4096 chunks — the actual blocker,
 quantified**: every run so far (`srs_stitch_nc4_slot8`, `srs_stitch_nc8_slot8`, ...)
 packs the ENTIRE window schedule into one sequence sharing one `L x L` mask. At
-`n_chunks=2816` with the proven window geometry (`window=32B, stride=16B`), that's
-`n_windows = 2816 - 2 + 1 = 2815` windows, each contributing an IQ + 2 IR block
+`n_chunks=4096` with the proven window geometry (`window=32B, stride=16B`), that's
+`n_windows = 4096 - 2 + 1 = 4095` windows, each contributing an IQ + 2 IR block
 (~530-650 tokens/window with tags at `slot_len=8`) — extrapolating the observed
-`L=902 (nc=4) -> L=1694 (nc=8)` growth rate, `L` at `nc=2816` would land somewhere in
+`L=902 (nc=4) -> L=1694 (nc=8)` growth rate, `L` at `nc=4096` would land somewhere in
 the **hundreds of thousands of tokens**. The `L x L` mask ALONE (a numpy bool array)
 would need `(3-6x10^5)^2` ~ `10^11` entries — tens to hundreds of GB just to hold the
 mask, before any model computation. **Both training AND eval (the full stitched decode)
@@ -1134,23 +1292,24 @@ memory, the FLOP cost and the mask itself are still full `O(L^2)`, unchanged.
 eval should operate on a small, FIXED-SIZE local window run (matching an already-proven
 or near-proven scale — recommend **`block_nc=8` chunks, 7 windows, `L=1694`**, same as
 the current `srs_stitch_nc8_slot8` config) sampled from a random starting offset within
-the padded 2816-chunk corpus, rather than ever building one packed sequence for the
+the padded 4096-chunk corpus, rather than ever building one packed sequence for the
 whole corpus. This is a genuine architecture change to the training loop (not a config
 tweak) but does NOT require gradient checkpointing or multi-segment forward passes for
 TRAINING — because each step's `L` is bounded by `block_nc`, not by corpus length,
 total per-step compute stays flat regardless of how large the corpus grows; only the
-NUMBER of steps needed to cover it grows. `2816 - 8 + 1 = 2809` valid starting offsets
+NUMBER of steps needed to cover it grows. `4096 - 8 + 1 = 4089` valid starting offsets
 give plenty of sampling diversity.
 
-**Eval DOES need the "several forward passes" approach** the same way: chain
-`ceil(2809 / 7) ~ 402` independent local-block decodes end-to-end, each one a normal
+**Eval DOES need the "several forward passes" approach** the same way: chain **585**
+independent local-block decodes end-to-end (matching the "Worked example" below exactly
+— `n_blocks` stepping by `block_nc-1=7` chunks with 1-chunk overlap), each one a normal
 `ar_decode_srs_stitched_tagged`-style call over its own small `L=1694` mask, with block
 `i+1`'s first window's warmup seeded from block `i`'s own last decoded output bytes —
 literally the same warmup-seeded stitching mechanism already proven WITHIN one block,
 just extended ACROSS block boundaries too (no new mechanism, only a change in what
 counts as "one call" — currently one call chains 3 or 7 windows; the juz1 version chains
-~2815 windows across ~402 calls). Cheap: each block decode takes on the order of seconds;
-~402 of them sequentially is plausibly a 20-40 minute full end-to-end check, well within
+~4095 windows across 585 calls). Cheap: each block decode takes on the order of seconds;
+~585 of them sequentially is plausibly a 20-40 minute full end-to-end check, well within
 a single monitoring cycle — feasible to run periodically, not just once at the very end.
 
 **Four candidate traj_mix / training strategies** (in increasing sophistication —
@@ -1169,7 +1328,7 @@ recommend prototyping in this order):
 2. **SRS-weighted resampling (the actual point of this whole research program)**:
    maintain a per-block retention/difficulty score (e.g. an EMA of that block's own
    recent eval match%, from a periodic sub-sampled eval sweep — can't afford to eval
-   all 2809 blocks every `eval_every` cycle, so randomly eval e.g. 20-50 blocks each
+   all 4089 valid offsets every `eval_every` cycle, so randomly eval e.g. 20-50 blocks each
    cycle and use that to update scores), then oversample low-retention blocks more
    often — a genuine implementation of this doc's Core Idea (spaced repetition,
    review-what's-forgotten) rather than uniform coverage. This is what distinguishes
@@ -1185,10 +1344,10 @@ recommend prototyping in this order):
 
 4. **Hierarchical: local blocks + periodic full-corpus review pass**: combine strategy
    1 or 2 with an occasional (e.g. every K training steps) full sequential end-to-end
-   stitched decode across ALL ~402 blocks (eval-only, no gradient) to directly measure
+   stitched decode across ALL 585 blocks (eval-only, no gradient) to directly measure
    the thing that actually matters — "does the full chained decode reproduce all
    44,443 bytes exactly" — since per-block metrics alone can miss COMPOUNDING errors
-   across a ~2815-window chain even if every individual block scores near-100% in
+   across a ~4095-window chain even if every individual block scores near-100% in
    isolation. This is the closest analogue to the literal "final stitch eval must
    generate the same byte sequence 100% match" bar and should be the actual pass/fail
    gate, not per-block averages.
@@ -1209,7 +1368,7 @@ actually shows up as a specific, diagnosed failure mode in the full-corpus eval 
 (strategy 4) — don't build it preemptively.
 
 **Recommended first step**: implement strategy 1 (uniform random block sampling,
-`block_nc=8`, `n_chunks=2816` padded target) as the smallest possible extension of the
+`block_nc=8`, `n_chunks=4096` padded target) as the smallest possible extension of the
 existing `experiments/srs_tagged/train.py` — this alone validates whether the streaming
 loop works at all before layering SRS-weighting or curriculum growth on top. Not yet
 built; queued as the actual "implement the streaming corpus-ingestion training loop"
@@ -1218,9 +1377,9 @@ section, now with concrete numbers grounding it instead of the original design s
 
 ### Estimates — quantitative sizing (windows, refine steps, KV capacity, wall-clock)
 
-**Total windows/context**: `n_chunks=2816` padded corpus -> **2815 total overlapping
+**Total windows/context**: `n_chunks=4096` padded corpus -> **4095 total overlapping
 windows**; chained into `block_nc=8` local units (7 windows/block, `L=1694`, 1-chunk
-overlap between consecutive blocks) -> **403 blocks** cover the corpus end-to-end.
+overlap between consecutive blocks) -> **585 blocks** cover the corpus end-to-end.
 
 **Refine steps**: keep `n_refine=2` — no basis to increase it for a larger corpus; it's
 a per-window property, decoupled from total corpus length, and every proven result
@@ -1243,7 +1402,7 @@ unknown is total STEPS needed):
 |---|---|---|
 | Optimistic (shared algorithm generalizes fast across offsets) | ~150,000-300,000 | 1.2-2.5 days |
 | Matches single-location deep lineage (~260k) + modest coverage overhead | ~400,000-600,000 | 3.3-5.0 days |
-| Naive no-sharing baseline (403 blocks x ~50k steps/block, bounds the pessimistic case) | ~20,000,000 | ~165 days |
+| Naive no-sharing baseline (585 blocks x ~50k steps/block, bounds the pessimistic case) | ~29,250,000 | ~241 days |
 
 **Traditional-LM framing (batch size / epoch) surfaces a real implementation gap**:
 today's code shares ONE sampled position/content across the whole batch (diversity
@@ -1251,11 +1410,18 @@ currently comes from independently-random BYTES at a fixed position — meaningl
 real text, since content at any offset is fixed). Real-corpus training needs batch
 diversity from DIFFERENT OFFSETS per batch item — a genuine code change (per-example
 masking/position), not a hyperparameter tweak. At `B=32` distinct offsets/step, one
-epoch over 403 blocks ~ 13 steps; a 300k-step budget ~ 23,600 epochs — consistent with
+epoch over 585 blocks ~ 18 steps; a 300k-step budget ~ 23,600 epochs — consistent with
 this being intentional-overfitting/exact-memorization, not generalization-focused
 pretraining, so "many epochs" is expected and not a red flag by itself.
 
 ### Worked example — 65,536 bytes (2^16), sequential incremental ingestion + SRS review
+
+**This is now THE juz1 plan, not a separate illustration** — the `n_chunks=2816 ->
+4096` revision above was adopted specifically so this worked example's numbers (already
+computed independently, before the revision) would exactly match the primary design
+instead of needing reconciling. `juz1.txt`'s real content (44,443 bytes) fills the
+first ~2778 chunks; the remaining chunks up to 4096 are padding, excluded from match%
+scoring per the valid-byte-mask note above.
 
 A different, more realistic framing than "randomly sample any offset": simulate a user
 handing the corpus to the model incrementally, chunk by chunk, in order, exactly as
@@ -1306,6 +1472,120 @@ distinct real content). Recommend measuring the real per-new-block transfer cost
 small pilot (Phase A + ~10 Phase-B blocks, a few hundred thousand steps) before
 committing to a multi-day run — that single measurement lets the rest of this table be
 recalculated from data instead of extrapolated guesswork.
+
+### Random-offset trajectory sampling as "unordered SRS" — formal design
+
+**SRS given 65,536 bytes and the window geometry, restated concretely**: `chunk_len=16`,
+`window=32B`, `stride=16B` -> `n_chunks=4096`, `n_windows=4095`. Chained into
+`block_nc=8` local units (7 windows/block, 1-chunk overlap between consecutive blocks)
+-> **585 sequential blocks** span the corpus. The worked example above assumed
+DETERMINISTIC sequential order (block 0, then 1, then 2, ... with explicit
+doubling-interval review reinserted into that fixed sequence) — the SRS-textbook way to
+present spaced repetition, and useful for reasoning about the review-interval math, but
+not how the actual training loop has to sample batches (each step needs a training
+example NOW, not "wait until block 217 is next in some master sequence").
+
+**The question this answers**: can RANDOM offset sampling (unordered — no fixed visit
+sequence) still reproduce SRS's essential property (blocks get revisited at increasing
+spacing, effort concentrates on weakly-retained content, and the whole corpus is
+PROVABLY covered, not just probably) — rather than treating "sequential SRS" and
+"random sampling" as two incompatible designs?
+
+**Baseline: pure i.i.d. uniform sampling (why this alone is NOT enough)**. If each step
+draws a uniformly random block index from `[0, 585)` with replacement, this is a
+coupon-collector process. Let `k` = number of DISTINCT blocks seen so far. At the next
+draw, `P(revisit) = k/585` — revisit probability starts near 0 (almost every early draw
+is new content) and rises toward 1 as `k -> 585` (almost every later draw is a repeat).
+This means a bootstrap-like "mostly new" phase and a review-like "mostly repeat" phase
+**emerge automatically** from pure random sampling, without needing an explicit
+Phase A/Phase B split — a genuinely useful property. But it has a real weakness: coupon
+collector has a long tail. Expected steps for full coverage (B=1): `585 * H_585 ~
+4066`. For 99%-confidence full coverage: `585 * (ln(585) + ln(100)) ~ 6421` — some
+unlucky block could, by chance, go unsampled for thousands of extra steps past the
+"expected" point. That's a PROBABILISTIC guarantee, not a provable one — not good
+enough for "must provably cover the whole sequence."
+
+**The fix: hybrid priority sampling — shuffled exhaustive sweep + due-based review
+queue.** Maintain, per block, two pieces of state: `last_reviewed` (step index) and
+`interval` (doubling schedule position, same M=4-mastery-cap idea as the sequential
+worked example). Each training step's batch of `B` blocks is drawn with this priority,
+highest first:
+
+1. **Never-visited blocks** (top priority, order randomly shuffled each pass — this is
+   the "unordered" part). Guarantees the FULL 585-block corpus is provably covered
+   within exactly `ceil(585/B)` steps — no probabilistic tail risk, unlike pure i.i.d.
+   sampling. At `B=32`: **19 steps** for one complete pass (matches the earlier
+   traditional-LM epoch-framing table). Collision/revisit probability during this
+   phase is exactly 0 by construction (a block is never redrawn from this pool until
+   the full shuffle is exhausted).
+2. **Due blocks** (`current_step - last_reviewed >= interval`), once the never-visited
+   pool is empty — sampled either uniformly among due blocks or weighted by how overdue
+   they are (more overdue = higher priority, standard SRS practice). Once a block
+   graduates (M=4 consecutive correct reviews), its interval keeps doubling, pushing it
+   further into the future — this is what keeps steady-state review load logarithmic in
+   corpus size rather than linear, per the SRS mechanism note earlier in this doc.
+3. **Not-yet-due blocks are never sampled** — this is what makes review load
+   sub-linear; without it, every step would need to consider all 585 blocks.
+
+**How much to sample**: `B=32-64` distinct blocks per step (matching the earlier
+traditional-LM batch-size framing) — large enough that one cold-sweep pass finishes in
+under 20 steps, small enough to stay within the `L=1694`-per-block memory/compute
+budget per training step (batches of independent same-shape blocks, not one shared
+giant sequence — consistent with "local blocks, never one global mask").
+
+**How much collision so revisit happens**: by design, NOT left to chance. Phase 1 (cold
+sweep) has zero collision, by construction. Phase 2 (steady-state) has collision
+probability effectively 100% for DUE blocks (every draw from the due-queue is
+necessarily a revisit) and 0% for not-yet-due blocks (they're excluded from the pool
+entirely) — the "how much" is governed by the interval-doubling schedule, not a tunable
+sampling-noise parameter. This is the actual advantage of the hybrid design over pure
+i.i.d.: collision/revisit rate is an ENGINEERED property (matches retention need) rather
+than an emergent side effect of chance.
+
+**How much to refine**: `n_refine=2` fixed baseline (the proven recipe), with two
+optional adaptive twists once the base loop is validated: (a) escalate to `n_refine=3`
+or add an extra review cycle for blocks that fail a due-review (retention check below
+threshold) — spend more effort exactly where it's needed, mirroring real spaced-
+repetition practice of extra drilling on missed cards; (b) drop to `n_refine=0`
+(IQ-only "ping") for blocks that have graduated to long intervals — a cheap maintenance
+check rather than a full refine cycle, since the point of a late-stage review is
+confirming retention, not re-teaching.
+
+**Until provably gone through the whole 65,536-byte sequence**: the cold-sweep
+mechanism (priority 1 above) gives an EXACT, provable bound — `ceil(585/B)` steps
+guarantees every block has been trained at least once, no probabilistic tail. "Fully
+memorized" (not just "seen once") obviously needs many more passes layered on top via
+the due-queue's spaced revisits — that's the same multi-hundred-thousand-step estimate
+from the worked example above, now delivered via unordered priority sampling instead of
+a fixed sequential schedule, while keeping the SAME provable-coverage and
+logarithmic-review-load properties that made sequential SRS attractive in the first
+place.
+
+**Does this preserve stitching, and is stitching's past success actually zero-shot?**
+Random block sampling changes only WHICH 8-chunk block is trained per step — never the
+internal window geometry (7 windows, stride=1 chunk, 50% overlap, `nochain`-masked)
+within a sampled block, and never how cross-block continuity is achieved (entirely at
+EVAL time, via warmup seeded from the PRECEDING block's own decoded output — this
+never depends on training order, since blocks are always separate forward
+passes/masks, at both train and eval, regardless of sampling scheme). RoPE positions
+are always local to each block's own packed sequence (`0` to `L-1`), never globally
+offset by true corpus position — the model has no absolute-position signal to lose by
+randomizing sampling order.
+
+**Checked precisely: yes, every past stitching success was zero-shot.** Training
+(`make_batch_tagged`) always uses TEACHER-FORCED ground-truth warmup for every window —
+the model has NEVER once been trained with the actual eval-time chaining mechanism (a
+prior window's DECODED output fed in as the next window's warmup); that mechanism only
+exists in `ar_decode_srs_stitched_tagged`, eval-only. The 100%/100% sustained result was
+a genuine zero-shot generalization: it worked because each window's own decode accuracy
+was already ~100%, making decoded output operationally identical to ground truth — the
+chain never actually had to tolerate an imperfect link. **This is why "does prolonged AR
+decode degrade gracefully?" (Open Questions, below) has stayed unanswered the whole
+project** — every scale tested so far kept per-window accuracy high enough that the
+zero-shot gap was never actually exercised. `juz1` (up to 585 chained links, real text
+instead of synthetic random bytes) is the first scale where this assumption would
+actually get stress-tested rather than staying hypothetical — worth watching for
+specifically once the streaming loop is running, not just assuming it continues to hold.
 
 **Step (c) started** (still whole-schedule-packed design, not yet the streaming loop —
 picked as the lowest-risk next autonomous step, since it only requires extending
@@ -1627,6 +1907,69 @@ primary signal, `ScheduleWakeup`'s delay as an untrusted fallback rather than a
 reliable heartbeat — and check process liveness (`ps -p <pid>`), not just log content,
 on every wake, since a silently-exited process produces no new log lines and looks
 identical to "still running slowly" without that explicit check.
+
+**Gradient checkpointing — implemented and queued for a speed test, not yet run.**
+Prediction before measuring (see this session's discussion): checkpointing should be
+NET SLOWER here, not faster — it always adds recompute cost, and the only way it pays
+off is indirectly (freed memory -> bigger batch -> better throughput), which is a much
+weaker effect on MPS (far less parallelism headroom than a big CUDA GPU) especially for
+a model this small (166k-232k params, likely dispatch-overhead-bound rather than
+FLOP-bound on MPS). Implemented in `DualAttnModel`/`DualAttnBlock`
+(`experiments/attn_dual/model.py`) with TWO granularities to test which is better, if
+either: `grad_checkpoint='block'` (checkpoint each `DualAttnBlock` as a whole, matching
+`KVMemModel`'s existing granularity) and `grad_checkpoint='attn'` (checkpoint each
+`attn1`/`attn2` sublayer individually — finer-grained). Both smoke-tested working
+end-to-end (training + eval) alongside `grad_checkpoint=None`. Speed-test config:
+`experiments/attn_dual/configs/dualattn_nc8_gradckpt_speedtest.py` (2000 steps, no
+eval, `chunk_attn=256`/`B=3` matching the current window-G run) — queued to run three
+times (off/block/attn) after `dualattn_nc8_slot8_ir` finishes, comparing raw it/s
+directly to test the prediction rather than assume it.
+
+### Compute/memory anatomy of one training step (`dualattn_nc8_slot8_ir`, `L=1694`, `B=3`, `n_heads=4`)
+
+**Forward passes and tokens per step**:
+
+| Level | Count | Detail |
+|---|---|---|
+| Model calls per step | 2 | `torch.no_grad()` argmax-fill pass + real gradient pass |
+| Tokens per single forward pass | `B x L` = 3x1694 = **5,082** | whole packed sequence x batch |
+| Total tokens per step (both passes) | **10,164** | backward compute only on pass 2 |
+| Self-attn ops per model call | 8 | 4 layers x 2 sublayers (`attn1`+`attn2`) |
+| Self-attn ops per step | **16** | 8 x 2 model calls |
+| Standard-arch equivalent (attn+ffn) at same `L`,`B` | 4 attn ops/call, 8/step | half the attention compute |
+
+**Attention mask memory (`L x L`, the square mask itself)**: `L^2 = 2,869,636` entries.
+As `float32` (the actual dtype `chunk_mask_fb` returns): **10.95 MiB**. This base mask
+is built ONCE per step and broadcasts across batch/heads
+(`mask.unsqueeze(0).unsqueeze(0)` -> `(1,1,L,L)`) — does NOT scale with `B` or `H`. The
+real memory driver during compute is the attention-SCORE tensor `Q@K^T`, shape
+`(B,H,L,L)`: unchunked, `B*H*L^2*4` bytes = **131.4 MiB** per attention call.
+`chunk_attn=256` cuts this to `B*H*256*L*4` bytes = **19.85 MiB peak** (6.6x reduction)
+— applied independently to all 16 attention calls per step. This 6.6x peak-memory cut
+is what actually fixed the OOM crash — the base mask itself (11 MiB) was never the
+problem; the `(B,H,L,L)` score tensor recomputed fresh inside every one of the 16
+self-attention calls per step was.
+
+**Block-level attention pattern** (rows = query region, columns = key/value region it
+can attend to; full sequence = `[enc_0..enc_7]` (8 chunks, each with a local encoding
+SLOT) -> `[Win A: IQ,IR1,IR2]` -> `[Win B: IQ,IR1,IR2]` -> ... -> `[Win G: IQ,IR1,IR2]`):
+
+| Query region | enc raw bytes | enc SLOT | Win A | Win B | ... | Win G |
+|---|---|---|---|---|---|---|
+| enc SLOT_k | own chunk only (Rule 2) | own chunk only | before A (causal) | — | | — |
+| Win A IQ SLOT | blocked (Rule 3, bottleneck) | all 8 | own turn only | before B (causal) | | — |
+| Win A IR1/IR2 (SLOT_A/argmax/SLOT_B) | blocked | blocked (Rules 5-7) | own `argmax` copy only | — | | — |
+| Win B IQ SLOT | blocked | all 8 | **blocked — nochain (Rule 3b), full blackout** | own turn only | | — |
+| Win B IR1/IR2 | blocked | blocked | blocked (same blackout) | own `argmax` only | | — |
+| ... | | | | | (same pattern) | |
+| Win G IQ SLOT | blocked | all 8 | **blocked — nochain** | **blocked — nochain** | ... | own turn only |
+
+Two structural rules visible here: (1) every window's SLOT can only read *compressed*
+per-chunk encodings (`enc_k` SLOT), never raw source bytes — the compression
+bottleneck; (2) every window is fully blind to every other window's content except
+through its own explicit `argmax` copy — the `nochain` rule (Rule 3b) that forces each
+window to be independently addressable rather than reading a neighbor's already-decoded
+output.
 
 **RMSNorm restart**: since the IQ stage had only just started (LayerNorm version was at
 step ~20000/160000, val 25.0%/test 44.6% and progressing normally), switched to

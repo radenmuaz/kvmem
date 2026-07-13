@@ -59,7 +59,8 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     hp_model = dict(V=hp['V'], d=hp['d'], n_layers=hp['n_layers'],
                     n_heads=hp['n_heads'], rope=hp.get('rope', True),
                     yarn=hp.get('yarn', True), null_kv=hp.get('null_kv', True),
-                    rmsnorm=hp.get('rmsnorm', False), chunk_attn=hp.get('chunk_attn', 0))
+                    rmsnorm=hp.get('rmsnorm', False), chunk_attn=hp.get('chunk_attn', 0),
+                    grad_checkpoint=hp.get('grad_checkpoint', None))
     model    = build_dualattn_model(hp_model, device)
     n_params = sum(p.numel() for p in model.parameters())
     _log(f'Model: {n_params:,} params  device={device}  V={hp_model["V"]}  (attn_dual ablation, no MLP)')
