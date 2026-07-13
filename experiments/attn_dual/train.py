@@ -1,24 +1,21 @@
 """
-experiments/srs_tagged/train.py — true SRS (spaced-repetition span scheduling)
-with chat-tags' proven fixes: span-specific query tags + wrong-token-weighted
-IR loss. See docs/SRS_RECIPE.md § "Resuming true SRS" for the full design.
+experiments/attn_dual/train.py — dual-attention-block ablation (no MLP
+anywhere, attn+attn per block instead of attn+ffn) vs the proven 3-window
+64B stitched SRS baseline (experiments/srs_tagged/configs/srs_stitch_nc4_slot8.py).
 
-Unlike experiments/chat_tags/train.py, there is no traj_mix/weighted-trajectory
-sampling — every training batch IS the full SRS schedule (one sequence spans
-every review span in order), so there's exactly one trajectory per stage.
-Reuses experiments/chat_tags/batch.py's make_batch_tagged, _fill_argmax_fb, and
-ar_decode_iq_global_rw_tagged completely unchanged — all three are generic over
-pos_content['rec_blocks'] and already handle per-span (not just per-window)
-structure correctly (see docs/SRS_RECIPE.md for why no changes were needed).
+Reuses chunk_positions_srs_tagged / make_batch_tagged / _fill_argmax_fb /
+chunk_mask_fb completely unchanged from the tagged-stitching track. Only the
+model (DualAttnModel, experiments/attn_dual/model.py) and the eval decode
+(no-KV-cache full recompute, experiments/attn_dual/decode.py) differ — see
+those files' docstrings for why.
 
-Adds the held-out test-file eval path (load_chunks_padded + eval_file) that the
-original (pre-chat-tags) SRS configs used but chat-tags never wired in — kept
-here since "reuse similar val and test" was explicit in the design ask.
-
-Usage:
-    python -m experiments.srs_tagged.train \\
-        --config experiments/srs_tagged/configs/srs_depth2_nc4_slot8.py \\
-        --device mps
+No warm-start: MLP removal changes the architecture (different state_dict
+keys), so this always trains from scratch — a fair from-scratch vs
+from-scratch comparison would need the baseline re-run from scratch too, but
+the existing srs_stitch_nc4_slot8 result (100%/100% sustained, warm-started)
+is the target ceiling to compare against regardless of starting point, since
+the interesting question is "can dual-attn reach/approach that ceiling at
+all" not "does warm-starting help it."
 """
 from __future__ import annotations
 
@@ -33,17 +30,14 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from kvmem.model import build_model
-from kvmem.train_hmn_chunk import (
-    chunk_mask_fb, _StatusWriter, srs_schedule, srs_schedule_depth2, load_chunks_padded,
-)
+from kvmem.train_hmn_chunk import chunk_mask_fb, _StatusWriter
 from kvmem.train_hmn_mono import _positional_ls_nll, load_config
 from kvmem.utils import make_test_sequences
 
-from experiments.chat_tags.vocab import HMN_TAG_VOCAB_SIZE_V2
 from experiments.chat_tags.positions import chunk_positions_srs_tagged
-from experiments.chat_tags.batch import make_batch_tagged, _fill_argmax_fb, ar_decode_iq_global_rw_tagged
-from experiments.srs_tagged.stitch_decode import ar_decode_srs_stitched_tagged
+from experiments.chat_tags.batch import make_batch_tagged, _fill_argmax_fb
+from experiments.attn_dual.model import build_dualattn_model
+from experiments.attn_dual.decode import ar_decode_srs_stitched_tagged_nokv
 
 
 def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
@@ -51,7 +45,7 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     rng    = np.random.default_rng(hp.get('seed', 42))
     torch.manual_seed(hp.get('seed', 42))
 
-    name     = hp.get('name', 'srs_tagged')
+    name     = hp.get('name', 'attn_dual')
     log_dir  = os.path.join(log_base, name)
     ckpt_dir = os.path.join(log_dir, 'checkpoints')
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -62,34 +56,47 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     def _log(msg): print(msg); print(msg, file=log_file)
     def _jlog(d):  jsonl_file.write(json.dumps(d) + '\n')
 
-    hp_model = dict(V=hp.get('V', HMN_TAG_VOCAB_SIZE_V2),
-                    d=hp['d'], n_layers=hp['n_layers'],
-                    n_heads=hp['n_heads'], d_ff=hp['d_ff'],
-                    rope=hp.get('rope', True), yarn=hp.get('yarn', True),
-                    null_kv=hp.get('null_kv', True), compile=hp.get('compile', False),
-                    chunk_attn=hp.get('chunk_attn', 0), rmsnorm=hp.get('rmsnorm', False))
-    model    = build_model(hp_model, device)
+    hp_model = dict(V=hp['V'], d=hp['d'], n_layers=hp['n_layers'],
+                    n_heads=hp['n_heads'], rope=hp.get('rope', True),
+                    yarn=hp.get('yarn', True), null_kv=hp.get('null_kv', True),
+                    rmsnorm=hp.get('rmsnorm', False), chunk_attn=hp.get('chunk_attn', 0))
+    model    = build_dualattn_model(hp_model, device)
     n_params = sum(p.numel() for p in model.parameters())
-    _log(f'Model: {n_params:,} params  device={device}  V={hp_model["V"]}  (srs_tagged experiment)')
+    _log(f'Model: {n_params:,} params  device={device}  V={hp_model["V"]}  (attn_dual ablation, no MLP)')
 
     if hp.get('_pretrained_ckpt'):
+        # Same-architecture staged warm-start: mirrors this project's proven IQ-then-IR
+        # curriculum (every prior success in this codebase — hmn_feedback_32_iq->_ir,
+        # chat_tags Phase A->B, srs_depth2_nc4_slot8->srs_stitch_nc4_slot8 — warm-starts
+        # a harder stage from an easier stage's checkpoint of the SAME architecture,
+        # not a cross-architecture weight transplant). Here: dualattn_nc4_slot8_iq.py
+        # (IQ-only, n_refine=0) -> dualattn_nc4_slot8_ir.py (this stage, n_refine=2).
+        # All keys match exactly (both stages use DualAttnModel), so this is a full
+        # state_dict load; the shape-matching loop is kept generic in case a partial
+        # load is ever needed for a different lineage.
+        # Also handles vocab growth (e.g. nc4->nc8 adding window D-G tags):
+        # a growing tensor (e.g. special_embed.weight) gets its overlapping
+        # PREFIX copied rather than being skipped outright — same mechanism
+        # already proven in experiments/srs_tagged/train.py for the standard
+        # architecture's own nc4->nc8 vocab growth.
         ckpt = torch.load(hp['_pretrained_ckpt'], map_location=device)
         src_sd = ckpt['model']
         dst_sd = model.state_dict()
-        grown = []
-        for k, dst_t in dst_sd.items():
+        loaded, grown = [], []
+        for k in dst_sd:
             if k not in src_sd:
                 continue
-            src_t = src_sd[k]
+            src_t, dst_t = src_sd[k], dst_sd[k]
             if src_t.shape == dst_t.shape:
-                dst_sd[k] = src_t
+                dst_sd[k] = src_t; loaded.append(k)
             elif src_t.dim() >= 1 and src_t.shape[1:] == dst_t.shape[1:] and src_t.shape[0] < dst_t.shape[0]:
                 dst_sd[k][:src_t.shape[0]] = src_t
                 grown.append(f'{k}: {tuple(src_t.shape)}->{tuple(dst_t.shape)}')
             else:
                 raise RuntimeError(f'Unhandled shape mismatch for {k}: {src_t.shape} vs {dst_t.shape}')
         model.load_state_dict(dst_sd)
-        _log(f'Loaded: {hp["_pretrained_ckpt"]}' + (f'  (grown: {grown})' if grown else ''))
+        _log(f'Loaded (staged warm-start): {len(loaded)}/{len(dst_sd)} tensors '
+             f'from {hp["_pretrained_ckpt"]}' + (f'  (grown: {grown})' if grown else ''))
 
     lr_max  = hp.get('lr_max', 3e-4)
     wd      = hp.get('wd', 0.001)
@@ -113,49 +120,22 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         slot_count = hp.get('slot_count', 2)
         warmup_len = hp.get('warmup_len', 8)
         n_refine   = stage.get('n_refine', 2)
-        depth      = stage.get('depth', 2)
         B          = stage.get('B', 8)
         n_steps    = stage.get('n_steps', 60000)
         stage_eval_every = stage.get('eval_every', 5000)
         ls_max     = hp.get('ls_max', 0.0)
-        eval_mode  = stage.get('eval_mode', 'per_span')  # 'per_span' (GT-seeded, atomic) or 'stitch' (chained)
+        windows    = stage['windows']
 
-        # 'windows' overrides the depth-based srs_schedule/srs_schedule_depth2
-        # generator with an explicit (possibly overlapping) window list — used
-        # by the stitched track (see docs/SRS_RECIPE.md "Stitching vs atomic
-        # full-span"). Falls back to the original depth-based schedules
-        # unchanged when absent.
-        if 'windows' in stage:
-            schedule = stage['windows']
-        else:
-            schedule = srs_schedule_depth2(n_chunks) if depth == 2 else srs_schedule(n_chunks)
         built = chunk_positions_srs_tagged(n_chunks, chunk_len, slot_len, warmup_len,
-                                           schedule, n_refine=n_refine)
+                                           windows, n_refine=n_refine)
         pos_content, pos_mask, tags, L = (built['pos_content'], built['pos_mask'],
                                           built['tags'], built['L'])
-
-        # ir_slot_window: RNN-framing sliding-window restriction on how many
-        # PRIOR TURNS' SLOT tokens (within one window's own IQ->IR1->IR2->...
-        # chain) a later turn's SLOT_A/argmax/SLOT_B rows may attend to.
-        # None (default) = unbounded, IDENTICAL to chunk_mask_fb's existing
-        # behavior (verified bit-for-bit in
-        # experiments/chat_tags/mask_windowed.py) — no breaking change unless
-        # a config explicitly sets this. See docs/SRS_RECIPE.md "is there a
-        # parameter for how much a memory slot can attend to past memory
-        # slots" discussion.
-        ir_slot_window = hp.get('ir_slot_window', None)
-        if ir_slot_window is not None:
-            from experiments.chat_tags.mask_windowed import chunk_mask_fb_windowed
-            rec_spans = [rb['span'] for rb in pos_content['rec_blocks']]
-            mask_np = chunk_mask_fb_windowed(pos_mask, ir_slot_window=ir_slot_window,
-                                             rec_spans=rec_spans)
-        else:
-            mask_np = chunk_mask_fb(pos_mask)
+        mask_np = chunk_mask_fb(pos_mask)
         mask_t  = torch.tensor(mask_np, dtype=torch.float32, device=device)
 
         _log(f'\n[stage {stage_i}] n_chunks={n_chunks} chunk_len={chunk_len} slot={slot_len} '
-             f'wl={warmup_len} depth={depth} schedule={schedule} n_refine={n_refine} '
-             f'ir_slot_window={ir_slot_window} B={B}  steps={n_steps}  L={L}')
+             f'wl={warmup_len} windows={windows} n_refine={n_refine} '
+             f'B={B}  steps={n_steps}  L={L}')
 
         lr_min      = hp.get('lr_min', 0.0)
         cosine_T0   = hp.get('cosine_T0', 20000)
@@ -180,10 +160,11 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
         if val_n_seqs is not None:
             val_seqs = dict(list(val_seqs.items())[:val_n_seqs])
 
-        test_chunks = test_valid = None
+        test_chunks = None
         if eval_file:
+            from kvmem.train_hmn_chunk import load_chunks_padded
             try:
-                test_chunks, test_valid = load_chunks_padded(eval_file, n_chunks, chunk_len)
+                test_chunks, _ = load_chunks_padded(eval_file, n_chunks, chunk_len)
             except Exception as e:
                 _log(f'  [test eval disabled: {e}]')
 
@@ -248,40 +229,31 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 _log(f'\n--- stage={stage_i} step={local_step}/{n_steps}'
                      f'  g={global_step}  loss={loss_f:.4f}  {h:02d}:{m:02d}:{s:02d} ---')
 
-                # Which rec_block index is each span's OWN final (last) block?
                 span_last_idx: dict[tuple, int] = {}
                 for i, rb in enumerate(pos_content['rec_blocks']):
-                    span_last_idx[rb['span']] = i  # later entries overwrite -> last one wins
+                    span_last_idx[rb['span']] = i
 
                 def _eval_on(seqs_iter, tag_prefix):
-                    span_means = {span: [] for span in schedule}
+                    span_means = {span: [] for span in windows}
                     stitched_means = []
                     for sname, chunks_arr in seqs_iter:
-                        if eval_mode == 'stitch':
-                            r = ar_decode_srs_stitched_tagged(model, chunks_arr, slot_len, slot_count,
-                                                              mask_np, pos_content, tags, device)
-                            stitched_means.append(r['match_pct'])
-                        else:
-                            r = ar_decode_iq_global_rw_tagged(model, chunks_arr, slot_len, slot_count,
-                                                              mask_np, pos_content, tags, device,
-                                                              warmup_offset=0)
-                        for span in schedule:
+                        r = ar_decode_srs_stitched_tagged_nokv(model, chunks_arr, slot_len, slot_count,
+                                                               mask_np, pos_content, tags, device)
+                        stitched_means.append(r['match_pct'])
+                        for span in windows:
                             idx = span_last_idx[span]
                             span_means[span].append(r['turn_match_pcts'][idx])
-                        tail = f'  stitched={r["match_pct"]:.1f}%' if eval_mode == 'stitch' else ''
-                        _log(f'  {tag_prefix}/{sname:<15} per-span={[round(r["turn_match_pcts"][span_last_idx[s]],1) for s in schedule]}{tail}')
+                        _log(f'  {tag_prefix}/{sname:<15} per-span={[round(r["turn_match_pcts"][span_last_idx[s]],1) for s in windows]}  stitched={r["match_pct"]:.1f}%')
                     means = []
-                    for span in schedule:
+                    for span in windows:
                         m_ = sum(span_means[span]) / len(span_means[span])
                         means.append(m_)
                         _log(f'  {tag_prefix}/span{span}/MEAN               match={m_:.1f}%')
                     overall = sum(means) / len(means)
                     _log(f'  {tag_prefix}/MEAN               match={overall:.1f}%')
-                    if eval_mode == 'stitch':
-                        stitched_overall = sum(stitched_means) / len(stitched_means)
-                        _log(f'  {tag_prefix}/STITCHED_MEAN               match={stitched_overall:.1f}%')
-                        return stitched_overall
-                    return overall
+                    stitched_overall = sum(stitched_means) / len(stitched_means)
+                    _log(f'  {tag_prefix}/STITCHED_MEAN               match={stitched_overall:.1f}%')
+                    return stitched_overall
 
                 val_iter = ((sname, np.array([seq[k*chunk_len:(k+1)*chunk_len] for k in range(n_chunks)], np.int64))
                            for sname, seq in val_seqs.items())
@@ -307,10 +279,10 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--config',     required=True)
-    p.add_argument('--device',     default='cpu')
+    p.add_argument('--config', required=True)
+    p.add_argument('--device', default='cpu')
     p.add_argument('--pretrained', default=None)
-    p.add_argument('--log-dir',    default='experiments/srs_tagged/logs')
+    p.add_argument('--log-dir', default='experiments/attn_dual/logs')
     args = p.parse_args()
 
     hp = load_config(args.config)
