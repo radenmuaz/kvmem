@@ -22,7 +22,7 @@ Validation (design plan section 5, part 2 — the actual chain-memory test, not
 just per-chain-step accuracy): per-chain-step recall alone doesn't prove
 STATE_QUEUE carried anything forward (each chain step can solve its own span
 locally regardless of chaining, since direct cross-chain-step attention stays
-blocked per Rule 3b). The real test is recovering an EARLIER chain step's span
+blocked by the nochain blackout). The real test is recovering an EARLIER chain step's span
 from the LAST chain step's round-0 recall — only reachable via the
 accumulated STATE_QUEUE chain. Not yet automated in train()'s eval loop as of
 this config; run as a follow-up probe once Stage 1 converges.
@@ -31,6 +31,37 @@ Run:
     python3 -m kvmem.hmn --config kvmem/configs/hmn_stage1_round0_chained.py \
         --pretrained kvmem/logs/hmn_stage0_round0_single/checkpoints/stage0_best.pt \
         --device mps
+
+Exact generated token layout for this config (from chunk_positions_chained(
+n_chunks=4, chunk_len=16, state_len=8, warmup_len=8,
+chain_steps=[(0,2),(1,3),(2,4)], n_refine=0), L=252):
+
+  Shared encoding pass (positions 0-103, same as Stage 0 — one STATE per chunk):
+    <src>chunk0(16B)</src>STATE(8) <src>chunk1(16B)</src>STATE(8)
+    <src>chunk2(16B)</src>STATE(8) <src>chunk3(16B)</src>STATE(8)
+
+  Chain step 0 (span 0,2 — reads chunk0+1's STATEs, NO STATE_QUEUE_in,
+  identical shape to Stage 0's own recall block):
+    STATE(8) <query>warmup(8B)</query> <response>output(24B)</response>
+
+  Chain step 1 (span 1,3 — reads chunk1+2's STATEs, HAS STATE_QUEUE_in
+  relayed from chain step 0 via h_inject):
+    STATE_QUEUE_in(8) STATE(8) <query>warmup(8B)</query> <response>output(24B)</response>
+
+  Chain step 2 (span 2,4 — reads chunk2+3's STATEs, HAS STATE_QUEUE_in
+  relayed from chain step 1):
+    STATE_QUEUE_in(8) STATE(8) <query>warmup(8B)</query> <response>output(24B)</response>
+
+Notes:
+  - Same <query>/<response> tags reused at every chain step (no
+    per-step <query_a>/<query_b>/<query_c> variants — that's the exact
+    per-window tag scheme this rewrite retired, see docs/HMN_RECIPE.md §1-2).
+  - STATE_QUEUE_in is bare, no wrapper tag (same reasoning as STATE itself:
+    self-identifying via its placeholder tokens) — the tokens shown above are
+    only placeholder IDs at batch-construction time; the actual relayed
+    content is injected into the residual stream at those exact positions
+    ([148,156) for chain step 1, [200,208) for chain step 2) via h_inject,
+    right before the transformer blocks run.
 """
 
 hp = dict(

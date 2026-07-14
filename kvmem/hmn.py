@@ -19,7 +19,7 @@ It ports, into one self-contained file (no imports from the `kvmem` or
   - the traj_mix training loop                (experiments/chat_tags/train.py)
 
 Masking/position math is ported verbatim — these encode subtle correctness
-properties (Rule 3b nochain masking, tag-row leak prevention) that must not
+properties (the nochain blackout, tag-row leak prevention) that must not
 change during this port.
 """
 from __future__ import annotations
@@ -38,54 +38,63 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _ckpt
 from tqdm import tqdm
 
+from kvmem.structured_data import generate_structured_chunks
+
 
 # =============================================================================
 # Vocab / tags
-# ported from kvmem/data.py (base offset) + experiments/chat_tags/vocab.py
+#
+# LAYOUT (vocab reorder — supersedes the original kvmem/data.py-ported
+# ordering, which put STATE ids BEFORE the chat tags with 6 dead legacy
+# padding slots sandwiched between them; that made STATE growth beyond 10
+# awkward — see git history / docs/HMN_RECIPE.md for the pre-reorder
+# scheme). Chat tags now sit immediately after the 256 data bytes — fixed,
+# small (3 pairs, 6 ids), never expected to grow. STATE placeholders occupy
+# the TAIL of the vocab — the only region ever expected to grow
+# (state_vocab_size) — so growth is ALWAYS a pure tail-append, the only mode
+# train()'s pretrained-checkpoint loader supports. No two-tier alphabet,
+# no collision risk to guard against, ever again.
 # =============================================================================
 
-# HMN_VOCAB_SIZE = 268 — base kvmem vocab size (256 data bytes + 12 special
-# tokens: HMN_MEM_START/END, HMN_STATE_0-3, HMN_DEL_START/END, HMN_DEL_SLOT_0-3).
-# Hardcoded here (kvmem/data.py:2203) so this file has no dependency on the
-# kvmem package.
-HMN_VOCAB_SIZE = 268
-
-# kvmem/data.py:2190-2195 — needed by _cyclic_state_ids below.
-HMN_MEM_START  = 256
-HMN_MEM_END    = 257
-HMN_STATE_0    = 258
-HMN_STATE_1    = 259
-HMN_STATE_2    = 260
-HMN_STATE_3    = 261
-
-# kvmem/utils.py:5 — DATA_LO, needed by make_test_sequences below.
 DATA_LO = 0x20   # legacy: data restricted to [0x20, 0xFF]
 
 # Shared, generic tag vocabulary — reused identically at every chain step /
 # round. No per-step or per-round variants: turn identity comes from position
 # + accumulated content only, never from a turn-numbered vocab entry (see
 # design-experiment-which-use-atomic-kay.md). <mem>/</mem> is dropped entirely
-# (STATE-family regions are always filled with the fixed HMN_STATE_0..3
+# (STATE-family regions are always filled with the fixed HMN_STATE_0..N-1
 # placeholder tokens, which are already unambiguous region markers on their
 # own — a wrapper tag would add zero information).
-HMN_SRC_OPEN       = HMN_VOCAB_SIZE + 0   # 268  <src>
-HMN_SRC_CLOSE      = HMN_VOCAB_SIZE + 1   # 269  </src>
-HMN_QUERY_OPEN     = HMN_VOCAB_SIZE + 2   # 270  <query>       generic, reused at every chain step
-HMN_QUERY_CLOSE    = HMN_VOCAB_SIZE + 3   # 271  </query>
-HMN_RESPONSE_OPEN  = HMN_VOCAB_SIZE + 4   # 272  <response>
-HMN_RESPONSE_CLOSE = HMN_VOCAB_SIZE + 5   # 273  </response>
+HMN_SRC_OPEN       = 256   # <src>
+HMN_SRC_CLOSE      = 257   # </src>
+HMN_QUERY_OPEN     = 258   # <query>       generic, reused at every chain step
+HMN_QUERY_CLOSE    = 259   # </query>
+HMN_RESPONSE_OPEN  = 260   # <response>
+HMN_RESPONSE_CLOSE = 261   # </response>
 
-# HMN_VOCAB_SIZE (268) + 2 tokens per surviving open/close pair
-# (HMN_SRC, HMN_QUERY, HMN_RESPONSE = 3 pairs = 6 tokens) = 274.
-HMN_TAG_VOCAB_SIZE = HMN_VOCAB_SIZE + 6    # 274
+# First STATE placeholder id. Everything from here to the end of the vocab
+# (hp['V']) is STATE alphabet — pure tail region, no upper neighbor to
+# collide with, so state_vocab_size is bounded only by hp['V'] itself.
+HMN_STATE_0 = 262
+
+# Default vocab size: 256 bytes + 6 chat tags + 12 reserved STATE ids
+# (state_vocab_size <= 12 is free — one more than the pre-reorder scheme's
+# 10, and V=274 stays numerically identical to the pre-reorder default for
+# an apples-to-apples parameter-count comparison).
+HMN_TAG_VOCAB_SIZE = 274
 
 
 def _cyclic_state_ids(state_len: int, state_vocab_size: int = 2) -> list[int]:
     # ported from kvmem/train_hmn_chunk.py:63-64 (formerly _slot_ids)
-    # Cyclic fill: when state_vocab_size < state_len, the alphabet of
-    # HMN_STATE_0..state_vocab_size-1 repeats periodically to fill state_len
-    # positions (e.g. state_len=8, state_vocab_size=2 ->
-    # [STATE_0,STATE_1,STATE_0,STATE_1,STATE_0,STATE_1,STATE_0,STATE_1]).
+    # Cyclic fill: alphabet HMN_STATE_0..HMN_STATE_0+state_vocab_size-1
+    # repeats periodically to fill state_len positions (e.g. state_len=8,
+    # state_vocab_size=2 -> [STATE_0,STATE_1,STATE_0,STATE_1,STATE_0,
+    # STATE_1,STATE_0,STATE_1]). STATE sits at the TAIL of the vocab (see
+    # module docstring above) so there's no collision to guard against —
+    # growing state_vocab_size just requires hp['V'] >= HMN_STATE_0 +
+    # state_vocab_size, which the pretrained-checkpoint tail-append growth
+    # logic in train() already handles.
+    assert state_vocab_size >= 1
     return [HMN_STATE_0 + (i % state_vocab_size) for i in range(state_len)]
 
 
@@ -203,47 +212,43 @@ def chunk_positions_iq_global_rw_tagged(n_chunks: int, chunk_len: int, state_len
     return dict(pos_content=pos_content, pos_mask=pos_mask, tags=tags, L=L)
 
 
-def chunk_positions_chained(n_chunks: int, chunk_len: int, state_len: int,
-                            warmup_len: int, chain_steps: list[tuple[int, int]],
-                            n_refine: int = 2, state_vocab_size: int = 2) -> dict:
+
+
+def chunk_positions_flow(n_chunks: int, chunk_len: int, state_len: int,
+                         warmup_len: int, chain_steps: list[tuple[int, int]],
+                         n_refine: int = 2, state_vocab_size: int = 2) -> dict:
     """
-    Chained multi-chain-step schedule: each span in `chain_steps` (e.g.
-    [(0,2),(1,3),(2,4)]) gets its OWN local round-0 (IQ) turn + n_refine
-    chained argmax-IR rounds, reusing the shared, generic <query>/<response>
-    tag pair at every chain step (no per-chain-step tag dispatch — turn
-    identity comes from position, not a turn-numbered vocab entry).
+    Stage `flow` — alternative to chunk_positions_chained's STATE_QUEUE/
+    h_inject relay. Same overall shape (shared encoding pass, then each
+    chain step threaded in sequence with its own local round-0(+IR)) but NO
+    separate STATE_QUEUE_in region — chain step i's own round-0 STATE region
+    serves double duty as both "this chain step's recall register" and "the
+    thing the NEXT chain step reads." The relay channel is a genuine
+    attention permission (see chunk_mask_fb_flow), not a forced vector copy.
 
-    Chain step i > 0 additionally gets a STATE_QUEUE_in region (width
-    state_len, M=1) immediately before its round-0 STATE region, populated at
-    train/eval time via h_inject from chain step i-1's last round's own STATE
-    slice (see train()'s chain-step dispatch). Reuses the same HMN_STATE_0..3
-    placeholder tokens as any other STATE region — position/mask disambiguate
-    the regions, and h_inject overwrites the embedding before any block runs,
-    so the placeholder identity is irrelevant.
+    Why: h_inject's relay is a hand-engineered "copy chain step i-1's final
+    STATE into chain step i's input" operation, cut off from gradient flow
+    via .detach() (truncated BPTT — the model never gets direct gradient
+    signal that STATE must be useful to a FUTURE chain step, only to its own
+    recall loss, see chunk_positions_chained's docstring). Flow instead
+    grants chain step i's own round-0 STATE row a narrow, SINGLE-HOP
+    attention exception (see chunk_mask_fb_flow's relay exception) letting it read
+    chain step i-1's STATE columns directly and let the model LEARN what to
+    preserve end-to-end, no detach, no forced copy. This also means flow
+    training reuses the ordinary non-chained (fast, up-to-2-forward-passes)
+    loop — no sequential per-chain-step h_inject orchestration needed, since
+    everything is resolved by mask permissions within one packed sequence.
 
-    Structurally this is chunk_positions_fb_localrefine (kvmem/train_hmn_chunk.py)
-    with tags added — same "one shared encoding pass, then each span threaded in
-    sequence with its own local round-0+IR" shape, same reliance on
-    chunk_mask_fb's Rule 3b (round-0 STATE blocked from ALL tokens in prior
-    rec_blocks) for the nochain/no-cross-chain-step-leak property, reused
-    unmodified. The *only* channel for cross-chain-step information is the
-    injected STATE_QUEUE_in feature vector, never an attention path.
-
-    STATE_QUEUE is a single-hop relay, not an accumulating buffer — M=1 means
-    chain step i's STATE_QUEUE_in comes ONLY from chain step i-1's own last
-    round's STATE, never from i-2 or earlier directly. There is no separate
-    "older states" store to mask or discard: raw content from chain steps
-    older than i-1 is already fully blocked by Rule 3b regardless of
-    STATE_QUEUE (that invariant predates this mechanism and applies to every
-    chain step, chained or not). For information from chain step i-2 to reach
-    chain step i, chain step i-1 must have implicitly folded it into its own
-    single state_len-wide STATE when producing its own output — there is no
-    guarantee this happens; it's exactly what the deferred "recover an
-    earlier chain step's span from the last chain step's round-0 recall"
-    validation probe is designed to test. Per-chain-step recall accuracy
-    alone does NOT test this — each chain step can solve its own span from
-    its own encoding-block STATEs without STATE_QUEUE carrying anything
-    useful across the relay at all.
+    Same single-hop constraint as STATE_QUEUE (M=1 in that design's terms):
+    chain step i's STATE row sees ONLY chain step i-1's STATE columns, never
+    i-2 or earlier directly — preserved here for a clean, apples-to-apples
+    comparison against `relay` (chunk_positions_chained) where the LEARNING
+    MECHANISM, not the information-theoretic constraint, is the isolated
+    variable. For information from chain step i-2 to reach chain step i,
+    chain step i-1 must still implicitly fold it into its own bottlenecked
+    STATE — exactly the same open question chunk_positions_chained's
+    docstring raises, now testable with full gradient flow instead of a
+    truncated one.
     """
     enc_blocks_c: list[dict] = []
     enc_blocks_m: list[dict] = []
@@ -263,29 +268,19 @@ def chunk_positions_chained(n_chunks: int, chunk_len: int, state_len: int,
     rec_blocks_c: list[dict] = []
     rec_blocks_m: list[dict] = []
 
-    # Single shared <query>/<response> tag pair, reused identically at every
-    # chain step (no per-chain-step lookup — see module docstring / plan).
     query_open, query_close = HMN_QUERY_OPEN, HMN_QUERY_CLOSE
 
     for chain_step_i, span in enumerate(chain_steps):
         span_s, span_e = span
         span_len = (span_e - span_s) * chunk_len
         out_len  = span_len - warmup_len
-        has_queue_in = chain_step_i > 0
 
-        def _emit_round(round_idx: int, has_queue_in: bool):
-            """round_idx == 0: [STATE_QUEUE_in if has_queue_in] + STATE +
-            <query>/<response>, no argmax segment.
-            round_idx > 0: STATE_A + argmax + STATE_B + <query>/<response>
-            (today's IR block). STATE-family regions (STATE, STATE_A,
-            STATE_B, STATE_QUEUE_in) are bare (no wrapper tag) — content-dict
-            and mask-dict field boundaries are identical for them, no more
-            +/-1 tag-absorption widening."""
+        def _emit_round(round_idx: int):
+            """Same as chunk_positions_chained's _emit_round, minus the
+            has_queue_in branch — flow never allocates a separate queue
+            region."""
             nonlocal offset
             if round_idx == 0:
-                q0 = q1 = None
-                if has_queue_in:
-                    q0 = offset; q1 = q0 + state_len; offset = q1
                 sl0 = offset; sl1 = sl0 + state_len; offset = sl1
                 tags.append((offset, query_open)); offset += 1
                 w0 = offset; w1 = w0 + warmup_len; offset = w1
@@ -295,9 +290,6 @@ def chunk_positions_chained(n_chunks: int, chunk_len: int, state_len: int,
                 tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
                 c_fields = dict(sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1)
                 m_fields = dict(sl0=sl0, sl1=sl1, w0=w0 - 1, w1=w1 + 1, c0=c0 - 1, c1=c1 + 1)
-                if has_queue_in:
-                    c_fields.update(queue0=q0, queue1=q1)
-                    m_fields.update(queue0=q0, queue1=q1)
                 return c_fields, m_fields
             else:
                 sla0 = offset; sla1 = sla0 + state_len; offset = sla1
@@ -318,25 +310,19 @@ def chunk_positions_chained(n_chunks: int, chunk_len: int, state_len: int,
                                 c0=c0 - 1, c1=c1 + 1)
                 return c_fields, m_fields
 
-        iq_c, iq_m = _emit_round(0, has_queue_in)
-        # Chained chain steps have no random warmup offset (warmup is always
-        # the chain step's own start byte, X=0 within the span) —
-        # make_batch_tagged/ar_decode_iq_global_rw_tagged (reused unmodified
-        # from chat_tags) expect this field on every round-0 block, so give
-        # it a degenerate fixed (0,0) range rather than touching that shared
-        # code.
+        iq_c, iq_m = _emit_round(0)
         rec_blocks_c.append(dict(type='iq', span=span, span_len=span_len,
                                  out_len=out_len, is_clean=(n_refine == 0),
                                  warmup_train_range=(0, 0), warmup_x_dist='fixed', **iq_c))
-        rec_blocks_m.append(dict(type='iq', **iq_m))
+        rec_blocks_m.append(dict(type='iq', span=span, **iq_m))
 
         prev_c0_c = iq_c['c0']
         for _ in range(n_refine):
-            ir_c, ir_m = _emit_round(1, False)
+            ir_c, ir_m = _emit_round(1)
             rec_blocks_c.append(dict(type='ir', span=span, span_len=span_len,
                                      out_len=out_len, is_clean=True,
                                      argmax_src_c0=prev_c0_c, **ir_c))
-            rec_blocks_m.append(dict(type='ir', **ir_m))
+            rec_blocks_m.append(dict(type='ir', span=span, **ir_m))
             prev_c0_c = ir_c['c0']
 
     L = offset
@@ -349,6 +335,494 @@ def chunk_positions_chained(n_chunks: int, chunk_len: int, state_len: int,
     return dict(pos_content=pos_content, pos_mask=pos_mask, tags=tags, L=L)
 
 
+def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
+                         operations: list[tuple], n_refine: int = 0,
+                         state_vocab_size: int = 2) -> dict:
+    """
+    Stage `weave` — generalizes chunk_positions_flow to arbitrary INTERLEAVED
+    encode/query operation sequences, not just "encode everything, then
+    query everything" (batch) or "encode everything, then chain queries in a
+    fixed order" (relay/flow). Every named trajectory pattern (batch, stream,
+    interleave-delayed, repeat-query, and the chain-memory recovery probe
+    generalized to more hops) is just a different `operations` list fed to
+    this SAME function — no separate per-pattern position builder needed.
+
+    operations: list of ops, each one of:
+      ('E', chunk_idx)     — ingest chunk_idx's RAW BYTES ONLY: emit
+                             <src>chunk_bytes</src>. Does NOT emit a STATE by
+                             itself — chunk_idx must not have been encoded
+                             already, and must be immediately followed by an
+                             ('S', None) op (asserted below) to actually
+                             compress it. Splitting "ingest" from "compress"
+                             into two explicit ops (rather than one bundled
+                             "encode" op) makes the compression step a first-
+                             class, visible thing in the operations list —
+                             see the module-level DSL discussion for why.
+      ('S', None)           — emit ONE state_len-wide STATE region. Its ROLE
+                             is determined entirely by what IMMEDIATELY
+                             precedes it in the operations list:
+                               - if an unclaimed ('E', k) op sits directly
+                                 before it: this IS chunk k's own encoding-
+                                 STATE (encoding isolation — sees chunk k's
+                                 own raw bytes, blocked from every OTHER
+                                 chunk's raw bytes; NOT part of the
+                                 single-hop relay chain, same as the shared
+                                 encoding pass always was).
+                               - otherwise (no immediately-preceding unclaimed
+                                 'E'): this is a bare relay hop — what used to
+                                 be a separate 'N' (no-op) op type. Blocked
+                                 from ALL raw chunks (chunk blackout) and from
+                                 every prior op except the immediately
+                                 preceding 'Q'-or-bare-'S' op's own STATE (the
+                                 relay exception, single-hop). No local recall target,
+                                 is_clean=False, contributes nothing to loss
+                                 directly — gradient reaches it only through
+                                 whichever LATER op ends up depending on it.
+                                 Isolates "pure relay decay rate" from
+                                 "recall accuracy at each hop," which
+                                 repeated 'Q' ops conflate (a failure there
+                                 could mean the relay lost information OR
+                                 that hop's own local recall task failed for
+                                 unrelated reasons).
+      ('Q', (span_s, span_e)) — query/recall chunks [span_s, span_e): emit
+                             STATE + <query>warmup</query><response>output
+                             </response> (+ n_refine IR rounds). Every chunk
+                             in [span_s, span_e) MUST already have been
+                             ingested-and-compressed (E immediately followed
+                             by S) earlier in the list — a hard causal
+                             requirement (attention is causal; a query
+                             literally cannot read content that doesn't
+                             exist yet), asserted below, not just documented.
+
+    Relay mechanism: same single-hop STATE-to-STATE attention permission as
+    chunk_positions_flow (see chunk_mask_fb_traj) — the i-th 'Q'-or-bare-'S'
+    op's own STATE row can read the (i-1)-th 'Q'-or-bare-'S' op's own STATE
+    columns directly, nothing else cross-op. The SAME span can appear in
+    multiple 'Q' ops (repeat-query pattern) — each occurrence is its own
+    independent rec_block at its own sequence position, referencing the SAME
+    underlying enc_blocks by chunk_idx (compression is never redone).
+
+    Unlike chunk_positions_chained/chunk_positions_flow, enc_blocks here is a
+    dict keyed by chunk_idx (not a list in emission order) since 'E'/'S'
+    pairs can occur in any order interspersed with 'Q' ops — later 'Q' ops
+    need to look up "where is chunk k's STATE" regardless of when it was
+    emitted.
+    """
+    enc_blocks_c: dict[int, dict] = {}
+    enc_blocks_m: dict[int, dict] = {}
+    tags: list[tuple[int, int]] = []
+    offset = 0
+
+    query_open, query_close = HMN_QUERY_OPEN, HMN_QUERY_CLOSE
+
+    rec_blocks_c: list[dict] = []
+    rec_blocks_m: list[dict] = []
+    op_count = 0  # counts 'Q' ops AND bare 'S' ops — both produce a relay-eligible STATE
+
+    pending_chunk_idx: int | None = None  # unclaimed 'E' waiting for its 'S'
+
+    for op, arg in operations:
+        if op == 'E':
+            chunk_idx = arg
+            assert chunk_idx not in enc_blocks_c, f'chunk {chunk_idx} encoded twice'
+            assert pending_chunk_idx is None, \
+                f"chunk {pending_chunk_idx}'s 'E' was never followed by 'S' before chunk {chunk_idx}'s 'E'"
+            tags.append((offset, HMN_SRC_OPEN)); offset += 1
+            s0 = offset; s1 = s0 + chunk_len; offset = s1
+            tags.append((offset, HMN_SRC_CLOSE)); offset += 1
+            enc_blocks_c[chunk_idx] = dict(s0=s0, s1=s1)  # sl0/sl1 filled in when 'S' claims it, below
+            enc_blocks_m[chunk_idx] = dict(s0=s0 - 1, s1=s1 + 1)
+            pending_chunk_idx = chunk_idx
+
+        elif op == 'S':
+            sl0 = offset; sl1 = sl0 + state_len; offset = sl1
+            if pending_chunk_idx is not None:
+                # Claims the immediately-preceding unclaimed 'E' — this IS
+                # that chunk's own encoding-STATE (encoding isolation role),
+                # NOT part of the single-hop relay chain (same as the shared
+                # encoding pass always was — see chunk_mask_fb_traj's
+                # encoding-isolation handling, unchanged).
+                enc_blocks_c[pending_chunk_idx]['sl0'] = sl0
+                enc_blocks_c[pending_chunk_idx]['sl1'] = sl1
+                enc_blocks_m[pending_chunk_idx]['sl0'] = sl0
+                enc_blocks_m[pending_chunk_idx]['sl1'] = sl1
+                pending_chunk_idx = None
+            else:
+                # Bare 'S' — no immediately-preceding unclaimed 'E' — this is
+                # a relay-only no-op hop (formerly a separate 'N' op type).
+                # Same relay-read permission as a 'Q' op's STATE row (see
+                # chunk_mask_fb_traj) but no local recall bottleneck rules
+                # (nothing to bound a warmup/response region around).
+                op_idx = op_count
+                op_count += 1
+                rec_blocks_c.append(dict(type='noop', span=None, is_clean=False,
+                                         op_idx=op_idx, sl0=sl0, sl1=sl1))
+                rec_blocks_m.append(dict(type='noop', span=None, op_idx=op_idx, sl0=sl0, sl1=sl1))
+
+        else:  # 'Q'
+            span_s, span_e = arg
+            for k in range(span_s, span_e):
+                assert k in enc_blocks_c, \
+                    f'query span {arg} references chunk {k} which has not been encoded yet — ' \
+                    f'causal violation, fix the operations list'
+            span_len = (span_e - span_s) * chunk_len
+            out_len = span_len - warmup_len
+            op_idx = op_count
+            op_count += 1
+
+            def _emit_round(round_idx: int):
+                nonlocal offset
+                if round_idx == 0:
+                    sl0 = offset; sl1 = sl0 + state_len; offset = sl1
+                    tags.append((offset, query_open)); offset += 1
+                    w0 = offset; w1 = w0 + warmup_len; offset = w1
+                    tags.append((offset, query_close)); offset += 1
+                    tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+                    c0 = offset; c1 = c0 + out_len; offset = c1
+                    tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+                    c_fields = dict(sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1)
+                    m_fields = dict(sl0=sl0, sl1=sl1, w0=w0 - 1, w1=w1 + 1, c0=c0 - 1, c1=c1 + 1)
+                    return c_fields, m_fields
+                else:
+                    sla0 = offset; sla1 = sla0 + state_len; offset = sla1
+                    tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+                    am0 = offset; am1 = am0 + out_len; offset = am1
+                    tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+                    slb0 = offset; slb1 = slb0 + state_len; offset = slb1
+                    tags.append((offset, query_open)); offset += 1
+                    w0 = offset; w1 = w0 + warmup_len; offset = w1
+                    tags.append((offset, query_close)); offset += 1
+                    tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+                    c0 = offset; c1 = c0 + out_len; offset = c1
+                    tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+                    c_fields = dict(sla0=sla0, sla1=sla1, am0=am0, am1=am1, slb0=slb0, slb1=slb1,
+                                    w0=w0, w1=w1, c0=c0, c1=c1)
+                    m_fields = dict(sla0=sla0, sla1=sla1, am0=am0 - 1, am1=am1 + 1,
+                                    slb0=slb0, slb1=slb1, w0=w0 - 1, w1=w1 + 1,
+                                    c0=c0 - 1, c1=c1 + 1)
+                    return c_fields, m_fields
+
+            iq_c, iq_m = _emit_round(0)
+            rec_blocks_c.append(dict(type='iq', span=(span_s, span_e), span_len=span_len,
+                                     out_len=out_len, is_clean=(n_refine == 0), op_idx=op_idx,
+                                     warmup_train_range=(0, 0), warmup_x_dist='fixed', **iq_c))
+            rec_blocks_m.append(dict(type='iq', span=(span_s, span_e), op_idx=op_idx, **iq_m))
+
+            prev_c0_c = iq_c['c0']
+            for _ in range(n_refine):
+                ir_c, ir_m = _emit_round(1)
+                rec_blocks_c.append(dict(type='ir', span=(span_s, span_e), span_len=span_len,
+                                         out_len=out_len, is_clean=True, op_idx=op_idx,
+                                         argmax_src_c0=prev_c0_c, **ir_c))
+                rec_blocks_m.append(dict(type='ir', span=(span_s, span_e), op_idx=op_idx, **ir_m))
+                prev_c0_c = ir_c['c0']
+
+    assert pending_chunk_idx is None, \
+        f"chunk {pending_chunk_idx}'s 'E' was never followed by 'S' — every 'E' needs an 'S' right after it"
+
+    L = offset
+    enc_end = max((b['s1'] for b in enc_blocks_c.values()), default=0)  # informational only, not a hard boundary here
+
+    # Sort by chunk_idx explicitly (NOT dict insertion order) — consumers
+    # like ar_decode_srs_stitched_tagged_nokv assume enc_blocks[k] is chunk
+    # k's block by LIST POSITION. Every traj_* pattern here happens to encode
+    # chunks in numeric order already, so insertion order would coincidentally
+    # match — but that's not guaranteed by the dict structure itself, so sort
+    # explicitly rather than rely on it.
+    chunk_idx_order = sorted(enc_blocks_c.keys())
+    enc_blocks_c_list = [enc_blocks_c[k] for k in chunk_idx_order]
+    enc_blocks_m_list = [enc_blocks_m[k] for k in chunk_idx_order]
+
+    pos_content = dict(enc_blocks=enc_blocks_c_list, rec_blocks=rec_blocks_c,
+                       enc_end=enc_end, warmup_len=warmup_len, L=L)
+    pos_mask = dict(enc_blocks=enc_blocks_m_list, rec_blocks=rec_blocks_m,
+                    enc_end=enc_end, warmup_len=warmup_len, L=L)
+
+    return dict(pos_content=pos_content, pos_mask=pos_mask, tags=tags, L=L)
+
+
+def chunk_mask_fb_traj(pos: dict) -> np.ndarray:
+    """
+    Mask for chunk_positions_traj layouts — same relay exception as
+    chunk_mask_fb_flow (a round-0 STATE row may attend to the immediately
+    preceding relay-producing op's own last-round STATE, single-hop only)
+    but grouped by `op_idx` (the i-th 'Q'-or-'N' operation encountered)
+    instead of by chain-step span, since chunk_positions_traj allows the
+    SAME span to recur (repeat-query), allows 'E' ops interspersed anywhere,
+    and now allows 'N' (no-op) ops that also participate in the relay chain
+    — `span` alone can't identify "which occurrence" the way it could in
+    chunk_positions_flow's strictly-one-Q-per-chain-step schedules.
+
+    Encoding isolation (STATE_k isolated from chunk_j, j≠k), chunk blackout
+    (query/no-op STATE blocked from ALL raw chunks), and IR feedback
+    isolation (IR rounds) are all unchanged from chunk_mask_fb/
+    chunk_mask_fb_flow. Only the relay exception changes how "the
+    immediately preceding thing" is identified, and a 'noop' block gets the
+    SAME chunk-blackout/relay-exception treatment as a 'iq' block's STATE
+    row minus the warmup/output bottlenecks (no warmup/response fields to
+    bound).
+    """
+    L = pos['L']
+    r = np.arange(L); c = np.arange(L)
+    causal  = c[None, :] <= r[:, None]
+    blocked = np.zeros((L, L), dtype=bool)
+
+    enc_blocks = pos['enc_blocks']
+    rec_blocks = pos['rec_blocks']
+
+    is_any_chunk = np.zeros(L, dtype=bool)
+    for b in enc_blocks:
+        is_any_chunk |= (c >= b['s0']) & (c < b['s1'])
+
+    is_any_rec_output = np.zeros(L, dtype=bool)
+    for rb2 in rec_blocks:
+        if 'c0' in rb2:  # 'noop' blocks have no output region
+            is_any_rec_output |= (c >= rb2['c0']) & (c < rb2['c1'])
+
+    last_rb_of_op: dict[int, int] = {}
+    for i_rb, rb in enumerate(rec_blocks):
+        last_rb_of_op[rb['op_idx']] = i_rb  # last write wins -> last rec_block per relay-producing op
+
+    def _relay_source(prev_rb: dict) -> tuple[int, int]:
+        """The (lo, hi) STATE range a later op's relay-read can attend to,
+        for whichever op type prev_rb is."""
+        if prev_rb['type'] == 'iq' or prev_rb['type'] == 'noop':
+            return prev_rb['sl0'], prev_rb['sl1']
+        return prev_rb['slb0'], prev_rb['slb1']
+
+    def _prior_blocked_union(i_rb: int) -> np.ndarray:
+        """Union of everything a round-0 STATE/no-op row is blocked from —
+        every prior rec_block's STATE/warmup/argmax/output (noop blocks only
+        contribute their STATE, having no other fields)."""
+        prior_all = np.zeros(L, dtype=bool)
+        for prev_rb in rec_blocks[:i_rb]:
+            if prev_rb['type'] == 'noop':
+                prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
+            elif prev_rb['type'] == 'iq':
+                prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
+                prior_all |= (c >= prev_rb['w0'])  & (c < prev_rb['w1'])
+                prior_all |= (c >= prev_rb['c0'])  & (c < prev_rb['c1'])
+            else:  # 'ir'
+                prior_all |= (c >= prev_rb['sla0']) & (c < prev_rb['sla1'])
+                prior_all |= (c >= prev_rb['am0'])  & (c < prev_rb['am1'])
+                prior_all |= (c >= prev_rb['slb0']) & (c < prev_rb['slb1'])
+                prior_all |= (c >= prev_rb['w0'])   & (c < prev_rb['w1'])
+                prior_all |= (c >= prev_rb['c0'])   & (c < prev_rb['c1'])
+        return prior_all
+
+    for k, b in enumerate(enc_blocks):
+        sl_row = (r >= b['sl0']) & (r < b['sl1'])
+        for j, bj in enumerate(enc_blocks):
+            if j == k: continue
+            blocked |= sl_row[:, None] & ((c >= bj['s0']) & (c < bj['s1']))[None, :]
+
+    for i_rb, rb in enumerate(rec_blocks):
+        if rb['type'] == 'noop':
+            sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
+            blocked |= sl_row[:, None] & is_any_chunk[None, :]
+
+            prior_all = _prior_blocked_union(i_rb)
+            if rb['op_idx'] > 0:
+                lo, hi = _relay_source(rec_blocks[last_rb_of_op[rb['op_idx'] - 1]])
+                prior_all = prior_all & ~((c >= lo) & (c < hi))
+            blocked |= sl_row[:, None] & prior_all[None, :]
+            # No Rules 4a/4b — a no-op has no warmup/response fields to bound.
+
+        elif rb['type'] == 'iq':
+            sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
+            blocked |= sl_row[:, None] & is_any_chunk[None, :]
+
+            prior_all = _prior_blocked_union(i_rb)
+            if rb['op_idx'] > 0:
+                lo, hi = _relay_source(rec_blocks[last_rb_of_op[rb['op_idx'] - 1]])
+                prior_all = prior_all & ~((c >= lo) & (c < hi))
+            blocked |= sl_row[:, None] & prior_all[None, :]
+
+            if rb['w0'] < rb['w1']:
+                wm_row = (r >= rb['w0']) & (r < rb['w1'])
+                own = (c >= rb['sl0']) & (c < rb['sl1']) | (c >= rb['w0']) & (c < rb['w1'])
+                blocked |= wm_row[:, None] & ~own[None, :]
+            out_row = (r >= rb['c0']) & (r < rb['c1'])
+            own = ((c >= rb['sl0']) & (c < rb['sl1']) |
+                   (c >= rb['w0'])  & (c < rb['w1'])  |
+                   (c >= rb['c0'])  & (c < rb['c1']))
+            blocked |= out_row[:, None] & ~own[None, :]
+
+        else:  # type == 'ir'
+            sla_row = (r >= rb['sla0']) & (r < rb['sla1'])
+            am_row  = (r >= rb['am0'])  & (r < rb['am1'])
+            slb_row = (r >= rb['slb0']) & (r < rb['slb1'])
+            blocked |= (sla_row | am_row | slb_row)[:, None] & (is_any_chunk | is_any_rec_output)[None, :]
+
+            wm_row  = (r >= rb['w0'])  & (r < rb['w1'])
+            out_row = (r >= rb['c0'])  & (r < rb['c1'])
+            own_slb = (c >= rb['slb0']) & (c < rb['slb1'])
+            own_wm  = (c >= rb['w0'])   & (c < rb['w1'])
+            own_out = (c >= rb['c0'])   & (c < rb['c1'])
+            allowed = own_slb | own_wm | own_out
+            if rb['w0'] < rb['w1']:
+                blocked |= wm_row[:, None] & ~(own_slb | own_wm)[None, :]
+            blocked |= out_row[:, None] & ~allowed[None, :]
+
+    visible = causal & ~blocked
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Named trajectory patterns (operations-list constructors) — see
+# docs/HMN_RECIPE.md's trajectory-taxonomy discussion. Each takes n_chunks
+# and returns an `operations` list for chunk_positions_traj. batch/stream/
+# interleave_delayed are the TRAIN-mix candidates; repeat_query and
+# long_hop_recovery are TEST-ONLY (never trained on) — the whole point is
+# they diagnose generalization beyond whatever rhythm was trained on, so
+# training on them would defeat their purpose.
+# ---------------------------------------------------------------------------
+
+def traj_batch(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
+    """Encode everything, then query everything in order — matches relay/flow exactly."""
+    spans = ' '.join(f'Q({i},{i + window_chunks})' for i in range(n_chunks - window_chunks + 1))
+    return parse_traj_dsl(f'E{n_chunks} {spans}')
+
+
+def traj_stream(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
+    """Encode just enough for each query, then query immediately — each
+    query happens as soon as its dependencies are satisfied, not after
+    every chunk has been seen."""
+    dsl_parts = [f'E{window_chunks}']  # enough for the first query
+    for i in range(n_chunks - window_chunks + 1):
+        if i > 0:
+            dsl_parts.append('E')  # one more chunk before each subsequent query
+        dsl_parts.append(f'Q({i},{i + window_chunks})')
+    return parse_traj_dsl(' '.join(dsl_parts))
+
+
+def traj_interleave_delayed(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
+    """Encode everything first (like batch), but query in a SHUFFLED
+    (non-monotonic) order — isolates "does an intervening unrelated query
+    corrupt recall of a not-yet-queried earlier span" from the
+    encode/query-interleaving variable stream already tests."""
+    spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
+    # Reverse order: query the LAST span first, earliest span last — the
+    # earliest span's query now has to survive every other query's relay
+    # update happening first.
+    q_str = ' '.join(f'Q({s},{e})' for s, e in reversed(spans))
+    return parse_traj_dsl(f'E{n_chunks} {q_str}')
+
+
+def traj_repeat_query(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
+    """TEST-ONLY. Encode everything, query in order, then query the FIRST
+    span again at the very end — tests whether that content is still
+    recoverable after the relay state kept moving forward through every
+    other query in between."""
+    spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
+    q_str = ' '.join(f'Q({s},{e})' for s, e in spans)
+    first_s, first_e = spans[0]
+    return parse_traj_dsl(f'E{n_chunks} {q_str} Q({first_s},{first_e})')
+
+
+def traj_long_hop_recovery(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
+    """TEST-ONLY. Encode everything, chain-query every span in order (so the
+    single-hop relay is unbroken all the way through), then probe the FIRST
+    span AGAIN as the final operation — same shape as traj_repeat_query, but
+    intended to be run with a LARGER n_chunks than training ever used (e.g.
+    n_chunks=8, 7 chain steps) to stress the relay over many more hops than
+    it was ever trained on. This IS the deferred "chain-memory recovery
+    probe" — generalized to arbitrary hop count via the same operations list
+    mechanism, not a separate implementation."""
+    return traj_repeat_query(n_chunks, window_chunks)
+
+
+# ---------------------------------------------------------------------------
+# Trajectory DSL — compact string notation for operations lists, matching
+# this project's established curriculum-as-DSL convention (see
+# archive_v1/kvmem/curriculum_dsl.py's `nN/rK/Xk` stage tokens for the
+# precedent this follows, adapted to weave's E/S/Q operation alphabet).
+#
+# Grammar (whitespace-separated tokens):
+#   E          ingest the next not-yet-ingested chunk's raw bytes (no STATE
+#              yet — MUST be immediately followed by 'S', asserted by
+#              chunk_positions_traj, not just documented)
+#   E<n>       n consecutive (ingest, compress) PAIRS — shorthand that still
+#              expands to explicit alternating E S E S ... (n of each), never
+#              a bundled "encode" primitive — see chunk_positions_traj's
+#              docstring for why E and S are kept as two separate ops
+#   S          emit one STATE region — claims the immediately-preceding
+#              unclaimed 'E' if there is one (that chunk's own encoding-
+#              STATE), otherwise a bare relay-only no-op hop
+#   S<n>       n bare 'S' ops in a row (only meaningful with no preceding
+#              unclaimed 'E' — e.g. after a 'Q', for decay-curve patterns)
+#   Q(s,e)     query span [s,e)
+#
+# Examples (equivalent to the Python constructors above):
+#   batch:               "E4 Q(0,2) Q(1,3) Q(2,4)"
+#   stream:               "E2 Q(0,2) E S Q(1,3) E S Q(2,4)"
+#   interleave_delayed:    "E4 Q(2,4) Q(1,3) Q(0,2)"
+#   repeat_query:          "E4 Q(0,2) Q(1,3) Q(2,4) Q(0,2)"
+#   decay_curve (4 hops): "E2 Q(0,2) S4 Q(0,2)"
+# ---------------------------------------------------------------------------
+
+def parse_traj_dsl(s: str) -> list[tuple]:
+    """Parse a trajectory DSL string into an operations list for
+    chunk_positions_traj. See the grammar comment above this function.
+    'E<n>' expands to n explicit (E, S) pairs, never a bundled op — the
+    resulting operations list always has 'S' immediately after every 'E',
+    matching chunk_positions_traj's hard requirement."""
+    ops: list[tuple] = []
+    next_chunk_idx = 0
+    for tok in s.split():
+        if tok.startswith('Q('):
+            inner = tok[2:-1]  # strip 'Q(' and trailing ')'
+            s_str, e_str = inner.split(',')
+            ops.append(('Q', (int(s_str), int(e_str))))
+        elif tok.startswith('E'):
+            n = int(tok[1:]) if len(tok) > 1 else 1
+            for _ in range(n):
+                ops.append(('E', next_chunk_idx))
+                ops.append(('S', None))
+                next_chunk_idx += 1
+        elif tok.startswith('S'):
+            n = int(tok[1:]) if len(tok) > 1 else 1
+            for _ in range(n):
+                ops.append(('S', None))
+        else:
+            raise ValueError(f'unrecognized trajectory DSL token: {tok!r}')
+    return ops
+
+
+def traj_decay_curve(n_noop_hops: int, window_chunks: int = 2) -> list[tuple]:
+    """TEST-ONLY (or a train-mix candidate at low hop counts — see
+    docs/HMN_RECIPE.md). Query once, take n_noop_hops content-free relay
+    hops, then repeat the SAME query — isolates pure relay decay rate from
+    recall-accuracy-at-each-hop the way repeat_query/long_hop_recovery
+    cannot (their intermediate hops are all real queries with their own
+    local recall task, confounding "did the relay lose information" with
+    "did that hop's own recall fail for unrelated reasons"). Cheap to
+    stretch arbitrarily far since no-ops carry no extra warmup/response
+    tokens and contribute no extra loss terms — sweep n_noop_hops to build
+    an actual decay curve (match% vs. hop count) for the checkpoint being
+    tested. Built on parse_traj_dsl as a demonstration of the DSL's purpose:
+    every named trajectory constructor above could be expressed this way.
+
+    Only encodes exactly `window_chunks` chunks (just enough for the probe
+    span) — no unused chunks, since the point is isolating pure decay, not
+    exercising a full multi-chunk schedule (unlike batch/stream/etc., this
+    doesn't take a separate n_chunks parameter).
+
+    CONFOUND WARNING for zero-shot eval against an existing checkpoint
+    (measured, not theoretical — see eval_weave smoke test against `solo`'s
+    checkpoint): this produces a MUCH SHORTER total sequence (L=156 at
+    window_chunks=2/state_len=8/chunk_len=16) than a checkpoint trained with
+    a larger n_chunks (e.g. `solo`'s L=236 at n_chunks=4). A checkpoint that
+    scores 100% on batch/repeat_query (same n_chunks as training) can score
+    0% here purely from never having seen a sequence this short/differently
+    laid out — that's a LENGTH-EXTRAPOLATION failure, not evidence about
+    decay. Only trust decay_curve results from a checkpoint that was
+    actually TRAINED on decay_curve-shaped trajectories (or close to this
+    exact length), not zero-shot against solo/relay/flow.
+    """
+    return parse_traj_dsl(f'E{window_chunks} Q(0,{window_chunks}) S{n_noop_hops} Q(0,{window_chunks})')
+
+
 # =============================================================================
 # Attention mask construction (feedback-argmax IR layout)
 # ported from kvmem/train_hmn_chunk.py: chunk_mask_fb (lines 583-688)
@@ -357,22 +831,22 @@ def chunk_positions_chained(n_chunks: int, chunk_len: int, state_len: int,
 def chunk_mask_fb(pos: dict) -> np.ndarray:
     """
     Mask for feedback-argmax IR layout. Same rules as chunk_mask for encoding
-    blocks and round-0 (IQ) turns. Additional rules for IR rounds:
+    blocks and round-0 (IQ) turns. Additional rules for IR rounds (together,
+    the IR feedback isolation rule):
 
-    5. STATE_A rows: blocked from all chunks (like all recall STATE fields).
-    6. argmax rows: blocked from all chunks.
-    7. STATE_B rows: blocked from all chunks; sees STATE_A + argmax causally.
-    8. IR warmup/out rows: blocked from everything except own STATE_B + own warmup/out.
-       (Same strong bottleneck as round-0 out rows, but STATE_B is the gate — not STATE_A or argmax.)
+    - STATE_A rows: blocked from all chunks (like all recall STATE fields).
+    - argmax rows: blocked from all chunks.
+    - STATE_B rows: blocked from all chunks; sees STATE_A + argmax causally.
+    - IR output bottleneck: warmup/out rows blocked from everything except own STATE_B + own warmup/out.
+       (Same strong bottleneck as the round-0 output bottleneck, but STATE_B is the gate — not STATE_A or argmax.)
 
-    Rule 3b (always on): Each round-0 STATE row (and its STATE_QUEUE_in, if
-    any) is blocked from ALL tokens in prior rec_blocks (STATE, warmup, argmax,
-    AND output of earlier chain steps' round-0 and IR turns). Forces every
-    chain step to encode independently from enc-block STATEs (+ its own
-    injected STATE_QUEUE_in) only. Without this, the model chains through
-    prior OUTPUT tokens — chain step 1 reads chain step 0's recalled bytes in
-    the 50% overlap region. Blocking only prior STATEs is insufficient
-    (v4 lesson).
+    Nochain blackout (always on): Each round-0 STATE row is blocked from ALL
+    tokens in prior rec_blocks (STATE, warmup, argmax, AND output of earlier
+    chain steps' round-0 and IR turns). Forces every chain step to encode
+    independently from enc-block STATEs only. Without this, the model chains
+    through prior OUTPUT tokens — chain step 1 reads chain step 0's recalled
+    bytes in the 50% overlap region. Blocking only prior STATEs is
+    insufficient (v4 lesson).
     """
     L = pos['L']
     r = np.arange(L); c = np.arange(L)
@@ -397,7 +871,7 @@ def chunk_mask_fb(pos: dict) -> np.ndarray:
     for rb2 in rec_blocks:
         is_any_rec_output |= (c >= rb2['c0']) & (c < rb2['c1'])
 
-    # Rule 2: encoding STATE_k blocked from chunk_j (j≠k)
+    # Encoding isolation: encoding STATE_k blocked from chunk_j (j≠k)
     for k, b in enumerate(enc_blocks):
         sl_row = (r >= b['sl0']) & (r < b['sl1'])
         for j, bj in enumerate(enc_blocks):
@@ -406,24 +880,21 @@ def chunk_mask_fb(pos: dict) -> np.ndarray:
 
     for i_rb, rb in enumerate(rec_blocks):
         if rb['type'] == 'iq':
-            has_queue_in = 'queue0' in rb
-            # Rule 3 (round-0 STATE): blocked from all chunks
+            # Chunk blackout (round-0 STATE): blocked from all chunks
             sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
             blocked |= sl_row[:, None] & is_any_chunk[None, :]
-            # Rule 3b: round-0 STATE blocked from ALL tokens in prior rec_blocks
-            # (STATE + warmup + argmax + output). Blocking only STATEs is insufficient —
-            # the model chains through prior OUTPUT tokens (chain step 1 reads chain step
-            # 0's recalled bytes in the 50% overlap). Full blackout forces every chain
-            # step to encode from enc-block STATEs (+ its own STATE_QUEUE_in, the only
-            # sanctioned cross-chain-step channel) only.
+            # Nochain blackout: round-0 STATE blocked from ALL tokens in
+            # prior rec_blocks (STATE + warmup + argmax + output). Blocking
+            # only STATEs is insufficient — the model chains through prior
+            # OUTPUT tokens (chain step 1 reads chain step 0's recalled
+            # bytes in the 50% overlap). Full blackout forces every chain
+            # step to encode from enc-block STATEs only.
             prior_all = np.zeros(L, dtype=bool)
             for prev_rb in rec_blocks[:i_rb]:
                 if prev_rb['type'] == 'iq':
                     prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
                     prior_all |= (c >= prev_rb['w0'])  & (c < prev_rb['w1'])
                     prior_all |= (c >= prev_rb['c0'])  & (c < prev_rb['c1'])
-                    if 'queue0' in prev_rb:
-                        prior_all |= (c >= prev_rb['queue0']) & (c < prev_rb['queue1'])
                 else:
                     prior_all |= (c >= prev_rb['sla0']) & (c < prev_rb['sla1'])
                     prior_all |= (c >= prev_rb['am0'])  & (c < prev_rb['am1'])
@@ -431,40 +902,157 @@ def chunk_mask_fb(pos: dict) -> np.ndarray:
                     prior_all |= (c >= prev_rb['w0'])   & (c < prev_rb['w1'])
                     prior_all |= (c >= prev_rb['c0'])   & (c < prev_rb['c1'])
             blocked |= sl_row[:, None] & prior_all[None, :]
-            if has_queue_in:
-                # STATE_QUEUE_in row: same nochain treatment as round-0 STATE
-                # itself — blocked from all chunks and all prior rec_blocks'
-                # tokens. Its only content comes from h_inject, not attention.
-                q_row = (r >= rb['queue0']) & (r < rb['queue1'])
-                blocked |= q_row[:, None] & is_any_chunk[None, :]
-                blocked |= q_row[:, None] & prior_all[None, :]
-            # Rule 4a: round-0 warmup rows — own STATE_QUEUE_in (if any) + own STATE + own warmup only
+            # Warmup bottleneck: round-0 warmup rows — own STATE + own warmup only
             if rb['w0'] < rb['w1']:
                 wm_row = (r >= rb['w0']) & (r < rb['w1'])
                 own = (c >= rb['sl0']) & (c < rb['sl1']) | (c >= rb['w0']) & (c < rb['w1'])
-                if has_queue_in:
-                    own = own | (c >= rb['queue0']) & (c < rb['queue1'])
                 blocked |= wm_row[:, None] & ~own[None, :]
-            # Rule 4b: round-0 out rows — own STATE_QUEUE_in (if any) + own STATE + own warmup + own output
+            # Output bottleneck: round-0 out rows — own STATE + own warmup + own output
             out_row = (r >= rb['c0']) & (r < rb['c1'])
             own = ((c >= rb['sl0']) & (c < rb['sl1']) |
                    (c >= rb['w0'])  & (c < rb['w1'])  |
                    (c >= rb['c0'])  & (c < rb['c1']))
-            if has_queue_in:
-                own = own | (c >= rb['queue0']) & (c < rb['queue1'])
             blocked |= out_row[:, None] & ~own[None, :]
 
         else:  # type == 'ir'
-            # Rules 5,6,7: STATE_A, argmax, STATE_B — blocked from encoding chunks
-            # AND from every rec_block's own raw output region (own am0:am1
-            # copy is the only sanctioned path back to an earlier turn's
-            # output — see is_any_rec_output comment above).
+            # IR feedback isolation: STATE_A, argmax, STATE_B — blocked from
+            # encoding chunks AND from every rec_block's own raw output
+            # region (own am0:am1 copy is the only sanctioned path back to
+            # an earlier turn's output — see is_any_rec_output comment above).
             sla_row = (r >= rb['sla0']) & (r < rb['sla1'])
             am_row  = (r >= rb['am0'])  & (r < rb['am1'])
             slb_row = (r >= rb['slb0']) & (r < rb['slb1'])
             blocked |= (sla_row | am_row | slb_row)[:, None] & (is_any_chunk | is_any_rec_output)[None, :]
 
-            # Rule 8: IR warmup/out rows — only own STATE_B + own warmup + own output
+            # IR output bottleneck: warmup/out rows — only own STATE_B + own warmup + own output
+            wm_row  = (r >= rb['w0'])  & (r < rb['w1'])
+            out_row = (r >= rb['c0'])  & (r < rb['c1'])
+            own_slb = (c >= rb['slb0']) & (c < rb['slb1'])
+            own_wm  = (c >= rb['w0'])   & (c < rb['w1'])
+            own_out = (c >= rb['c0'])   & (c < rb['c1'])
+            allowed = own_slb | own_wm | own_out
+            if rb['w0'] < rb['w1']:
+                blocked |= wm_row[:, None] & ~(own_slb | own_wm)[None, :]
+            blocked |= out_row[:, None] & ~allowed[None, :]
+
+    visible = causal & ~blocked
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
+
+
+def chunk_mask_fb_flow(pos: dict) -> np.ndarray:
+    """
+    Mask for Stage `flow` layouts (chunk_positions_flow) — identical to
+    chunk_mask_fb in every rule EXCEPT one deliberate, narrow exception to
+    the nochain blackout: a round-0 STATE row is still blocked from every
+    prior chain step's warmup/argmax/output and from every prior chain
+    step's STATE EXCEPT the immediately preceding chain step's own
+    last-round STATE (its sl0:sl1 if that chain step had no IR rounds, else
+    its slb0:slb1 — the same "last round's own STATE" definition the
+    original STATE_QUEUE_out used). This is the sanctioned single-hop relay
+    channel (the relay exception), now a genuine attention permission
+    instead of a forced h_inject copy — see chunk_positions_flow's docstring
+    for the full rationale.
+
+    Everything else (encoding isolation, IR feedback isolation for IR
+    rounds, the is_any_rec_output leak-prevention union) is copied verbatim
+    from chunk_mask_fb — this function is NOT a general-purpose replacement,
+    only chunk_positions_flow's own pos dicts (which never have a 'queue0'
+    field) should be passed to it.
+    """
+    L = pos['L']
+    r = np.arange(L); c = np.arange(L)
+    causal  = c[None, :] <= r[:, None]
+    blocked = np.zeros((L, L), dtype=bool)
+
+    enc_blocks = pos['enc_blocks']
+    rec_blocks = pos['rec_blocks']
+
+    is_any_chunk = np.zeros(L, dtype=bool)
+    for b in enc_blocks:
+        is_any_chunk |= (c >= b['s0']) & (c < b['s1'])
+
+    is_any_rec_output = np.zeros(L, dtype=bool)
+    for rb2 in rec_blocks:
+        is_any_rec_output |= (c >= rb2['c0']) & (c < rb2['c1'])
+
+    # Group rec_block indices by chain step (consecutive runs sharing the
+    # same 'span') so the relay exception can find "the immediately
+    # preceding chain step's last rec_block" for the single-hop
+    # STATE-to-STATE exception.
+    chain_step_of_rb: list[int] = []
+    span_to_idx: dict[tuple, int] = {}
+    for rb in rec_blocks:
+        if rb['span'] not in span_to_idx:
+            span_to_idx[rb['span']] = len(span_to_idx)
+        chain_step_of_rb.append(span_to_idx[rb['span']])
+    last_rb_of_chain_step: dict[int, int] = {}
+    for i_rb, ci in enumerate(chain_step_of_rb):
+        last_rb_of_chain_step[ci] = i_rb  # overwritten each time -> ends up as the LAST index per chain step
+
+    # Encoding isolation: encoding STATE_k blocked from chunk_j (j≠k)
+    for k, b in enumerate(enc_blocks):
+        sl_row = (r >= b['sl0']) & (r < b['sl1'])
+        for j, bj in enumerate(enc_blocks):
+            if j == k: continue
+            blocked |= sl_row[:, None] & ((c >= bj['s0']) & (c < bj['s1']))[None, :]
+
+    for i_rb, rb in enumerate(rec_blocks):
+        if rb['type'] == 'iq':
+            sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
+            blocked |= sl_row[:, None] & is_any_chunk[None, :]
+
+            this_chain_step = chain_step_of_rb[i_rb]
+            allowed_relay_lo = allowed_relay_hi = None
+            if this_chain_step > 0:
+                prev_last_i_rb = last_rb_of_chain_step[this_chain_step - 1]
+                prev_last_rb = rec_blocks[prev_last_i_rb]
+                if prev_last_rb['type'] == 'iq':
+                    allowed_relay_lo, allowed_relay_hi = prev_last_rb['sl0'], prev_last_rb['sl1']
+                else:
+                    allowed_relay_lo, allowed_relay_hi = prev_last_rb['slb0'], prev_last_rb['slb1']
+
+            # Relay exception: round-0 STATE blocked from ALL tokens in prior
+            # rec_blocks EXCEPT the immediately preceding chain step's own
+            # last-round STATE (the single-hop carve-out from the nochain
+            # blackout — see module docstring).
+            prior_all = np.zeros(L, dtype=bool)
+            for prev_rb in rec_blocks[:i_rb]:
+                if prev_rb['type'] == 'iq':
+                    prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
+                    prior_all |= (c >= prev_rb['w0'])  & (c < prev_rb['w1'])
+                    prior_all |= (c >= prev_rb['c0'])  & (c < prev_rb['c1'])
+                else:
+                    prior_all |= (c >= prev_rb['sla0']) & (c < prev_rb['sla1'])
+                    prior_all |= (c >= prev_rb['am0'])  & (c < prev_rb['am1'])
+                    prior_all |= (c >= prev_rb['slb0']) & (c < prev_rb['slb1'])
+                    prior_all |= (c >= prev_rb['w0'])   & (c < prev_rb['w1'])
+                    prior_all |= (c >= prev_rb['c0'])   & (c < prev_rb['c1'])
+            if allowed_relay_lo is not None:
+                relay_cols = (c >= allowed_relay_lo) & (c < allowed_relay_hi)
+                prior_all = prior_all & ~relay_cols
+            blocked |= sl_row[:, None] & prior_all[None, :]
+
+            # Warmup bottleneck: round-0 warmup rows — own STATE + own warmup only
+            # (relay visibility is NOT extended to warmup/output rows — only
+            # the STATE row itself gets the single-hop exception, same
+            # bottleneck-forcing intent as STATE_QUEUE_in's original design).
+            if rb['w0'] < rb['w1']:
+                wm_row = (r >= rb['w0']) & (r < rb['w1'])
+                own = (c >= rb['sl0']) & (c < rb['sl1']) | (c >= rb['w0']) & (c < rb['w1'])
+                blocked |= wm_row[:, None] & ~own[None, :]
+            # Output bottleneck: round-0 out rows — own STATE + own warmup + own output
+            out_row = (r >= rb['c0']) & (r < rb['c1'])
+            own = ((c >= rb['sl0']) & (c < rb['sl1']) |
+                   (c >= rb['w0'])  & (c < rb['w1'])  |
+                   (c >= rb['c0'])  & (c < rb['c1']))
+            blocked |= out_row[:, None] & ~own[None, :]
+
+        else:  # type == 'ir'
+            sla_row = (r >= rb['sla0']) & (r < rb['sla1'])
+            am_row  = (r >= rb['am0'])  & (r < rb['am1'])
+            slb_row = (r >= rb['slb0']) & (r < rb['slb1'])
+            blocked |= (sla_row | am_row | slb_row)[:, None] & (is_any_chunk | is_any_rec_output)[None, :]
+
             wm_row  = (r >= rb['w0'])  & (r < rb['w1'])
             out_row = (r >= rb['c0'])  & (r < rb['c1'])
             own_slb = (c >= rb['slb0']) & (c < rb['slb1'])
@@ -519,12 +1107,29 @@ def _cat_kv(kv_a: list, kv_b: list) -> list:
 
 def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len: int,
                       state_len: int, state_vocab_size: int, pos_content: dict,
-                      tags: list[tuple[int, int]]) -> np.ndarray:
+                      tags: list[tuple[int, int]],
+                      data_kind: str = 'random', data_target_bits: float | None = None) -> np.ndarray:
+    """
+    data_kind: 'random' (default, unchanged behavior — uniform random bytes,
+    the source distribution every prior architecture in this project trained
+    and validated on) or 'chaotic'/'fractal'/'ca' (kvmem/structured_data.py —
+    the structured-data track, see docs/HMN_RECIPE.md §8). Each batch item
+    gets a FRESH call to generate_structured_chunks (fresh rule/seed per
+    example, same principle as random bytes already being resampled per
+    batch — required so the model can't bake a fixed rule into static
+    weights instead of encoding it into STATE, see structured_data.py's
+    module docstring).
+    """
     sids = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
     wl = pos_content['warmup_len']
     L = pos_content['L']
     tok = np.zeros((B, L), dtype=np.int64)
-    segs = rng.integers(0, 256, size=(B, n_chunks, chunk_len), dtype=np.int64)
+    if data_kind == 'random':
+        segs = rng.integers(0, 256, size=(B, n_chunks, chunk_len), dtype=np.int64)
+    else:
+        segs = np.stack([generate_structured_chunks(rng, data_kind, n_chunks, chunk_len,
+                                                     target_bits=data_target_bits)
+                        for _ in range(B)], axis=0)
 
     for k, b in enumerate(pos_content['enc_blocks']):
         tok[:, b['s0']:b['s1']] = segs[:, k, :]
@@ -537,12 +1142,6 @@ def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
 
         if rb['type'] == 'iq':
             tok[:, rb['sl0']:rb['sl1']] = sids
-            if 'queue0' in rb:
-                # STATE_QUEUE_in placeholder fill — content is overridden by
-                # h_inject in train()'s chained dispatch; the token identity
-                # here is only there to give the region a well-defined shape
-                # before injection (see chunk_positions_chained docstring).
-                tok[:, rb['queue0']:rb['queue1']] = sids
             x_min, x_max = rb['warmup_train_range']
             _xdist = rb.get('warmup_x_dist', 'uniform')
             if _xdist == 'arcsine':
@@ -821,6 +1420,123 @@ def ar_decode_srs_stitched_tagged_nokv(model, chunks_arr, state_len: int, state_
     bpb = float(np.mean(nll_buf[wl:][valid]) / math.log(2)) if valid.any() else float('nan')
 
     return dict(bpb=bpb, match_pct=match_pct, decoded_bytes=decoded_bytes.tolist(),
+               turn_match_pcts=turn_match_pcts)
+
+
+@torch.no_grad()
+def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int,
+                        mask_np: np.ndarray, pos_content: dict,
+                        tags: list[tuple[int, int]], device) -> dict:
+    """
+    AR decode for chunk_positions_traj layouts (Stage `weave`) — same
+    mechanics as ar_decode_srs_stitched_tagged_nokv (full-recompute, no KV
+    cache; only the FIRST query's warmup comes from ground truth, every
+    later query's warmup is chained from the model's own decoded bytes) but
+    generalized to handle `'noop'` rec_blocks, which
+    ar_decode_srs_stitched_tagged_nokv cannot: it unconditionally unpacks
+    `rb['span']` and branches only on 'iq'/'ir', and a `'noop'` block has
+    `span=None` and none of `sla0`/`am0`/etc. — would raise on both counts.
+
+    A no-op block needs no decode step at all: its STATE region is filled
+    with the same fixed placeholder tokens (`sids`) as any other STATE
+    region, and its actual VALUE is whatever the causal forward pass
+    computes there — there is no c0:c1 output to autoregressively generate,
+    no target to match, no `turn_match_pcts` entry. It exists purely as
+    context for whatever LATER op's single-hop relay reads it.
+
+    Simplifications vs. ar_decode_srs_stitched_tagged_nokv: (1) no BPB —
+    that function's teacher-forced BPB pass groups rec_blocks by "last
+    block per contiguous same-span run," which assumes each span appears
+    at most once in a monotonic sequence; repeat_query/interleave_delayed
+    violate that (the same span can recur non-contiguously), so BPB is
+    dropped here rather than computed incorrectly — match_pct (mean of
+    turn_match_pcts) is the metric this diagnostic actually needs. (2)
+    warmup chaining keyed by span (`decoded_by_span`), not a single global
+    byte buffer — a repeated span's second occurrence chains its warmup
+    from that SAME span's own most recent decode, not from whatever
+    happens to sit at that byte offset globally (meaningful for weave's
+    arbitrary/non-overlapping spans, unlike relay/flow's fixed 50%-overlap
+    schedule where a global buffer and per-span chaining coincide).
+    """
+    if isinstance(chunks_arr, np.ndarray) and chunks_arr.ndim == 2:
+        chunks_list = [chunks_arr[k] for k in range(chunks_arr.shape[0])]
+    else:
+        chunks_list = list(chunks_arr)
+
+    chunk_len = len(chunks_list[0])
+    wl        = pos_content['warmup_len']
+    sids      = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
+    L         = pos_content['L']
+    full_mask = torch.tensor(mask_np, dtype=torch.float32, device=device)
+    gt_full   = np.concatenate(chunks_list)
+
+    tok = np.zeros(L, dtype=np.int64)
+    for k, b in enumerate(pos_content['enc_blocks']):
+        tok[b['s0']:b['s1']]   = chunks_list[k]
+        tok[b['sl0']:b['sl1']] = sids
+
+    tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
+    tag_ids = np.array([i for _, i in tags], dtype=np.int64)
+    tok[tag_pos] = tag_ids
+
+    def _fwd_logits_at(pos: int) -> torch.Tensor:
+        t = torch.tensor(tok[:pos], dtype=torch.long, device=device)
+        m = full_mask[:pos, :pos]
+        logits = model(t, m)
+        return logits[-1]
+
+    def _decode_segment(rb):
+        for j in range(rb['out_len']):
+            pos = rb['c0'] + j
+            logits = _fwd_logits_at(pos)
+            tok[pos] = int(logits.argmax())
+
+    decoded_by_span: dict[tuple, np.ndarray] = {}  # last-decoded bytes per span (for warmup chaining)
+    turn_match_pcts: list[float] = []
+
+    for rb in pos_content['rec_blocks']:
+        if rb['type'] == 'noop':
+            tok[rb['sl0']:rb['sl1']] = sids  # placeholder only — real content comes from causal attention
+            continue
+
+        span_s, span_e = rb['span']
+        gt_span = np.concatenate(chunks_list[span_s:span_e])
+
+        # First-ever occurrence of ANY span starting at byte 0 uses ground
+        # truth (nothing decoded yet); every other occurrence (including a
+        # REPEATED query of the same span) chains from whatever was most
+        # recently decoded for that exact span.
+        if span_s == 0 and rb['span'] not in decoded_by_span:
+            warmup_src = gt_span[:wl]
+        else:
+            warmup_src = decoded_by_span.get(rb['span'], gt_span)[:wl]
+
+        if rb['type'] == 'iq':
+            tok[rb['sl0']:rb['sl1']] = sids
+            if wl > 0:
+                tok[rb['w0']:rb['w1']] = warmup_src
+            _decode_segment(rb)
+        else:  # 'ir'
+            tok[rb['sla0']:rb['sla1']] = sids
+            src_c0 = rb['argmax_src_c0']
+            tok[rb['am0']:rb['am1']] = tok[src_c0:src_c0 + rb['out_len']]
+            tok[rb['slb0']:rb['slb1']] = sids
+            if wl > 0:
+                tok[rb['w0']:rb['w1']] = warmup_src
+            _decode_segment(rb)
+
+        out_len = rb['out_len']
+        decoded_by_span[rb['span']] = np.concatenate([
+            warmup_src if wl > 0 else np.array([], dtype=np.int64),
+            tok[rb['c0']:rb['c1']],
+        ])
+
+        rb_target = gt_span[wl:wl + out_len]
+        rb_gen    = tok[rb['c0']:rb['c1']]
+        rb_match  = 100.0 * float(np.sum(rb_gen[:len(rb_target)] == rb_target)) / max(len(rb_target), 1)
+        turn_match_pcts.append(rb_match)
+
+    return dict(match_pct=(sum(turn_match_pcts) / len(turn_match_pcts) if turn_match_pcts else float('nan')),
                turn_match_pcts=turn_match_pcts)
 
 
@@ -1239,8 +1955,7 @@ class HMNModel(nn.Module):
                 past_kv: list | None = None,
                 return_kv: bool = False,
                 offset: int = 0,
-                return_features: bool = False,
-                h_inject: dict | None = None) -> torch.Tensor | tuple:
+                return_features: bool = False) -> torch.Tensor | tuple:
         """
         tokens          : (B, L) or (L,) int64
         mask            : (L_q, L_kv) — L_kv = L_past + L when past_kv given
@@ -1250,9 +1965,6 @@ class HMNModel(nn.Module):
         return_features : return (logits, x) where x is the pre-head residual stream
                           (B, L, d); disables grad_checkpoint to preserve full graph.
         offset          : RoPE position offset (= L_past for suffix pass)
-        h_inject        : dict mapping (sl0, sl1) → (B, state_len, d) tensor.
-                          Overrides the embedding at x[:, sl0:sl1, :] after _embed()
-                          but before transformer blocks.
 
         grad_checkpoint: for attn_mlp/single_attn, True checkpoints each block
         during backward (depth-only), same semantics as KVMemModel. For
@@ -1263,10 +1975,6 @@ class HMNModel(nn.Module):
         if not batched:
             tokens = tokens.unsqueeze(0)
         x      = self._embed(tokens)
-        if h_inject is not None:
-            for (sl0, sl1), h_val in h_inject.items():
-                x = x.clone()  # avoid in-place autograd error
-                x[:, sl0:sl1, :] = h_val
 
         if self.block_type == 'dual_attn':
             # No KV-cache support — full pass only, matches DualAttnModel.
@@ -1544,6 +2252,8 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     warmup_steps = hp.get('warmup_steps', 500)
     use_actual_am = hp.get('use_actual_argmax', True)
     wrong_token_weight = hp.get('wrong_token_weight', 0.0)  # alpha: extra NLL weight on wrong-argmax positions
+    data_kind = hp.get('data_kind', 'random')  # 'random' (default) | 'chaotic'/'fractal'/'ca' (structured-data track)
+    data_target_bits = hp.get('data_target_bits', None)
     opt = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=wd, betas=(0.9, 0.999))
 
     curriculum = hp.get('curriculum', [])
@@ -1555,19 +2265,26 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
     for stage_i, stage in enumerate(curriculum):
         if 'chain_steps' in stage:
-            # NEW path: true chained multi-chain-step training (ports
-            # experiments/attn_dual/train.py's single-trajectory loop verbatim).
-            # Structurally different from the traj_mix branch below: ONE packed
-            # pos/mask built from a fixed `chain_steps` list (one rec_block per
-            # chain step, each with its own n_refine IR rounds) instead of many
+            # Chained multi-chain-step training (ports experiments/attn_dual/
+            # train.py's single-trajectory loop verbatim). Structurally
+            # different from the traj_mix branch below: ONE packed pos/mask
+            # built from a fixed `chain_steps` list (one rec_block per chain
+            # step, each with its own n_refine IR rounds) instead of many
             # small per-trajectory sequences sampled by weight each step.
             #
-            # stage['chain']=True switches to the STATE_QUEUE-chained sequential
-            # dispatch (one forward pass per chain step, h_inject-linked) —
-            # see the `if is_chained:` branch below. stage['chain'] absent/False
-            # keeps today's fast single-packed-sequence path (2 forward passes
-            # total regardless of chain-step count), valid only when no chain
-            # step reads a STATE_QUEUE_in (i.e. no cross-chain-step dependency).
+            # Always uses chunk_positions_flow/chunk_mask_fb_flow — the
+            # single-hop STATE-to-STATE attention permission (the relay
+            # exception) is a strict superset of the single-chain-step case (no prior chain
+            # step to read from, so the exception never triggers — byte-
+            # identical layout to a plain non-relay schedule) AND the
+            # multi-chain-step relay case, resolved entirely within one
+            # packed-sequence forward pass (no sequential per-chain-step
+            # orchestration needed). Superseded the earlier h_inject-based
+            # STATE_QUEUE/`chain=True` relay (chunk_positions_chained,
+            # sequential per-chain-step forward passes with a .detach()'d
+            # injected feature) once `flow`'s learned-attention-permission
+            # mechanism was validated to substantially outperform it — see
+            # docs/HMN_RECIPE.md §4b and CLAUDE.md's relay-vs-flow comparison.
             n_chunks   = stage['n_chunks']
             chunk_len  = stage['chunk_len']
             state_len  = hp.get('state_len', 8)
@@ -1579,18 +2296,17 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             stage_eval_every = stage.get('eval_every', 5000)
             ls_max     = hp.get('ls_max', 0.0)
             chain_steps = stage['chain_steps']
-            is_chained = bool(stage.get('chain', False))
 
-            built = chunk_positions_chained(n_chunks, chunk_len, state_len, warmup_len,
-                                            chain_steps, n_refine=n_refine,
-                                            state_vocab_size=state_vocab_size)
+            built = chunk_positions_flow(n_chunks, chunk_len, state_len, warmup_len,
+                                         chain_steps, n_refine=n_refine,
+                                         state_vocab_size=state_vocab_size)
             pos_content, pos_mask, tags, L = (built['pos_content'], built['pos_mask'],
                                               built['tags'], built['L'])
-            mask_np = chunk_mask_fb(pos_mask)
+            mask_np = chunk_mask_fb_flow(pos_mask)
             mask_t  = torch.tensor(mask_np, dtype=torch.float32, device=device)
 
             _log(f'\n[stage {stage_i}] n_chunks={n_chunks} chunk_len={chunk_len} state={state_len} '
-                 f'wl={warmup_len} chain_steps={chain_steps} n_refine={n_refine} chain={is_chained} '
+                 f'wl={warmup_len} chain_steps={chain_steps} n_refine={n_refine}  '
                  f'B={B}  steps={n_steps}  L={L}')
 
             lr_min      = hp.get('lr_min', 0.0)
@@ -1624,16 +2340,6 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 except Exception as e:
                     _log(f'  [test eval disabled: {e}]')
 
-            # Per-chain-step rec_block index groups, in schedule order — used
-            # by both the fast packed path and the chained h_inject path to
-            # slice out "this chain step's own rec_blocks" and (for chained)
-            # "this chain step's last round's own STATE field" for
-            # STATE_QUEUE_out extraction.
-            chain_step_rb_idxs: list[list[int]] = [[] for _ in chain_steps]
-            span_to_chain_idx = {span: i for i, span in enumerate(chain_steps)}
-            for i, rb in enumerate(pos_content['rec_blocks']):
-                chain_step_rb_idxs[span_to_chain_idx[rb['span']]].append(i)
-
             stage_best_val = -1.0
             pbar = tqdm(range(1, n_steps + 1), desc=f'stage{stage_i}', dynamic_ncols=True, file=status_file)
             for local_step in pbar:
@@ -1644,86 +2350,35 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 model.train(); opt.zero_grad()
 
                 tok_np = make_batch_tagged(rng, B, n_chunks, chunk_len, state_len, state_vocab_size,
-                                           pos_content, tags)
+                                           pos_content, tags, data_kind=data_kind,
+                                           data_target_bits=data_target_bits)
                 tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
 
                 wrong_masks: dict[int, np.ndarray] = {}
 
-                if not is_chained:
-                    # Fast path: no STATE_QUEUE_in anywhere in this schedule (or
-                    # chain=False was set deliberately) — one shared mask, up to
-                    # 2 forward passes total for the whole packed sequence,
-                    # exactly as before the STATE_QUEUE mechanism existed.
-                    if use_actual_am:
-                        with torch.no_grad():
-                            logits_1 = model(tok_t, mask_t)
-                        if wrong_token_weight > 0:
-                            for i, rb in enumerate(pos_content['rec_blocks']):
-                                if rb['type'] != 'ir':
-                                    continue
-                                src_c0 = rb['argmax_src_c0']
-                                wrong_masks[i] = tok_np[:, src_c0:src_c0 + rb['out_len']].copy()
-                        tok_np = _fill_argmax_fb(tok_np, logits_1, pos_content)
-                        if wrong_token_weight > 0:
-                            for i, rb in enumerate(pos_content['rec_blocks']):
-                                if i not in wrong_masks:
-                                    continue
-                                wrong_masks[i] = (tok_np[:, rb['am0']:rb['am1']] != wrong_masks[i])
-                        tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
+                # One shared mask, up to 2 forward passes total for the whole
+                # packed sequence — the flow relay (the relay-exception
+                # attention permission) is resolved entirely by mask_t, no sequential
+                # per-chain-step orchestration needed.
+                if use_actual_am:
+                    with torch.no_grad():
+                        logits_1 = model(tok_t, mask_t)
+                    if wrong_token_weight > 0:
+                        for i, rb in enumerate(pos_content['rec_blocks']):
+                            if rb['type'] != 'ir':
+                                continue
+                            src_c0 = rb['argmax_src_c0']
+                            wrong_masks[i] = tok_np[:, src_c0:src_c0 + rb['out_len']].copy()
+                    tok_np = _fill_argmax_fb(tok_np, logits_1, pos_content)
+                    if wrong_token_weight > 0:
+                        for i, rb in enumerate(pos_content['rec_blocks']):
+                            if i not in wrong_masks:
+                                continue
+                            wrong_masks[i] = (tok_np[:, rb['am0']:rb['am1']] != wrong_masks[i])
+                    tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
 
-                    logits = model(tok_t, mask_t)
-                    logits_by_rb = {i: logits for i in range(len(pos_content['rec_blocks']))}
-                else:
-                    # Chained path: chain step i's input genuinely depends on
-                    # chain step i-1's computed hidden state (via h_inject), not
-                    # just its decoded byte output — so this needs one
-                    # sequential forward pass per chain step. Each chain step's
-                    # own IR rounds (if any) still use the existing 2-pass
-                    # argmax-feedback trick, applied to the FULL packed sequence
-                    # each time (mask_t already encodes Rule 3b nochain across
-                    # chain steps, so re-running the full sequence per chain
-                    # step is safe/idempotent — only the current chain step's
-                    # argmax positions are filled per its own pass). The logits
-                    # used for THIS chain step's loss are always the ones from
-                    # ITS OWN final pass (recorded per rec_block index in
-                    # logits_by_rb), not some stitched full-sequence tensor.
-                    h_inject: dict[tuple, torch.Tensor] = {}
-                    logits_by_rb: dict[int, torch.Tensor] = {}
-                    for ci, rb_idxs in enumerate(chain_step_rb_idxs):
-                        if use_actual_am and any(pos_content['rec_blocks'][i]['type'] == 'ir' for i in rb_idxs):
-                            with torch.no_grad():
-                                logits_1, _ = model(tok_t, mask_t, h_inject=h_inject or None, return_features=True)
-                            for i in rb_idxs:
-                                rb = pos_content['rec_blocks'][i]
-                                if rb['type'] != 'ir':
-                                    continue
-                                src_c0 = rb['argmax_src_c0']
-                                if wrong_token_weight > 0:
-                                    wrong_masks[i] = tok_np[:, src_c0:src_c0 + rb['out_len']].copy()
-                                am = logits_1[:, src_c0-1:src_c0-1+rb['out_len']].argmax(-1).cpu().numpy()
-                                tok_np[:, rb['am0']:rb['am1']] = am
-                                if wrong_token_weight > 0:
-                                    wrong_masks[i] = (tok_np[:, rb['am0']:rb['am1']] != wrong_masks[i])
-                            tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
-
-                        logits_ci, x_ci = model(tok_t, mask_t, h_inject=h_inject or None, return_features=True)
-                        for i in rb_idxs:
-                            logits_by_rb[i] = logits_ci
-
-                        # STATE_QUEUE_out = this chain step's last round's own
-                        # STATE field (round 0's sl0/sl1 if n_refine==0, else the
-                        # final IR round's slb0/slb1) — feed into the NEXT chain
-                        # step's STATE_QUEUE_in, if any.
-                        last_rb = pos_content['rec_blocks'][rb_idxs[-1]]
-                        out_sl0, out_sl1 = (last_rb['sl0'], last_rb['sl1']) if last_rb['type'] == 'iq' \
-                            else (last_rb['slb0'], last_rb['slb1'])
-                        if ci + 1 < len(chain_step_rb_idxs):
-                            next_rb0 = pos_content['rec_blocks'][chain_step_rb_idxs[ci + 1][0]]
-                            if 'queue0' in next_rb0:
-                                h_inject = {(next_rb0['queue0'], next_rb0['queue1']):
-                                            x_ci[:, out_sl0:out_sl1, :].detach()}
-                            else:
-                                h_inject = {}
+                logits = model(tok_t, mask_t)
+                logits_by_rb = {i: logits for i in range(len(pos_content['rec_blocks']))}
 
                 nlls = []
                 for i, rb in enumerate(pos_content['rec_blocks']):
@@ -1900,7 +2555,8 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                                           traj['tags'], traj['has_ir'])
 
             tok_np = make_batch_tagged(rng, B, n_chunks, chunk_len, state_len, state_vocab_size,
-                                       t_pos_content, t_tags)
+                                       t_pos_content, t_tags, data_kind=data_kind,
+                                       data_target_bits=data_target_bits)
             tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
 
             # wrong_token_weight ablation: capture, per IR block, whether the fed-back
