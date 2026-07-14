@@ -26,6 +26,32 @@ plus k IR turns (iterative argmax-feedback refinement). Proven at 32B / k=2:
 | S | stability: how long a window stays above R_thresh after one review |
 | λ | forgetting rate = 1/S |
 
+**Clarification worth stating explicitly (recurring point of confusion)**: `warmup_len`
+is how much GROUND-TRUTH content is GIVEN as a seed, not how much the model can infer
+or output. `chunk_len` is a separate, unrelated parameter (local per-chunk encoding
+block size for SLOT compression), not the inference/output range either. The actual
+relationship: `out_len = W - warmup_len` (window size minus warmup) — e.g. at
+`W=32, warmup_len=8`: the model is given only 8 bytes and must GENERATE the other 24
+bytes (75% of the window) purely from the compressed SLOT memory, not from any direct
+input. Confirmed in code (`chunk_positions_srs_tagged`,
+`experiments/chat_tags/positions.py`): `out_len = span_len - warmup_len`. Across a full
+`n_chunks x chunk_len` corpus chained through `n_windows` overlapping windows, the model
+is only ever given `n_windows x warmup_len` bytes of TRUE ground-truth seed (and in
+practice, after the first window, even that comes from the model's own prior decoded
+output via stitching, not fresh ground truth) — it generates the rest entirely from
+memory. The warmup's only job is to disambiguate WHICH window/position is being
+recalled, not to hand the model most of the answer.
+
+**Sequence length for val/test (how to check for any given config)**: computed as
+`val_seg_len = n_chunks * chunk_len` (`experiments/attn_dual/train.py` /
+`experiments/srs_tagged/train.py`), used both for `make_test_sequences(val_seg_len)`
+(val, synthetic) and `load_chunks_padded(eval_file, n_chunks, chunk_len)` (test, real
+text — same truncation caveat noted elsewhere in this doc: this pads/truncates to
+`n_chunks*chunk_len` bytes of the real file, not the whole file). The stitched decode
+(`STITCHED_MEAN`) then reconstructs exactly this length end-to-end by chaining all
+`n_windows` overlapping windows — same total length as the underlying val/test
+sequence, never longer.
+
 ---
 
 ## Forgetting and Retention
@@ -1907,6 +1933,32 @@ primary signal, `ScheduleWakeup`'s delay as an untrusted fallback rather than a
 reliable heartbeat — and check process liveness (`ps -p <pid>`), not just log content,
 on every wake, since a silently-exited process produces no new log lines and looks
 identical to "still running slowly" without that explicit check.
+
+**FINAL VERDICT (run completed, step 60000/60000, 2026-07-14 ~02:52): RMSNorm did NOT
+resolve window G.** Progress table (val/test STITCHED_MEAN, and window G = `span(6,8)`
+specifically, at each checkpoint):
+
+| step | val STITCHED_MEAN | test STITCHED_MEAN | window G val | window G test |
+|---|---|---|---|---|
+| 35000 (peak) | 48.6% | — | ~12-14% | — |
+| 50000 | 40.8% | 45.8% | 12.5% | — |
+| 55000 | 39.7% | 45.0% | 8.3% | 8.3% |
+| 60000 (final) | **38.9%** | **44.2%** | **5.6%** | **8.3%** |
+
+Best checkpoint saved during the run was 51.4% (near the step-35000 peak) — final-step
+numbers are *worse* than the run's own best, and window G ended lower (5.6%/8.3%) than
+where it started oscillating (5-14% band from step 5000 on). This is the same failure
+mode as the earlier LayerNorm nc8 attempt (`srs_stitch_nc8_slot8`, window G stuck at
+4.2%/25.0%) — RMSNorm changed the numbers slightly but not the qualitative outcome: one
+window (the largest RoPE/relative-distance offset in the packed `L=1694` sequence)
+consistently fails to learn "preserve an already-correct IR1 output through IR2" while
+every other window (A-F) converges normally (val 59.7-79.2% at span level). **Conclusion:
+this is not a normalization-choice problem — it's structural**, most likely tied to
+window G's position in the sequence (RoPE distance) or to it being systematically
+undertrained relative to A-F in the current windows/traj_mix schedule. Per the
+already-planned fallback: next lever to try is oversampling window G specifically, not
+another norm/architecture swap. Deferred until after `juz1.txt` prep work per the
+existing next-in-queue ordering — this targeted fix test is complete, not blocking.
 
 **Gradient checkpointing — implemented and queued for a speed test, not yet run.**
 Prediction before measuring (see this session's discussion): checkpointing should be

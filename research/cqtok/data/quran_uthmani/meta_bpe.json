@@ -1,0 +1,9 @@
+{
+  "model_path": "/Users/muaz/code/kvmem/cqtok/data/quran_uthmani/bpe_1024.model",
+  "vocab_size": 1024,
+  "total_tokens": 228704,
+  "train_tokens": 205834,
+  "val_tokens": 22870,
+  "total_bytes": 1359946,
+  "avg_bytes_per_token": 5.946314887365328
+}

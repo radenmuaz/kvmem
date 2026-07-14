@@ -3,4 +3,4 @@ uv.lock
 logs
 .pyc
 __pycache__
-data
+datasets/random
