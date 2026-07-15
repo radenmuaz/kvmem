@@ -58,9 +58,9 @@ n_chunks=4, chunk_len=16, window_chunks=2 match `hop`'s own convention
 (same 32-byte, 2-chunk query span) so warm-started weights transfer
 cleanly and `batch` here is byte-shape-identical to what `hop` trained on.
 
-Queued — run only after the `squeeze` pair (`hmn_squeeze_random_n4.py` then
-`hmn_squeeze_ca_n4.py`) finishes; never two jobs at once. Once done, re-run
-`eval_weave.py --patterns repeat_query,long_hop_recovery,decay_curve`
+Running now (launched ahead of the `squeeze` pair in the original queue
+order, per explicit instruction — `squeeze` was paused mid-run at the time).
+Once done, re-run `eval_weave.py --patterns repeat_query,long_hop_recovery,decay_curve`
 against this checkpoint and compare directly against `hop`'s 0.0% result.
 
 Pretrained checkpoint is set as a DEFAULT directly in this config's `hp`

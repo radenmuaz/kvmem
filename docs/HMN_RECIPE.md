@@ -376,14 +376,21 @@ teacher-forced number.
 |---|---|---|---|
 | `solo` | `kvmem/configs/hmn_single_recall.py` | one chain step, no relay — the bootstrap case | Done |
 | `hop` | `kvmem/configs/hmn_recall_queue.py` | multi chain-step, `hops=1` relay | Done (run twice, results vary — see `CLAUDE.md`) |
-| `weave_mix` | `kvmem/configs/hmn_weave_mix.py` | trains on `batch`/`stream`/`interleave_delayed` mixed | Built, queued, not yet run |
-| `squeeze` | `hmn_squeeze_random_n4.py` / `hmn_squeeze_ca_n4.py` | tests genuine compression on structured (CA) vs. random data | Mid-run |
+| `weave_mix` | `kvmem/configs/hmn_weave_mix.py` | trains on `batch`/`stream`/`interleave_delayed` mixed | Done — MEAN=74.4% (warm-started from `solo`) |
+| `squeeze` | `hmn_squeeze_random_n4.py` / `hmn_squeeze_markov_n4.py` | tests genuine compression on structured (Markov, exact entropy) vs. random data | `random` paused mid-run; `markov` queued |
 
 **The open question right now**: `hop`'s chain-memory recovery probe
 (`kvmem/eval_weave.py --patterns repeat_query`) failed cleanly — a
 re-queried span dropped from 100% to 0.0% after 3 relay hops. `weave_mix`
-exists specifically to test whether this was a training-exposure gap
-(never trained on repeated queries) rather than a relay-mechanism failure.
+was built to test whether this was a training-exposure gap (never trained
+on repeated queries) rather than a relay-mechanism failure — re-run against
+`weave_mix`'s finished checkpoint, the result is a partial, non-clean
+improvement (0.0-4.2% recovery instead of a uniform 0.0%), confounded by
+`weave_mix` having been warm-started from `solo` rather than a strong `hop`
+checkpoint (so it had to learn the relay AND generalize at once — see
+CLAUDE.md's `weave_mix` entry for the full numbers). Not resolved cleanly;
+a cleaner follow-up would isolate relay-strength from generalization by
+warm-starting from a strong `hop` run instead.
 
 **Structured-data generators** (`kvmem/structured_data.py`, for the
 `squeeze` compression test): nine working generators spanning different

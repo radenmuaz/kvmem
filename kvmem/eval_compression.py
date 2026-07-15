@@ -169,6 +169,82 @@ def _teacher_forced_bits(model, pos_content: dict, mask_t: torch.Tensor, tags: l
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic 0 — nominal fp32 capacity accounting (pure arithmetic, no
+# forward pass — computed directly from hp/model so it can't drift out of
+# sync with a config's docstring the way hand-typed numbers can)
+# ---------------------------------------------------------------------------
+
+def nominal_capacity_accounting(model, hp: dict, target_bits: float | None = None,
+                                bits_per_float: int = 32) -> dict:
+    """
+    NOMINAL fp32 storage ceilings for input / STATE / model weights — NOT
+    measured/effective capacity (see caveat in the return dict and below).
+    Every number here is derived from hp/model directly, not copied by hand,
+    so it can't silently go stale if state_len/d/n_layers/chunk_len change.
+
+    - input_raw_bits: chunk_len * 8 (raw byte-level wire size).
+    - input_true_bits: chunk_len * target_bits (exact iff target_bits comes
+      from a closed-form-calibrated generator like gen_markov — see
+      docs/HISTORY.md §8; None if target_bits isn't given/set, e.g. for a
+      random-byte control where input_raw_bits IS the true content).
+    - state_residual_bits: state_len * d * bits_per_float — one d-dim
+      vector per STATE position, final layer only.
+    - state_kv_cache_bits: state_len * n_layers * 2(K,V) * d * bits_per_float
+      — every layer's K AND V at each STATE position, the complete set of
+      values any later attention row could actually read (routing can
+      happen at any layer, not just the last) — the more complete hard
+      ceiling of the two STATE numbers.
+    - model_bits: n_params * bits_per_float (n_params counted from the
+      actual model, not estimated).
+
+    CAVEAT, the reason this function is named "nominal" and not "capacity":
+    these are upper bounds on what fp32 storage COULD hold if every bit of
+    every float were an independent, freely addressable, freely readable
+    unit of information — none of that is actually true for a trained
+    attention representation (SGD noise, the need to generalize rather than
+    memorize, non-injective computation). Nominal capacity only proves
+    "physically possible," never "actually used this way" — the ratios
+    below are typically enormous (thousands of x at the model-weight level)
+    precisely because raw fp32 headroom is never the binding constraint.
+    What's actually happening can only be settled empirically —
+    state_ablation_gate (below) is the diagnostic for that, not this one.
+    """
+    state_len = hp.get('state_len', 8)
+    d = hp['d']
+    n_layers = hp['n_layers']
+    stage_cfg = hp['curriculum'][0]
+    chunk_len = stage_cfg['chunk_len']
+    if target_bits is None:
+        target_bits = hp.get('data_target_bits')
+
+    input_raw_bits = chunk_len * 8
+    input_true_bits = chunk_len * target_bits if target_bits is not None else None
+
+    state_residual_bits = state_len * d * bits_per_float
+    state_kv_cache_bits = state_len * n_layers * 2 * d * bits_per_float
+
+    n_params = sum(p.numel() for p in model.parameters())
+    model_bits = n_params * bits_per_float
+
+    def _ratio(numer, denom):
+        return (numer / denom) if denom else None
+
+    return dict(
+        chunk_len=chunk_len, state_len=state_len, d=d, n_layers=n_layers,
+        n_params=n_params, target_bits=target_bits,
+        input_raw_bits=input_raw_bits, input_true_bits=input_true_bits,
+        state_residual_bits=state_residual_bits, state_kv_cache_bits=state_kv_cache_bits,
+        model_bits=model_bits,
+        state_residual_vs_raw=_ratio(state_residual_bits, input_raw_bits),
+        state_residual_vs_true=_ratio(state_residual_bits, input_true_bits),
+        state_kv_vs_raw=_ratio(state_kv_cache_bits, input_raw_bits),
+        state_kv_vs_true=_ratio(state_kv_cache_bits, input_true_bits),
+        model_vs_raw=_ratio(model_bits, input_raw_bits),
+        model_vs_true=_ratio(model_bits, input_true_bits),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Diagnostic 1 — state ablation gate
 # ---------------------------------------------------------------------------
 
@@ -444,7 +520,25 @@ def main():
     n_chunks, chunk_len = hp['curriculum'][0]['n_chunks'], hp['curriculum'][0]['chunk_len']
     rand_chunks_list = [rand_bytes[k * chunk_len:(k + 1) * chunk_len] for k in range(n_chunks)]
 
-    print('=== Diagnostic 1: STATE ablation gate (random bytes) ===')
+    print('=== Diagnostic 0: nominal fp32 capacity accounting (pure arithmetic, no forward pass) ===')
+    ca = nominal_capacity_accounting(model, hp)
+    print(f'  chunk_len={ca["chunk_len"]}  state_len={ca["state_len"]}  d={ca["d"]}  '
+         f'n_layers={ca["n_layers"]}  n_params={ca["n_params"]:,}  target_bits={ca["target_bits"]}')
+    print(f'  input:  raw={ca["input_raw_bits"]} bits' +
+         (f'  true={ca["input_true_bits"]:.0f} bits' if ca['input_true_bits'] is not None else '  true=N/A (no target_bits)'))
+    print(f'  STATE (residual view): {ca["state_residual_bits"]} bits  '
+         f'({ca["state_residual_vs_raw"]:.1f}x raw' +
+         (f', {ca["state_residual_vs_true"]:.1f}x true)' if ca['state_residual_vs_true'] is not None else ')'))
+    print(f'  STATE (full KV-cache): {ca["state_kv_cache_bits"]} bits  '
+         f'({ca["state_kv_vs_raw"]:.1f}x raw' +
+         (f', {ca["state_kv_vs_true"]:.1f}x true)' if ca['state_kv_vs_true'] is not None else ')'))
+    print(f'  MODEL WEIGHTS: {ca["model_bits"]:,} bits  '
+         f'({ca["model_vs_raw"]:.1f}x raw' +
+         (f', {ca["model_vs_true"]:.1f}x true)' if ca['model_vs_true'] is not None else ')'))
+    print('  NOTE: these are NOMINAL fp32 storage ceilings, not measured/effective capacity — '
+         'see nominal_capacity_accounting\'s docstring. Diagnostic 1 below is the empirical check.')
+
+    print('\n=== Diagnostic 1: STATE ablation gate (random bytes) ===')
     g = state_ablation_gate(model, hp, device, rand_chunks_list)
     print(f'  normal={g["normal_bits"]:.2f} bits/byte  ablated={g["ablated_bits"]:.2f} bits/byte  '
          f'gap={g["gap"]:.2f}  depends_on_state={g["depends_on_state"]}')
