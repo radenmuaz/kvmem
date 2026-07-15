@@ -29,11 +29,30 @@ generalization was the missing ingredient, training on VARIED orderings
 should improve `repeat_query`/`long_hop_recovery` zero-shot performance
 after this run, without needing to touch the underlying relay mechanism.
 
-Warm-started from `hop`'s finished checkpoint (already learned the
-single-hop relay exception on its own fixed schedule — transferring that
-skill, then diversifying training exposure, rather than relearning the
-relay from scratch on top of `solo`). Same architecture/hyperparameters as
-`hop` throughout for a clean comparison.
+**Warm-started from `hmn_single_recall` (`solo`)'s checkpoint, NOT
+`hop`'s** — a deliberate change from this config's original plan.
+`hmn_recall_queue`'s (`hop`'s) checkpoint currently on disk converged
+NOTABLY WORSE than the run its own recovery-probe result (0.0% on
+`repeat_query`, cited above) was measured against — val/test
+STITCHED=71.4%/71.4%, loss=1.851, vs. the original measurement's
+88.1%/85.7%, loss=0.603 (see `hmn_recall_queue.py`'s docstring and
+CLAUDE.md's reproducibility-check section — same config, two different
+runs, notably different outcomes, attributed to warm-start sensitivity not
+a code defect). Warm-starting from that weaker checkpoint would make this
+stage's results hard to interpret cleanly. `solo`'s checkpoint has no such
+ambiguity (a single, well-measured run: val MEAN=94.4%, test=100%) — the
+tradeoff is that `weave_mix` now has to learn the `hop` relay exception AND
+generalize across trajectory shapes simultaneously, rather than
+transferring an already-learned relay skill and only diversifying
+exposure. Worth keeping in mind when interpreting results: a
+`repeat_query`/`long_hop_recovery` failure here could mean either
+"generalization training didn't fix it" (the original hypothesis) or
+"the relay itself never got learned well enough in the first place" (a
+confound `hop`-warm-starting would have avoided) — `hop`'s own per-pattern
+val numbers during this run (`batch` specifically, byte-shape-identical to
+what `hop` trained on) are the way to tell those apart: if `batch`
+converges to `hop`-like accuracy but `repeat_query` still fails, that
+isolates the generalization-gap hypothesis cleanly.
 
 n_chunks=4, chunk_len=16, window_chunks=2 match `hop`'s own convention
 (same 32-byte, 2-chunk query span) so warm-started weights transfer
@@ -44,24 +63,14 @@ Queued — run only after the `squeeze` pair (`hmn_squeeze_random_n4.py` then
 `eval_weave.py --patterns repeat_query,long_hop_recovery,decay_curve`
 against this checkpoint and compare directly against `hop`'s 0.0% result.
 
-**Pretrained-checkpoint caveat, still worth knowing**: `hmn_recall_queue`'s
-checkpoint on disk right now converged NOTABLY WORSE than the run
-`hop`'s own recovery-probe result (0.0% on `repeat_query`, cited above)
-was measured against — val/test STITCHED=71.4%/71.4%, loss=1.851, vs. the
-original measurement's 88.1%/85.7%, loss=0.603 (see `hmn_recall_queue.py`'s
-docstring and CLAUDE.md's reproducibility-check section for the full
-story — same config, two different runs, notably different outcomes,
-attributed to warm-start sensitivity not a code defect). Warm-starting
-`weave_mix` from this weaker checkpoint may make its own results harder to
-interpret cleanly against the "does generalization training fix the
-recovery-probe failure" question this stage exists to test — worth
-re-running `hop` first to get a strong checkpoint, rather than treating
-whatever's currently on disk as equivalent to what was originally measured.
+Pretrained checkpoint is set as a DEFAULT directly in this config's `hp`
+dict (`_pretrained_ckpt`, read by `train()` at `kvmem/hmn.py:2294` if
+present) rather than requiring `--pretrained` on every invocation — the
+CLI flag (`kvmem/hmn.py`'s `main()`) still overrides it if passed, so this
+doesn't remove the option to warm-start from something else ad hoc.
 
 Run:
-    python3 -m kvmem.hmn --config kvmem/configs/hmn_weave_mix.py \
-        --pretrained kvmem/logs/hmn_recall_queue/checkpoints/stage0_best.pt \
-        --device mps
+    python3 -m kvmem.hmn --config kvmem/configs/hmn_weave_mix.py --device mps
 """
 
 hp = dict(
@@ -74,6 +83,7 @@ hp = dict(
     rope=True, yarn=True, null_kv=True,
     rmsnorm=True,
     name='hmn_weave_mix', seed=50,
+    _pretrained_ckpt='kvmem/logs/hmn_single_recall/checkpoints/stage0_best.pt',
 
     state_len=8, state_vocab_size=2,
     warmup_len=8,
