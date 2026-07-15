@@ -42,7 +42,7 @@ chunk_len/state_len fixed at whatever the checkpoint was actually trained
 with (no extrapolation confound).
 
 Usage:
-    python3 -m kvmem.eval_compression --ckpt kvmem/logs/hmn_stage0_round0_single/checkpoints/stage0_best.pt --device mps
+    python3 -m kvmem.eval_compression --ckpt kvmem/logs/hmn_single_recall/checkpoints/stage0_best.pt --device mps
     python3 -m kvmem.eval_compression --ckpt <path> --device mps --kinds ca,chaotic,fractal
     python3 -m kvmem.eval_compression --ckpt <path> --device mps --sweep-length   # optional diagnostic 5
 """
@@ -56,10 +56,11 @@ import torch.nn.functional as F
 
 from kvmem.hmn import (
     build_model,
-    chunk_positions_chained,
-    chunk_mask_fb,
+    chunk_positions_hop,
+    chunk_mask_fb_hop,
     make_test_sequences,
     _cyclic_state_ids,
+    HMN_FEEDBACK_STATE_FAMILY,
     _positional_ls_nll,
 )
 from kvmem.structured_data import generate_structured_chunks, measure_bits_per_byte
@@ -97,15 +98,17 @@ def _build_layout(hp: dict, chain_steps=None):
     n_chunks, chunk_len = stage_cfg['n_chunks'], stage_cfg['chunk_len']
     chain_steps = chain_steps or stage_cfg['chain_steps']
     n_refine = stage_cfg.get('n_refine', 0)
+    hops = stage_cfg.get('hops', 0)
 
-    built = chunk_positions_chained(n_chunks, chunk_len, state_len, warmup_len,
-                                    chain_steps, n_refine=n_refine,
-                                    state_vocab_size=state_vocab_size)
-    return built['pos_content'], built['pos_mask'], built['tags'], n_chunks, chunk_len, state_len, state_vocab_size
+    built = chunk_positions_hop(n_chunks, chunk_len, state_len, warmup_len,
+                                chain_steps, n_refine=n_refine,
+                                state_vocab_size=state_vocab_size)
+    return (built['pos_content'], built['pos_mask'], built['tags'], n_chunks, chunk_len,
+           state_len, state_vocab_size, hops)
 
 
 def _fill_tokens(pos_content: dict, tags: list, chunks_list, sids: np.ndarray,
-                 warmup_len: int) -> np.ndarray:
+                 sids_feedback_state: np.ndarray, warmup_len: int) -> np.ndarray:
     """Ground-truth teacher-forced token fill (same pattern as attn_viz.py's
     _fill_tokens) — deterministic, no argmax feedback loop needed since these
     diagnostics only need a single forward pass's loss, not AR decode."""
@@ -119,9 +122,7 @@ def _fill_tokens(pos_content: dict, tags: list, chunks_list, sids: np.ndarray,
     for rb in pos_content['rec_blocks']:
         span_s, span_e = rb['span']
         gt_span = np.concatenate([np.array(chunks_list[i]) for i in range(span_s, span_e)])
-        if rb['type'] == 'iq':
-            if 'queue0' in rb:
-                tok[rb['queue0']:rb['queue1']] = sids
+        if rb['type'] == 'initial':
             tok[rb['sl0']:rb['sl1']] = sids
             if wl > 0:
                 tok[rb['w0']:rb['w1']] = np.array(gt_span[:wl], dtype=np.int64)
@@ -130,7 +131,7 @@ def _fill_tokens(pos_content: dict, tags: list, chunks_list, sids: np.ndarray,
             tok[rb['sla0']:rb['sla1']] = sids
             src_c0 = rb['argmax_src_c0']
             tok[rb['am0']:rb['am1']] = tok[src_c0:src_c0 + rb['out_len']]
-            tok[rb['slb0']:rb['slb1']] = sids
+            tok[rb['slb0']:rb['slb1']] = sids_feedback_state
             if wl > 0:
                 tok[rb['w0']:rb['w1']] = np.array(gt_span[:wl], dtype=np.int64)
             tok[rb['c0']:rb['c1']] = np.array(gt_span[wl:wl + rb['out_len']], dtype=np.int64)
@@ -142,12 +143,13 @@ def _fill_tokens(pos_content: dict, tags: list, chunks_list, sids: np.ndarray,
 
 
 def _teacher_forced_bits(model, pos_content: dict, mask_t: torch.Tensor, tags: list,
-                         chunks_list, sids: np.ndarray, warmup_len: int,
-                         device: torch.device, h_inject: dict | None = None) -> float:
+                         chunks_list, sids: np.ndarray, sids_feedback_state: np.ndarray,
+                         warmup_len: int, device: torch.device,
+                         h_inject: dict | None = None) -> float:
     """One forward pass, ground-truth-filled, NLL in bits/byte over every
     'is_clean' rec_block's output region — the actual bits/byte diagnostic
     number used by every check below."""
-    tok = _fill_tokens(pos_content, tags, chunks_list, sids, warmup_len)
+    tok = _fill_tokens(pos_content, tags, chunks_list, sids, sids_feedback_state, warmup_len)
     tok_t = torch.tensor(tok, dtype=torch.long, device=device).unsqueeze(0)
     with torch.no_grad():
         logits = model(tok_t, mask_t, h_inject=h_inject)
@@ -186,22 +188,25 @@ def state_ablation_gate(model, hp: dict, device: torch.device,
     way, none of diagnostics 2-4's "compression quality" numbers mean
     anything until this gap is confirmed large.
     """
-    pos_content, pos_mask, tags, n_chunks, chunk_len, state_len, state_vocab_size = _build_layout(hp)
-    mask_np = chunk_mask_fb(pos_mask)
+    pos_content, pos_mask, tags, n_chunks, chunk_len, state_len, state_vocab_size, hops = _build_layout(hp)
+    mask_np = chunk_mask_fb_hop(pos_mask, hops=hops)
     mask_t = torch.tensor(mask_np, dtype=torch.float32, device=device)
     sids = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
+    sids_feedback_state = np.array(
+        _cyclic_state_ids(state_len, state_vocab_size, family=HMN_FEEDBACK_STATE_FAMILY),
+        dtype=np.int64)
     warmup_len = hp['warmup_len']
 
     d = hp['d']
     normal_bits = _teacher_forced_bits(model, pos_content, mask_t, tags, chunks_list,
-                                       sids, warmup_len, device, h_inject=None)
+                                       sids, sids_feedback_state, warmup_len, device, h_inject=None)
 
     h_inject = {}
     for b in pos_content['enc_blocks']:
         noise = torch.randn(1, b['sl1'] - b['sl0'], d, device=device) * 0.5
         h_inject[(b['sl0'], b['sl1'])] = noise
     ablated_bits = _teacher_forced_bits(model, pos_content, mask_t, tags, chunks_list,
-                                        sids, warmup_len, device, h_inject=h_inject)
+                                        sids, sids_feedback_state, warmup_len, device, h_inject=h_inject)
 
     return dict(normal_bits=normal_bits, ablated_bits=ablated_bits,
                gap=ablated_bits - normal_bits,
@@ -219,14 +224,17 @@ def floor_comparison(model, hp: dict, device: torch.device, chunks_list) -> dict
     """L_model vs (a) chance floor ~8 bits/byte, (b) zlib's practical floor
     on the SAME sequence. L_model should be well below both for the model to
     be doing anything better than a trivial classical compressor."""
-    pos_content, pos_mask, tags, n_chunks, chunk_len, state_len, state_vocab_size = _build_layout(hp)
-    mask_np = chunk_mask_fb(pos_mask)
+    pos_content, pos_mask, tags, n_chunks, chunk_len, state_len, state_vocab_size, hops = _build_layout(hp)
+    mask_np = chunk_mask_fb_hop(pos_mask, hops=hops)
     mask_t = torch.tensor(mask_np, dtype=torch.float32, device=device)
     sids = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
+    sids_feedback_state = np.array(
+        _cyclic_state_ids(state_len, state_vocab_size, family=HMN_FEEDBACK_STATE_FAMILY),
+        dtype=np.int64)
     warmup_len = hp['warmup_len']
 
     l_model = _teacher_forced_bits(model, pos_content, mask_t, tags, chunks_list,
-                                   sids, warmup_len, device)
+                                   sids, sids_feedback_state, warmup_len, device)
     flat = np.concatenate(chunks_list)
     zlib_floor = measure_bits_per_byte(flat)
 
@@ -373,12 +381,15 @@ def sweep_max_recallable_length(model, hp: dict, device: torch.device, kind: str
             else:
                 chunks = generate_structured_chunks(rng, gen_kind, 1, cl, target_bits=tb)
                 chunks_list = [chunks[0]]
-            built = chunk_positions_chained(1, cl, state_len, warmup_len, [(0, 1)],
-                                            n_refine=0, state_vocab_size=state_vocab_size)
+            built = chunk_positions_hop(1, cl, state_len, warmup_len, [(0, 1)],
+                                       n_refine=0, state_vocab_size=state_vocab_size)
             pos_content, pos_mask, tags = built['pos_content'], built['pos_mask'], built['tags']
-            mask_t = torch.tensor(chunk_mask_fb(pos_mask), dtype=torch.float32, device=device)
+            mask_t = torch.tensor(chunk_mask_fb_hop(pos_mask, hops=0), dtype=torch.float32, device=device)
             sids = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
-            tok = _fill_tokens(pos_content, tags, chunks_list, sids, warmup_len)
+            sids_feedback_state = np.array(
+                _cyclic_state_ids(state_len, state_vocab_size, family=HMN_FEEDBACK_STATE_FAMILY),
+                dtype=np.int64)
+            tok = _fill_tokens(pos_content, tags, chunks_list, sids, sids_feedback_state, warmup_len)
             tok_t = torch.tensor(tok, dtype=torch.long, device=device).unsqueeze(0)
             with torch.no_grad():
                 logits = model(tok_t, mask_t)

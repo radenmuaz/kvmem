@@ -1,18 +1,18 @@
 """
 kvmem/eval_weave.py — trajectory-generalization diagnostics for any HMNModel
-checkpoint (solo/relay/flow), testing "does recall survive an interleaved or
+checkpoint (solo/relay/hop), testing "does recall survive an interleaved or
 repeated encode/query trajectory" beyond whatever fixed rhythm the checkpoint
-was actually trained on. See docs/HMN_RECIPE.md's trajectory-taxonomy
+was actually trained on. See docs/HISTORY.md's trajectory-taxonomy
 section and kvmem/hmn.py's traj_batch/traj_stream/traj_interleave_delayed/
 traj_repeat_query/traj_long_hop_recovery/traj_decay_curve for the underlying
 mechanism (chunk_positions_traj/chunk_mask_fb_traj — generalizes
-chunk_positions_flow to arbitrary interleaved 'E'/'S'/'Q' operation
+chunk_positions_hop to arbitrary interleaved 'E'/'S'/'Q' operation
 sequences, see kvmem.hmn's trajectory DSL comment block for the grammar).
 
 This is a TEST-ONLY tool — none of the patterns run here should be trained
 on directly (that would defeat their purpose as generalization probes). It
 works against ANY existing checkpoint zero-shot, since none of solo/relay/
-flow were trained on interleaved trajectories at all — a checkpoint that
+hop were trained on interleaved trajectories at all — a checkpoint that
 does well here despite never seeing these specific patterns is showing real
 algorithmic generalization, not pattern-matching a trained rhythm.
 
@@ -23,13 +23,13 @@ turn_match_pcts, in trajectory order — the SAME span can legitimately appear
 twice in one operations list). A large drop between first and repeated
 occurrence is direct evidence the relay loses previously-recoverable
 information as new content gets appended ("does a new round delete known
-info" — the concern that motivated Stage `flow`'s design in the first
+info" — the concern that motivated Stage `hop`'s design in the first
 place). decay_curve isolates this cleanly from recall-accuracy-at-each-hop
 (its intermediate hops are content-free no-ops, not real queries with their
 own local recall task) — sweep --noop-hops to build an actual decay curve.
 
 Usage:
-    python3 -m kvmem.eval_weave --ckpt kvmem/logs/hmn_stage1_round0_chained/checkpoints/stage0_best.pt --device mps
+    python3 -m kvmem.eval_weave --ckpt kvmem/logs/hmn_recall_queue/checkpoints/stage0_best.pt --device mps
     python3 -m kvmem.eval_weave --ckpt <path> --device mps --patterns repeat_query,interleave_delayed
     python3 -m kvmem.eval_weave --ckpt <path> --device mps --patterns long_hop_recovery --n-chunks 8
     python3 -m kvmem.eval_weave --ckpt <path> --device mps --patterns decay_curve --noop-hops 1,2,4,8

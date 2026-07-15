@@ -4,17 +4,19 @@ attn_viz.py — attention map heatmaps for HMNModel checkpoints (kvmem/hmn.py).
 Rewired from the original archive_v1/root_scripts/attn_viz.py (built for the
 pre-rewrite kvmem.model/kvmem.train_hmn_chunk stack) to the current
 consolidated kvmem/hmn.py: STATE terminology (not SLOT), chain_steps (not
-traj_mix/windows), shared chat tags written into the token sequence, and the
-new STATE_QUEUE_in region. Only supports chunk_positions_chained layouts
-(round-0-then-IR-per-chain-step) — the old iq_global_rw/ir_local trajectory
-branching is gone since the new hp format has no traj_mix.
+traj_mix/windows), shared chat tags written into the token sequence. Only
+supports chunk_positions_hop layouts (round-0-then-refine-per-chain-step,
+relay via attention permission, no separate STATE_QUEUE_in region) — the old
+iq_global_rw/ir_local trajectory branching is gone since the new hp format
+has no traj_mix, and the older h_inject/STATE_QUEUE relay
+(chunk_positions_chained) was deleted in favor of `hop`.
 
 Captures attention weights by temporarily replacing F.scaled_dot_product_attention
 with a version that saves the softmax weights before returning. No model or train
 files are modified.
 
 Usage:
-  python3 -m kvmem.attn_viz --ckpt kvmem/logs/hmn_stage0_round0_single/checkpoints/stage0_best.pt
+  python3 -m kvmem.attn_viz --ckpt kvmem/logs/hmn_single_recall/checkpoints/stage0_best.pt
   python3 -m kvmem.attn_viz --ckpt <path> --seq-idx 0 --out attn_maps.png
   python3 -m kvmem.attn_viz --ckpt <path> --analyse
 
@@ -38,9 +40,10 @@ import matplotlib.patches as mpatches
 
 from kvmem.hmn import (
     build_model,
-    chunk_positions_chained,
-    chunk_mask_fb,
+    chunk_positions_hop,
+    chunk_mask_fb_hop,
     _cyclic_state_ids,
+    HMN_FEEDBACK_STATE_FAMILY,
     make_test_sequences,
 )
 
@@ -101,15 +104,14 @@ class AttentionCapture:
 _SEG_COLORS = {
     'src':    '#4CAF50',   # green  — source bytes in enc_blocks
     'enc_st': '#2196F3',   # blue   — enc_block STATE tokens
-    'queue':  '#00BCD4',   # cyan   — STATE_QUEUE_in (chain memory carry-in)
-    'r0_st':  '#FF9800',   # orange — round-0 STATE
-    'r0_wm':  '#FFEB3B',   # yellow — round-0 warmup
-    'r0_out': '#F44336',   # red    — round-0 output
-    'sta':    '#9C27B0',   # purple — IR STATE_A
-    'am':     '#E91E63',   # pink   — IR argmax
-    'stb':    '#673AB7',   # indigo — IR STATE_B
-    'ir_wm':  '#FFEB3B',   # yellow — IR warmup (same as round-0 warmup)
-    'ir_out': '#F44336',   # red    — IR output (same as round-0 output)
+    'r0_st':  '#FF9800',   # orange — round-0 (initial) STATE
+    'r0_wm':  '#FFEB3B',   # yellow — round-0 (initial) warmup
+    'r0_out': '#F44336',   # red    — round-0 (initial) output
+    'sta':    '#9C27B0',   # purple — refine round's state
+    'am':     '#E91E63',   # pink   — refine argmax
+    'stb':    '#673AB7',   # indigo — refine round's feedback_state
+    'ir_wm':  '#FFEB3B',   # yellow — refine warmup (same as round-0 warmup)
+    'ir_out': '#F44336',   # red    — refine output (same as round-0 output)
 }
 
 
@@ -120,24 +122,22 @@ def _build_segments(pos_content: dict) -> list[tuple[int, int, str, str]]:
         segs.append((b['s0'],  b['s1'],  f'src{i}',  _SEG_COLORS['src']))
         segs.append((b['sl0'], b['sl1'], f'est{i}',  _SEG_COLORS['enc_st']))
 
-    r0_idx = ir_idx = 0
+    r0_idx = refine_idx = 0
     for rb in pos_content['rec_blocks']:
-        if rb['type'] == 'iq':
-            if 'queue0' in rb:
-                segs.append((rb['queue0'], rb['queue1'], f'R{r0_idx}_q', _SEG_COLORS['queue']))
+        if rb['type'] == 'initial':
             segs.append((rb['sl0'], rb['sl1'], f'R{r0_idx}_st', _SEG_COLORS['r0_st']))
             if rb['w0'] < rb['w1']:
                 segs.append((rb['w0'], rb['w1'], f'R{r0_idx}_wm', _SEG_COLORS['r0_wm']))
             segs.append((rb['c0'], rb['c1'], f'R{r0_idx}_out', _SEG_COLORS['r0_out']))
             r0_idx += 1
         else:
-            segs.append((rb['sla0'], rb['sla1'], f'IR{ir_idx}_A',  _SEG_COLORS['sta']))
-            segs.append((rb['am0'],  rb['am1'],  f'IR{ir_idx}_am', _SEG_COLORS['am']))
-            segs.append((rb['slb0'], rb['slb1'], f'IR{ir_idx}_B',  _SEG_COLORS['stb']))
+            segs.append((rb['sla0'], rb['sla1'], f'refine{refine_idx}_A',  _SEG_COLORS['sta']))
+            segs.append((rb['am0'],  rb['am1'],  f'refine{refine_idx}_am', _SEG_COLORS['am']))
+            segs.append((rb['slb0'], rb['slb1'], f'refine{refine_idx}_B',  _SEG_COLORS['stb']))
             if rb['w0'] < rb['w1']:
-                segs.append((rb['w0'], rb['w1'], f'IR{ir_idx}_wm', _SEG_COLORS['ir_wm']))
-            segs.append((rb['c0'], rb['c1'], f'IR{ir_idx}_out', _SEG_COLORS['ir_out']))
-            ir_idx += 1
+                segs.append((rb['w0'], rb['w1'], f'refine{refine_idx}_wm', _SEG_COLORS['ir_wm']))
+            segs.append((rb['c0'], rb['c1'], f'refine{refine_idx}_out', _SEG_COLORS['ir_out']))
+            refine_idx += 1
     return segs
 
 
@@ -177,7 +177,7 @@ def _legend_patches():
 # ---------------------------------------------------------------------------
 
 def _load_model_and_pos(ckpt_path: str, device: torch.device):
-    """Returns (model, pos_content, mask_np, tags, hp, sids)."""
+    """Returns (model, pos_content, mask_np, tags, hp, sids, sids_feedback_state)."""
     ckpt = torch.load(ckpt_path, map_location=device)
     hp = ckpt['hp']
 
@@ -202,19 +202,23 @@ def _load_model_and_pos(ckpt_path: str, device: torch.device):
     chunk_len = stage_cfg['chunk_len']
     chain_steps = stage_cfg['chain_steps']
     n_refine = stage_cfg.get('n_refine', 0)
+    hops = stage_cfg.get('hops', 0)
 
-    built = chunk_positions_chained(n_chunks, chunk_len, state_len, warmup_len,
-                                    chain_steps, n_refine=n_refine,
-                                    state_vocab_size=state_vocab_size)
+    built = chunk_positions_hop(n_chunks, chunk_len, state_len, warmup_len,
+                                chain_steps, n_refine=n_refine,
+                                state_vocab_size=state_vocab_size)
     pos_content, pos_mask, tags = built['pos_content'], built['pos_mask'], built['tags']
-    mask_np = chunk_mask_fb(pos_mask)
+    mask_np = chunk_mask_fb_hop(pos_mask, hops=hops)
     sids = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
+    sids_feedback_state = np.array(
+        _cyclic_state_ids(state_len, state_vocab_size, family=HMN_FEEDBACK_STATE_FAMILY),
+        dtype=np.int64)
 
-    return model, pos_content, mask_np, tags, hp, sids
+    return model, pos_content, mask_np, tags, hp, sids, sids_feedback_state
 
 
 def _fill_tokens(pos_content: dict, tags: list, chunks_list: list, sids: np.ndarray,
-                 warmup_len: int) -> np.ndarray:
+                 sids_feedback_state: np.ndarray, warmup_len: int) -> np.ndarray:
     """Build a ground-truth-filled (teacher-forced) token array for one sequence."""
     L = pos_content['L']
     tok = np.zeros(L, dtype=np.int64)
@@ -226,9 +230,7 @@ def _fill_tokens(pos_content: dict, tags: list, chunks_list: list, sids: np.ndar
     for rb in pos_content['rec_blocks']:
         span_s, span_e = rb['span']
         gt_span = np.concatenate([np.array(chunks_list[i]) for i in range(span_s, span_e)])
-        if rb['type'] == 'iq':
-            if 'queue0' in rb:
-                tok[rb['queue0']:rb['queue1']] = sids  # placeholder — h_inject overrides at runtime, not needed for a static viz pass
+        if rb['type'] == 'initial':
             tok[rb['sl0']:rb['sl1']] = sids
             if wl > 0:
                 tok[rb['w0']:rb['w1']] = np.array(gt_span[:wl], dtype=np.int64)
@@ -237,7 +239,7 @@ def _fill_tokens(pos_content: dict, tags: list, chunks_list: list, sids: np.ndar
             tok[rb['sla0']:rb['sla1']] = sids
             src_c0 = rb['argmax_src_c0']
             tok[rb['am0']:rb['am1']] = tok[src_c0:src_c0 + rb['out_len']]
-            tok[rb['slb0']:rb['slb1']] = sids
+            tok[rb['slb0']:rb['slb1']] = sids_feedback_state
             if wl > 0:
                 tok[rb['w0']:rb['w1']] = np.array(gt_span[:wl], dtype=np.int64)
             tok[rb['c0']:rb['c1']] = np.array(gt_span[wl:wl + rb['out_len']], dtype=np.int64)
@@ -257,7 +259,7 @@ def _fill_tokens(pos_content: dict, tags: list, chunks_list: list, sids: np.ndar
 def visualise(ckpt_path: str, seq_idx: int = 0, device_str: str = 'cpu',
              out_path: str | None = None, avg_heads: bool = False):
     device = torch.device(device_str)
-    model, pos_content, mask_np, tags, hp, sids = _load_model_and_pos(ckpt_path, device)
+    model, pos_content, mask_np, tags, hp, sids, sids_feedback_state = _load_model_and_pos(ckpt_path, device)
     L = pos_content['L']
     mask_t = torch.tensor(mask_np, dtype=torch.float32, device=device)
     n_layers = hp['n_layers']
@@ -272,15 +274,14 @@ def visualise(ckpt_path: str, seq_idx: int = 0, device_str: str = 'cpu',
     seq_bytes = list(val_seqs.values())[seq_idx % len(val_seqs)]
     chunks_list = [seq_bytes[k * chunk_len:(k + 1) * chunk_len] for k in range(n_chunks)]
 
-    tok = _fill_tokens(pos_content, tags, chunks_list, sids, warmup_len)
+    tok = _fill_tokens(pos_content, tags, chunks_list, sids, sids_feedback_state, warmup_len)
     tok_t = torch.tensor(tok, dtype=torch.long, device=device).unsqueeze(0)  # (1, L)
 
     # NOTE: this is a single static forward pass with plain placeholder tokens
-    # in any STATE_QUEUE_in region (no h_inject) — for chained checkpoints
-    # this only shows what round-0 attends to BEFORE chain memory is wired
-    # in, not the true chained-training-time attention pattern. Good enough
-    # for inspecting the round-0/IR mechanism itself; not yet a chain-memory
-    # visualization (that would need to replay train()'s h_inject sequence).
+    # placeholder tokens (no h_inject involved — `hop`'s relay is a mask
+    # permission resolved within this single forward pass, unlike the old
+    # h_inject/STATE_QUEUE relay). Good enough for inspecting the
+    # round-0/refine mechanism itself, including the hop relay exception.
     cap = AttentionCapture()
     with cap, torch.no_grad():
         _ = model(tok_t, mask_t)
@@ -357,7 +358,7 @@ def analyse_patterns(ckpt_path: str, device_str: str = 'cpu'):
     Flags violations of the expected pattern.
     """
     device = torch.device(device_str)
-    model, pos_content, mask_np, tags, hp, sids = _load_model_and_pos(ckpt_path, device)
+    model, pos_content, mask_np, tags, hp, sids, sids_feedback_state = _load_model_and_pos(ckpt_path, device)
     L = pos_content['L']
     mask_t = torch.tensor(mask_np, dtype=torch.float32, device=device)
     warmup_len = hp['warmup_len']
@@ -369,7 +370,7 @@ def analyse_patterns(ckpt_path: str, device_str: str = 'cpu'):
 
     for seq_bytes in list(val_seqs.values()):
         chunks_list = [seq_bytes[k * chunk_len:(k + 1) * chunk_len] for k in range(n_chunks)]
-        tok = _fill_tokens(pos_content, tags, chunks_list, sids, warmup_len)
+        tok = _fill_tokens(pos_content, tags, chunks_list, sids, sids_feedback_state, warmup_len)
         tok_t = torch.tensor(tok, dtype=torch.long, device=device).unsqueeze(0)
         cap = AttentionCapture()
         with cap, torch.no_grad():
@@ -393,10 +394,7 @@ def analyse_patterns(ckpt_path: str, device_str: str = 'cpu'):
 
     def _named_col_masks(rb: dict) -> list[tuple[str, np.ndarray, str]]:
         named = [('enc_src', enc_src_mask, 'low'), ('enc_state', enc_state_mask, '')]
-        if 'queue0' in rb:
-            q = np.zeros(L, dtype=bool); q[rb['queue0']:rb['queue1']] = True
-            named.append(('queue_in', q, ''))
-        if rb['type'] == 'iq':
+        if rb['type'] == 'initial':
             st = np.zeros(L, dtype=bool); st[rb['sl0']:rb['sl1']] = True
             wm = np.zeros(L, dtype=bool); wm[rb['w0']:rb['w1']] = True
             out = np.zeros(L, dtype=bool); out[rb['c0']:rb['c1']] = True
@@ -405,10 +403,10 @@ def analyse_patterns(ckpt_path: str, device_str: str = 'cpu'):
             sla = np.zeros(L, dtype=bool); sla[rb['sla0']:rb['sla1']] = True
             am = np.zeros(L, dtype=bool); am[rb['am0']:rb['am1']] = True
             slb = np.zeros(L, dtype=bool); slb[rb['slb0']:rb['slb1']] = True
-            ir_wm = np.zeros(L, dtype=bool); ir_wm[rb['w0']:rb['w1']] = True
-            ir_out = np.zeros(L, dtype=bool); ir_out[rb['c0']:rb['c1']] = True
-            named += [('IR_stA', sla, ''), ('IR_am', am, ''), ('IR_stB', slb, ''),
-                     ('IR_warm', ir_wm, ''), ('IR_out', ir_out, '')]
+            refine_wm = np.zeros(L, dtype=bool); refine_wm[rb['w0']:rb['w1']] = True
+            refine_out = np.zeros(L, dtype=bool); refine_out[rb['c0']:rb['c1']] = True
+            named += [('refine_state', sla, ''), ('refine_am', am, ''), ('refine_feedback_state', slb, ''),
+                     ('refine_warm', refine_wm, ''), ('refine_out', refine_out, '')]
         return named
 
     for rb_i, rb in enumerate(pos_content['rec_blocks']):
@@ -443,7 +441,7 @@ def analyse_patterns(ckpt_path: str, device_str: str = 'cpu'):
 
             print(f'    {row_name:20s} {row_lo:3d}:{row_hi:3d}  ' + '  '.join(parts))
 
-        if rb['type'] == 'iq':
+        if rb['type'] == 'initial':
             _report_rows(rb['sl0'], rb['sl1'], 'R0_STATE',
                         expect_low=('enc_src',), expect_high=('enc_state',))
             if rb['w0'] < rb['w1']:
@@ -452,14 +450,14 @@ def analyse_patterns(ckpt_path: str, device_str: str = 'cpu'):
             _report_rows(rb['c0'], rb['c1'], 'R0_output',
                         expect_low=('enc_src', 'enc_state'))
         else:
-            _report_rows(rb['sla0'], rb['sla1'], 'IR_STATE_A',
+            _report_rows(rb['sla0'], rb['sla1'], 'refine_state',
                         expect_low=('enc_src',), expect_high=('enc_state',))
-            _report_rows(rb['am0'], rb['am1'], 'IR_argmax', expect_low=('enc_src',))
-            _report_rows(rb['slb0'], rb['slb1'], 'IR_STATE_B', expect_low=('enc_src',))
+            _report_rows(rb['am0'], rb['am1'], 'refine_argmax', expect_low=('enc_src',))
+            _report_rows(rb['slb0'], rb['slb1'], 'refine_feedback_state', expect_low=('enc_src',))
             if rb['w0'] < rb['w1']:
-                _report_rows(rb['w0'], rb['w1'], 'IR_warmup',
+                _report_rows(rb['w0'], rb['w1'], 'refine_warmup',
                             expect_low=('enc_src', 'enc_state'))
-            _report_rows(rb['c0'], rb['c1'], 'IR_output',
+            _report_rows(rb['c0'], rb['c1'], 'refine_output',
                         expect_low=('enc_src', 'enc_state'))
 
     print()

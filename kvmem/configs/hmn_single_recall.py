@@ -1,10 +1,10 @@
 """
-Stage 0 — single chain-step, round 0 only, no chain (per
+Stage 0 / `solo` — single chain-step, round 0 only, no chain (per
 design-experiment-which-use-atomic-kay.md's "New staging" section). Establishes
-basic state-compression on the new shared-tag / STATE-renamed vocab before
-adding any accumulation (STATE_QUEUE) complexity — mirrors this project's own
-proven "simplest case first" bootstrap principle. No STATE_QUEUE region exists
-in this stage's layout at all (nothing to chain from with only one chain step).
+basic state-compression on the current vocab before adding any accumulation
+(relay) complexity — mirrors this project's own proven "simplest case first"
+bootstrap principle. No relay region exists in this stage's layout at all
+(nothing to relay from with only one chain step).
 
 single_attn block type (this project's default going forward), n_layers=8
 (double the paired dual_attn n_layers=4, matching total attention-op count —
@@ -12,18 +12,18 @@ see hmn_dualattn_nc4_iq.py / hmn_singleattn_nc4_iq.py precedent in this
 scratchpad). Scale matches this project's proven nc4/chunk_len=16 primitive
 (one chain step spanning 2 chunks = 32B recall unit).
 
-V=274 = HMN_TAG_VOCAB_SIZE (268 base + 3 tag pairs x 2 = 6) — shrunk from the
-old per-window-tag scheme's V=282, since <src>/<query>/<response> are now the
-only tag pairs and <mem> is dropped entirely.
+Vocab: chat tags occupy IDs 256-261 (fixed, small, never expected to grow),
+STATE occupies the tail starting at 262 (pure append-growth region) — see
+kvmem/hmn.py's vocab section docstring for the full layout and rationale.
+V=274 (256 data bytes + 6 chat tags + 12 reserved STATE ids).
 
 Sanity bar (design plan section 5): high single-chain-step round-0 match% —
 compare loosely against this project's historical single-window IQ baselines
 (e.g. ~100% dual-attn single-window IQ result) as a "did this at least learn
-the basic task" floor, not a strict target (vocab changed, so bit-for-bit
-reproduction doesn't apply).
+the basic task" floor, not a strict target.
 
 Run:
-    python3 -m kvmem.hmn --config kvmem/configs/hmn_stage0_round0_single.py \
+    python3 -m kvmem.hmn --config kvmem/configs/hmn_single_recall.py \
         --device mps
 """
 
@@ -36,7 +36,7 @@ hp = dict(
     cosine_T0=160000, cosine_T_mult=1,
     rope=True, yarn=True, null_kv=True,
     rmsnorm=True,
-    name='hmn_stage0_round0_single', seed=48,
+    name='hmn_single_recall', seed=48,
 
     state_len=8, state_vocab_size=2,
     warmup_len=8,

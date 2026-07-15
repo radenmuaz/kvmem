@@ -1,16 +1,31 @@
 """
 Stage `squeeze` — dedicated compression-capacity experiment, structured-data
-arm (per docs/HMN_RECIPE.md §10). Paired with hmn_squeeze_random_n4.py (the
+arm (per docs/HISTORY.md §10). Paired with hmn_squeeze_random_n4.py (the
 control, identical config except data_kind='random') — a high match% here
 alone proves nothing; the gap between this run and the control is the actual
 compression evidence.
 
 Single-register layout (n_chunks=1, chain_steps=[(0,1)]) isolates the
-capacity question to exactly one encoding-block STATE. chunk_len=32 is 2x
-Stage `solo`'s proven near-ceiling length (16 bytes at state_len=8 already
-reaches ~94-97% on pure random bytes) — chosen to sit past where raw
-memorization should fail for random bytes, while staying within the
-theoretical 8/target_bits=4x compression ceiling for target_bits=2.0.
+capacity question to exactly one encoding-block STATE.
+
+chunk_len=96 (CORRECTED, was 32 — measured, not assumed): the original
+chunk_len=32 (2x solo's proven ~128-bit near-ceiling length) was chosen
+expecting it to strain raw capacity for random bytes, but
+hmn_squeeze_random_n4.py's actual run DISPROVED that assumption —
+converged to ~100% val, loss~0 by step 70000/160000 on pure random
+(genuinely incompressible) 256-bit content, at n_layers=4. Since squeeze's
+whole point is "does structured data (this config) beat the random
+control at the SAME chunk_len," a control that already saturates near 100%
+leaves no room for this run to show an advantage — the comparison becomes
+uninformative exactly where it needs to be decisive. chunk_len=96 (768
+bits, 3x the point that just saturated, 6x solo's original calibration) is
+a first escalation estimate, not a precisely-derived number — escalate
+further (or reduce, if this overshoots into near-0% territory) based on
+what hmn_squeeze_random_n4.py's rerun actually shows before trusting this
+run's result. target_bits=2.0 stays a PER-BYTE quantity independent of
+chunk_len, so it's unchanged — at chunk_len=96 that's 192 bits of true
+information vs. random's 768 bits, a 4x theoretical compression ceiling
+either way.
 
 n_layers=4 (not solo/relay's 8) as a deliberate MDL-order choice (broaden
 distribution -> simplify algorithm -> grow model size LAST) — starting
@@ -50,7 +65,7 @@ hp = dict(
     data_target_bits=2.0,
 
     curriculum=[
-        dict(n_chunks=1, chunk_len=32, n_refine=0, B=6, n_steps=160000, eval_every=10000,
+        dict(n_chunks=1, chunk_len=96, n_refine=0, B=6, n_steps=60000, eval_every=5000,
              chain_steps=[(0, 1)]),
     ],
 )

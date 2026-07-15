@@ -1,17 +1,30 @@
 """
 Stage `squeeze` — dedicated compression-capacity experiment, RANDOM-BYTE
-CONTROL arm (per docs/HMN_RECIPE.md §10). Identical to hmn_squeeze_ca_n4.py
+CONTROL arm (per docs/HISTORY.md §10). Identical to hmn_squeeze_ca_n4.py
 in every respect except data_kind='random' (no data_target_bits — plain
 uniform random bytes, the source distribution every prior architecture in
 this project trained on).
 
 This is the run to launch FIRST (simpler, and its match% is the baseline
-that hmn_squeeze_ca_n4.py needs to clearly beat at the same chunk_len=32 to
+that hmn_squeeze_ca_n4.py needs to clearly beat at the same chunk_len to
 demonstrate genuine compression rather than just "the model got bigger/
-better at storage regardless of content"). At n_layers=4/state_len=8/
-chunk_len=32, this run is EXPECTED to show degraded match% relative to
-Stage `solo`'s chunk_len=16 ceiling — that expected failure is the point,
-it establishes the raw-capacity floor hmn_squeeze_ca_n4.py needs to beat.
+better at storage regardless of content").
+
+chunk_len=96 (CORRECTED, was 32 — measured, not assumed): the first attempt
+at chunk_len=32 was expected to show degraded match% (2x solo's proven
+~128-bit near-ceiling), but this run actually converged to ~100% val,
+loss~0 by step 70000/160000 on pure random (genuinely incompressible)
+256-bit content — no capacity pressure at all, so the paired comparison
+against hmn_squeeze_ca_n4.py would have been uninformative (nothing for CA
+to beat). Killed that run at step ~115000 once the saturation was clear.
+chunk_len=96 (768 bits, 3x the point that just saturated) is a first
+escalation estimate — re-verify this run ALSO shows genuine degradation
+below ~100% before trusting hmn_squeeze_ca_n4.py's comparison; escalate
+chunk_len further (or back off if this overshoots to near-0%) if not.
+n_steps reduced to 60000 (from 160000) for this probe — the original run's
+own eval curve showed convergence well before 160000 steps at the smaller
+scale, so a shorter budget should be enough to see the trend before
+committing to the full budget.
 
 Run (only after Stage `relay` finishes and the chain-memory recovery probe
 runs — never two jobs at once; run this BEFORE hmn_squeeze_ca_n4.py):
@@ -38,7 +51,7 @@ hp = dict(
     data_kind='random',
 
     curriculum=[
-        dict(n_chunks=1, chunk_len=32, n_refine=0, B=6, n_steps=160000, eval_every=10000,
+        dict(n_chunks=1, chunk_len=96, n_refine=0, B=6, n_steps=60000, eval_every=5000,
              chain_steps=[(0, 1)]),
     ],
 )
