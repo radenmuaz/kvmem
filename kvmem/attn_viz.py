@@ -16,7 +16,7 @@ with a version that saves the softmax weights before returning. No model or trai
 files are modified.
 
 Usage:
-  python3 -m kvmem.attn_viz --ckpt kvmem/logs/hmn_single_recall/checkpoints/stage0_best.pt
+  python3 -m kvmem.attn_viz --ckpt kvmem/logs/hmn_routing_4to1_state/checkpoints/stage0_best.pt
   python3 -m kvmem.attn_viz --ckpt <path> --seq-idx 0 --out attn_maps.png
   python3 -m kvmem.attn_viz --ckpt <path> --analyse
 
@@ -202,7 +202,7 @@ def _load_model_and_pos(ckpt_path: str, device: torch.device):
     chunk_len = stage_cfg['chunk_len']
     chain_steps = stage_cfg['chain_steps']
     n_refine = stage_cfg.get('n_refine', 0)
-    hops = stage_cfg.get('hops', 0)
+    hops = stage_cfg.get('hops', -1)  # default -1 = unbounded (routing-style); hops=0 is invalid
 
     built = chunk_positions_hop(n_chunks, chunk_len, state_len, warmup_len,
                                 chain_steps, n_refine=n_refine,

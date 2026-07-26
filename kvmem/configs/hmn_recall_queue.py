@@ -2,8 +2,13 @@
 `hmn_recall_queue.py` — training config for Stage `hop` (renamed from
 `hmn_flow.py`; the underlying mechanism is still called `hop` throughout
 the codebase — `chunk_positions_hop`/`chunk_mask_fb_hop`/`hops` —
-this filename just describes the TASK/schedule, matching
-`hmn_single_recall.py`'s naming convention, not the architecture).
+this filename just describes the TASK/schedule, not the architecture —
+warm-started from `hmn_single_recall_c64.py`'s checkpoint.
+`hmn_routing_4to1_state.py` (`solo`) is treated as an archived experiment
+(no checkpoint for it exists on disk); `hmn_single_recall_c64` is a
+same-architecture (d/n_layers/n_heads/state_len/V unchanged), single-chunk/
+no-relay checkpoint that already exists and reached 100% val match, so it
+plays the same "clean base to build from" role `solo` used to.
 
 Attention-based relay, single-hop STATE-to-STATE permission
 (`chunk_mask_fb_hop`'s relay exception) instead of a forced feature-vector
@@ -15,8 +20,8 @@ ONE packed-sequence forward pass — no sequential per-chain-step
 orchestration needed (cheaper per step than the original `h_inject`-based
 relay design, since deleted — see CLAUDE.md's "Deleted mechanisms").
 
-Warm-started from `solo`'s checkpoint (same d/n_layers/vocab, so this
-should load byte-identical, no growing tensors).
+Warm-started from `hmn_single_recall_c64`'s checkpoint (same d/n_layers/
+vocab, so this should load byte-identical, no growing tensors).
 
 **Known result, measured not assumed**: the run recorded under this exact
 config (same architecture/hyperparameters/warm-start-from-solo) previously
@@ -48,7 +53,7 @@ recovery-probe's clean repeat_query failure, orthogonal to `weave_mix`
 
 Run:
     python3 -m kvmem.hmn --config kvmem/configs/hmn_recall_queue.py \
-        --pretrained kvmem/logs/hmn_single_recall/checkpoints/stage0_best.pt \
+        --pretrained logs/hmn_single_recall_c64/checkpoints/stage0_best.pt \
         --device mps
 """
 

@@ -374,10 +374,12 @@ teacher-forced number.
 
 | Stage | Config | What it does | Status |
 |---|---|---|---|
-| `solo` | `kvmem/configs/hmn_single_recall.py` | one chain step, no relay — the bootstrap case | Done |
-| `hop` | `kvmem/configs/hmn_recall_queue.py` | multi chain-step, `hops=1` relay | Done (run twice, results vary — see `CLAUDE.md`) |
-| `weave_mix` | `kvmem/configs/hmn_weave_mix.py` | trains on `batch`/`stream`/`interleave_delayed` mixed | Done — MEAN=74.4% (warm-started from `solo`) |
-| `squeeze` | `hmn_squeeze_random_n4.py` / `hmn_squeeze_markov_n4.py` | tests genuine compression on structured (Markov, exact entropy) vs. random data | `random` paused mid-run; `markov` queued |
+| `solo` | `kvmem/configs/hmn_routing_4to1_state.py` (renamed from `hmn_single_recall.py`) | one chain step, no relay — the bootstrap case; recall STATE routes across all n_chunks encoding STATEs simultaneously (verified, zero blocked entries), not RNN-style accumulation | Done |
+| `hop` | `kvmem/configs/hmn_recall_queue.py` | multi chain-step, `hops=1` relay — now automatically exercises the corrected recurrent masking (2026-07-15, see CLAUDE.md's `hops` semantics entry); previously-measured numbers were produced under the OLD leaky masking and are not guaranteed to reproduce | Done under old masking; re-run needed for numbers under the fix |
+| `weave_mix` | `kvmem/configs/hmn_weave_mix.py` | trains on `batch`/`stream`/`interleave_delayed` mixed; never sets `hops`, so stays on the unbounded/routing-style default (`-1`), unaffected by the masking fix | Done — MEAN=74.4% (warm-started from `solo`) |
+| `weave_mix` (recurrent) | `kvmem/configs/hmn_weave_mix_accum_rnn.py` | same trajectory mix as `weave_mix`, but `hops=1` explicit — the corrected-masking, forced-accumulation counterpart | Queued |
+| `squeeze` | `hmn_squeeze_random_n4.py` / `hmn_squeeze_markov_n4.py` | tests genuine compression on structured (Markov, exact entropy) vs. random data at `chunk_len=96` (large nominal headroom, not a tight capacity test) | `random` paused mid-run; `markov` queued |
+| `squeeze` (sweet spot) | `hmn_squeeze_sweetspot_n4.py` / `hmn_squeeze_sanity_bigmodel_n4.py` | same dataset, sized so STATE is between the raw-file and true-content sizes (2.0x/0.5x ratios) — success would be genuine evidence of compression, not trivial or impossible | `sweetspot` queued; `sanity_bigmodel` stopped early (step 5999/60000, no learning yet) |
 
 **The open question right now**: `hop`'s chain-memory recovery probe
 (`kvmem/eval_weave.py --patterns repeat_query`) failed cleanly — a

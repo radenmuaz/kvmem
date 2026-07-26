@@ -22,8 +22,18 @@ compare loosely against this project's historical single-window IQ baselines
 (e.g. ~100% dual-attn single-window IQ result) as a "did this at least learn
 the basic task" floor, not a strict target.
 
+**Renamed from `hmn_single_recall.py`** — the recall STATE has full,
+simultaneous attention access to ALL n_chunks encoding-pass STATEs at
+once (verified directly against the mask: zero blocked entries between
+the recall STATE and any of the 4 encoding STATEs), not a single
+running/overwritten state the way an RNN would accumulate one chunk into
+the next. "routing" names this precisely: 4 independent per-chunk STATE
+registers route into 1 recall STATE via learned attention, nothing is
+merged/accumulated structurally — the model has to learn which of the 4
+to actually use for a given query, it isn't forced to.
+
 Run:
-    python3 -m kvmem.hmn --config kvmem/configs/hmn_single_recall.py \
+    python3 -m kvmem.hmn --config kvmem/configs/hmn_routing_4to1_state.py \
         --device mps
 """
 
@@ -36,7 +46,7 @@ hp = dict(
     cosine_T0=160000, cosine_T_mult=1,
     rope=True, yarn=True, null_kv=True,
     rmsnorm=True,
-    name='hmn_single_recall', seed=48,
+    name='hmn_routing_4to1_state', seed=48,
 
     state_len=8, state_vocab_size=2,
     warmup_len=8,

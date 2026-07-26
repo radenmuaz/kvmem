@@ -42,7 +42,7 @@ chunk_len/state_len fixed at whatever the checkpoint was actually trained
 with (no extrapolation confound).
 
 Usage:
-    python3 -m kvmem.eval_compression --ckpt kvmem/logs/hmn_single_recall/checkpoints/stage0_best.pt --device mps
+    python3 -m kvmem.eval_compression --ckpt kvmem/logs/hmn_routing_4to1_state/checkpoints/stage0_best.pt --device mps
     python3 -m kvmem.eval_compression --ckpt <path> --device mps --kinds ca,chaotic,fractal
     python3 -m kvmem.eval_compression --ckpt <path> --device mps --sweep-length   # optional diagnostic 5
 """
@@ -98,7 +98,7 @@ def _build_layout(hp: dict, chain_steps=None):
     n_chunks, chunk_len = stage_cfg['n_chunks'], stage_cfg['chunk_len']
     chain_steps = chain_steps or stage_cfg['chain_steps']
     n_refine = stage_cfg.get('n_refine', 0)
-    hops = stage_cfg.get('hops', 0)
+    hops = stage_cfg.get('hops', -1)  # default -1 = unbounded (routing-style); hops=0 is invalid
 
     built = chunk_positions_hop(n_chunks, chunk_len, state_len, warmup_len,
                                 chain_steps, n_refine=n_refine,
@@ -460,7 +460,7 @@ def sweep_max_recallable_length(model, hp: dict, device: torch.device, kind: str
             built = chunk_positions_hop(1, cl, state_len, warmup_len, [(0, 1)],
                                        n_refine=0, state_vocab_size=state_vocab_size)
             pos_content, pos_mask, tags = built['pos_content'], built['pos_mask'], built['tags']
-            mask_t = torch.tensor(chunk_mask_fb_hop(pos_mask, hops=0), dtype=torch.float32, device=device)
+            mask_t = torch.tensor(chunk_mask_fb_hop(pos_mask, hops=-1), dtype=torch.float32, device=device)
             sids = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
             sids_feedback_state = np.array(
                 _cyclic_state_ids(state_len, state_vocab_size, family=HMN_FEEDBACK_STATE_FAMILY),
