@@ -417,88 +417,6 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
     return dict(pos_content=pos_content, pos_mask=pos_mask, tags=tags, L=L)
 
 
-def chunk_positions_stitch(chunk_len: int, n_chunks: int, state_len: int,
-                           warmup_len: int, src_stride: int,
-                           state_vocab_size: int = 2) -> dict:
-    """
-    Byte-precise continuous-stitch query chain, decoupled from chunk_len:
-    encode n_chunks*chunk_len bytes as usual (E/S per chunk), then a chain
-    of `initial`-type rec_blocks whose warmup/response windows advance by
-    exactly `src_stride` bytes each — query i's warmup is source bytes
-    [i*src_stride, i*src_stride+warmup_len), response is
-    [i*src_stride+warmup_len, i*src_stride+warmup_len+src_stride). By
-    construction, query i+1's warmup ((i+1)*src_stride, ...) is EXACTLY the
-    tail `warmup_len` bytes of query i's response — only query 0's warmup
-    is genuinely new (unseen) source content; every later query's warmup
-    is literally the previous query's own response, byte for byte. Trains/
-    tests continuous, self-fed generation (only the first anchor is real
-    ground truth) rather than chunk_positions_traj's fresh-ground-truth-
-    per-window recall.
-
-    Reuses the same generic rec_block shape (type/op_idx/sl0.../c0/c1) as
-    chunk_positions_traj, so chunk_mask_fb_traj (keys off op_idx, not
-    span) and _forward_segmented/_iter_forward_segments work unchanged.
-    `src0` (absolute byte offset into the source) replaces `span` — a
-    chunk-index tuple doesn't apply here since windows aren't chunk-aligned.
-
-    `src_stride` need not evenly divide `(src_len - warmup_len)` — the
-    LAST query's response is simply clipped shorter than `src_stride` so
-    the chain covers the source EXACTLY, no gap and no overlap. Every
-    query's `src0` still advances by the regular `src_stride` (so the
-    continuity invariant — query i+1's warmup is exactly query i's own
-    response — holds all the way through, including into the shortened
-    last query), only its `out_len` differs. Requiring exact tiling would
-    otherwise force `src_stride` to be a divisor of `(src_len -
-    warmup_len)`, which can be awkwardly restrictive (e.g. at
-    src_len=1024, warmup_len=8: `1016 = 8*127`, and 127 is prime, so 8 and
-    127 are the ONLY two exact divisors — no usable middle ground between
-    "126 hops" and "7 hops").
-    """
-    src_len = n_chunks * chunk_len
-    n_queries = -(-(src_len - warmup_len) // src_stride)  # ceiling division
-    assert n_queries >= 1
-
-    enc_blocks_c: list[dict] = []
-    enc_blocks_m: list[dict] = []
-    tags: list[tuple[int, int]] = []
-    offset = 0
-    for _ in range(n_chunks):
-        tags.append((offset, HMN_SRC_OPEN)); offset += 1
-        s0 = offset; s1 = s0 + chunk_len; offset = s1
-        tags.append((offset, HMN_SRC_CLOSE)); offset += 1
-        sl0 = offset; sl1 = sl0 + state_len; offset = sl1
-        enc_blocks_c.append(dict(s0=s0, s1=s1, sl0=sl0, sl1=sl1))
-        enc_blocks_m.append(dict(s0=s0 - 1, s1=s1 + 1, sl0=sl0, sl1=sl1))
-    enc_end = offset
-
-    query_open, query_close = HMN_QUERY_OPEN, HMN_QUERY_CLOSE
-    rec_blocks_c: list[dict] = []
-    rec_blocks_m: list[dict] = []
-    for i in range(n_queries):
-        src0 = i * src_stride
-        out_len = min(src_stride, src_len - warmup_len - src0)  # last query clipped to land exactly on src_len
-        assert out_len > 0
-        sl0 = offset; sl1 = sl0 + state_len; offset = sl1
-        tags.append((offset, query_open)); offset += 1
-        w0 = offset; w1 = w0 + warmup_len; offset = w1
-        tags.append((offset, query_close)); offset += 1
-        tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
-        c0 = offset; c1 = c0 + out_len; offset = c1
-        tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
-        rec_blocks_c.append(dict(type='initial', src0=src0, out_len=out_len,
-                                 is_clean=True, op_idx=i,
-                                 sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1))
-        rec_blocks_m.append(dict(type='initial', op_idx=i,
-                                 sl0=sl0, sl1=sl1, w0=w0 - 1, w1=w1 + 1, c0=c0 - 1, c1=c1 + 1))
-
-    L = offset
-    pos_content = dict(enc_blocks=enc_blocks_c, rec_blocks=rec_blocks_c,
-                       enc_end=enc_end, warmup_len=warmup_len, L=L)
-    pos_mask = dict(enc_blocks=enc_blocks_m, rec_blocks=rec_blocks_m,
-                    enc_end=enc_end, warmup_len=warmup_len, L=L)
-    return dict(pos_content=pos_content, pos_mask=pos_mask, tags=tags, L=L)
-
-
 def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
     """
     Mask for chunk_positions_traj layouts — same relay exception as
@@ -653,21 +571,6 @@ def traj_interleave_delayed(n_chunks: int, window_chunks: int = 2) -> list[tuple
     spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
     q_str = ' '.join(f'Q({s},{e})' for s, e in reversed(spans))  # query last span first
     return parse_traj_dsl(f'E{n_chunks} {q_str}')
-
-
-def traj_suffix(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
-    """Encode everything, then a SINGLE query spanning the last
-    `window_chunks` chunks: `Q(n_chunks-window_chunks, n_chunks)` — warmup
-    (a few real ground-truth bytes) anchors at the START of that span,
-    response covers everything after warmup through the true end of the
-    source. No relay chain at all (`op_idx=0`, always exempt from the
-    `hops`-bounded relay restriction — see chunk_mask_fb_traj), so this
-    doesn't need `hops`/`forward_granularity`/`segment_checkpoint` the way
-    the multi-query stitch chain did; `window_chunks` here plays the role
-    of "how far from the end the warmup anchor sits" — smaller
-    `window_chunks` = warmup closer to the end = less left to generate."""
-    assert window_chunks >= 2, 'window_chunks must be >=2 so there is a non-trivial response to generate'
-    return parse_traj_dsl(f'E{n_chunks} Q({n_chunks - window_chunks},{n_chunks})')
 
 
 def traj_repeat_query(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
@@ -969,119 +872,6 @@ def _cat_kv(kv_a: list, kv_b: list) -> list:
             for (ka, va), (kb, vb) in zip(kv_a, kv_b)]
 
 
-def _iter_forward_segments(pos_content: dict) -> list[dict]:
-    """Ordered, contiguous (seg_start, seg_end, kind, block) list spanning the
-    whole packed sequence: one entry per encoding block (`<src>` through the
-    end of that chunk's own STATE) and one per rec_block (STATE through
-    `</response>`). Positions are contiguous by construction (chunk_positions_*
-    builds every block from one monotonically increasing offset), so
-    seg_start of entry i+1 always equals seg_end of entry i."""
-    segs = []
-    for b in pos_content['enc_blocks']:
-        segs.append(dict(seg_start=b['s0'] - 1, seg_end=b['sl1'], kind='enc', block=b))
-    for rb in pos_content['rec_blocks']:
-        end = rb['c1'] + 1 if 'c1' in rb else rb['sl1']  # 'noop' blocks have no c0/c1
-        start = rb['sl0'] if rb['type'] != 'refine' else rb['sla0']
-        segs.append(dict(seg_start=start, seg_end=end, kind='rec', block=rb))
-    segs.sort(key=lambda s: s['seg_start'])
-    return segs
-
-
-def _forward_segmented(model: nn.Module, tok_t: torch.Tensor, mask_np: np.ndarray,
-                       pos_content: dict, device: torch.device, ls_max: float,
-                       granularity: float | int, segment_checkpoint: bool = False) -> torch.Tensor:
-    """Alternative to one dense `model(tok_t, mask_t)` call: walk the packed
-    sequence in GROUPS of consecutive STATE-bounded segments
-    (`_iter_forward_segments`), one forward pass per group, carrying a KV
-    cache between groups (same `past_kv`/`return_kv`/`offset` primitives
-    `ar_decode_iq_global_rw_tagged` already uses for eval-time decode, here
-    run WITH gradients enabled instead of under `torch.no_grad()` — safe
-    because `_cat_kv` is a plain `torch.cat`, so `loss.backward()` still
-    reaches every earlier group's forward pass). `granularity` is the
-    memory/compute knob, either form: an int >=1 is an EXACT segment count
-    per group (`1` = the extreme case, one pass per STATE segment, smallest
-    possible per-pass attention matrix, most passes); a float in (0, 1] is a
-    FRACTION of the total segment count per group, so it scales with
-    sequence length instead of needing per-config retuning (`1.0` groups
-    everything into one pass — mathematically the same as not using this
-    path at all, see the `forward_granularity=None` default in train() which
-    skips it entirely instead; smaller fractions approach the per-STATE
-    extreme as they shrink toward `1/len(segments)`). Every downstream
-    region only ever attends through its own STATE bottleneck (verified
-    against the mask-construction rules in chunk_mask_fb_traj/
-    chunk_mask_fb_hop), so slicing the SAME precomputed full mask per group
-    reproduces exactly the attention a single joint pass would compute for
-    those rows — this changes peak memory (never materializes the full
-    (L,L) mask/scores at once), not model behavior. Only supports
-    'initial'-type rec_blocks today (no refine/argmax-feedback — see the
-    segmented-forward plan's Stage 2).
-
-    `segment_checkpoint` (time-axis gradient checkpointing, separate from
-    and independent of HMNModel's own `grad_checkpoint` model-DEPTH
-    checkpointing — this one checkpoints across the SEGMENT/time axis
-    instead, recomputing each group's own forward pass during backward
-    rather than retaining its activations): when True, each group's
-    `model(...)` call is wrapped in `torch.utils.checkpoint.checkpoint`
-    instead of called directly. This is the fix for the OOM measured when
-    training `hmn_stitch_src1024.py` at full batch size — without it,
-    every group's internal activations (Q/K/V, attention scores, RoPE
-    intermediates — everything except the K/V explicitly returned for the
-    relay cache) are retained for the WHOLE run's backward pass, so a long
-    STATE-segment chain (~100+ groups) accumulates a correspondingly large
-    graph even though each individual group's own work is small. With
-    `segment_checkpoint=True`, only the returned K/V tensors persist
-    (needed for the relay itself) — everything else is recomputed on
-    demand during backward, at the cost of ~2x forward compute for
-    whichever groups actually need a backward pass through them. Standard
-    nested-checkpoint semantics apply: recomputing group i's forward may
-    itself need group i-1's own (checkpointed) output recomputed first if
-    that hasn't been done yet — PyTorch's autograd handles this
-    automatically, same as any other chained/nested checkpoint use."""
-    segs = _iter_forward_segments(pos_content)
-    if isinstance(granularity, float):
-        assert 0 < granularity <= 1.0, 'fractional granularity must be in (0, 1]'
-        group_size = max(1, round(granularity * len(segs)))
-    else:
-        assert granularity >= 1
-        group_size = int(granularity)
-    groups = [segs[i:i + group_size] for i in range(0, len(segs), group_size)]
-
-    def _seg_fwd(tok_slice, seg_mask_t, kv_cache_arg, offset_val):
-        return model(tok_slice, seg_mask_t, past_kv=kv_cache_arg, return_kv=True, offset=offset_val)
-
-    kv_cache = None
-    L_cached = 0
-    nlls = []
-    for group in groups:
-        s0, s1 = group[0]['seg_start'], group[-1]['seg_end']
-        assert s0 == L_cached, f'segment gap: expected start {L_cached}, got {s0}'
-        seg_mask_np = mask_np[s0:s1, :s1]
-        seg_mask_t = torch.tensor(seg_mask_np, dtype=torch.float32, device=device)
-        tok_slice = tok_t[:, s0:s1]
-        if segment_checkpoint:
-            logits_grp, seg_kv = _ckpt(_seg_fwd, tok_slice, seg_mask_t, kv_cache, L_cached,
-                                       use_reentrant=False)
-        else:
-            logits_grp, seg_kv = _seg_fwd(tok_slice, seg_mask_t, kv_cache, L_cached)
-        kv_cache = seg_kv if kv_cache is None else _cat_kv(kv_cache, seg_kv)
-        L_cached = s1
-
-        for seg in group:
-            if seg['kind'] != 'rec':
-                continue
-            rb = seg['block']
-            if rb['type'] != 'initial':
-                raise NotImplementedError(
-                    "_forward_segmented only supports 'initial' rec_blocks today "
-                    "(no refine/argmax-feedback support yet)")
-            if rb['is_clean']:
-                lp  = F.log_softmax(logits_grp[:, rb['c0'] - 1 - s0:rb['c1'] - 1 - s0], dim=-1)
-                tgt = tok_t[:, rb['c0']:rb['c1']]
-                nll_per = _positional_ls_nll(lp, tgt, ls_max)
-                nlls.append(nll_per.mean())
-    return torch.stack(nlls).mean()
-
-
 def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len: int,
                       state_len: int, state_vocab_size: int, pos_content: dict,
                       tags: list[tuple[int, int]],
@@ -1139,47 +929,6 @@ def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
                 tok[b_idx, rb['am0']:rb['am1']] = gt[b_idx, X + wl:X + wl + rb['out_len']]
                 tok[b_idx, rb['w0']:rb['w1']]   = gt[b_idx, X:X + wl]
                 tok[b_idx, rb['c0']:rb['c1']]   = gt[b_idx, X + wl:X + wl + rb['out_len']]
-
-    tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
-    tag_ids = np.array([i for _, i in tags], dtype=np.int64)
-    tok[:, tag_pos] = tag_ids[None, :]
-
-    return tok
-
-
-def make_batch_stitch(rng: np.random.Generator, B: int, n_chunks: int, chunk_len: int,
-                      state_len: int, state_vocab_size: int, pos_content: dict,
-                      tags: list[tuple[int, int]],
-                      data_kind: str = 'random', data_target_bits: float | None = None) -> np.ndarray:
-    """Batch filler for chunk_positions_stitch layouts — same shape as
-    make_batch_tagged but sources warmup/response ground truth by absolute
-    byte offset (`rb['src0']`) into the flattened source, not by chunk-index
-    span, since stitch windows aren't chunk-aligned. No random warmup-offset
-    augmentation (chunk_positions_stitch has no warmup_train_range/rw_xs
-    concept — every window's position is fixed by the stitch geometry
-    itself, not randomized per batch item)."""
-    sids = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
-    L = pos_content['L']
-    tok = np.zeros((B, L), dtype=np.int64)
-    if data_kind == 'random':
-        segs = rng.integers(0, 256, size=(B, n_chunks, chunk_len), dtype=np.int64)
-    else:
-        segs = np.stack([generate_structured_chunks(rng, data_kind, n_chunks, chunk_len,
-                                                     target_bits=data_target_bits)
-                        for _ in range(B)], axis=0)
-    src = segs.reshape(B, n_chunks * chunk_len)  # flattened, byte-addressable source
-
-    for k, b in enumerate(pos_content['enc_blocks']):
-        tok[:, b['s0']:b['s1']] = segs[:, k, :]
-        tok[:, b['sl0']:b['sl1']] = sids
-
-    wl = pos_content['warmup_len']
-    for rb in pos_content['rec_blocks']:
-        assert rb['type'] == 'initial', 'chunk_positions_stitch only ever produces initial rec_blocks'
-        src0 = rb['src0']
-        tok[:, rb['sl0']:rb['sl1']] = sids
-        tok[:, rb['w0']:rb['w1']] = src[:, src0:src0 + wl]
-        tok[:, rb['c0']:rb['c1']] = src[:, src0 + wl:src0 + wl + rb['out_len']]
 
     tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
     tag_ids = np.array([i for _, i in tags], dtype=np.int64)
@@ -1530,121 +1279,6 @@ def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int
         rb_gen    = tok[rb['c0']:rb['c1']]
         rb_match  = 100.0 * float(np.sum(rb_gen[:len(rb_target)] == rb_target)) / max(len(rb_target), 1)
         turn_match_pcts.append(rb_match)
-
-    return dict(match_pct=(sum(turn_match_pcts) / len(turn_match_pcts) if turn_match_pcts else float('nan')),
-               turn_match_pcts=turn_match_pcts)
-
-
-@torch.no_grad()
-def ar_decode_stitch(model, chunks_arr, state_len: int, state_vocab_size: int,
-                        mask_np: np.ndarray, pos_content: dict,
-                        tags: list[tuple[int, int]], device) -> dict:
-    """
-    KV-cached AR decode for chunk_positions_stitch layouts — true continuous
-    decode: only query 0's warmup is ground truth (the single real anchor);
-    every later query's warmup is the model's OWN just-decoded response from
-    the immediately preceding query (rec_blocks are ordered by op_idx with
-    no span concept, so "immediately preceding rec_block" is unambiguous,
-    unlike ar_decode_traj_nokv's span-matching).
-
-    KV-cached (same past_kv/return_kv/offset primitives as
-    ar_decode_iq_global_rw_tagged, adapted here), NOT full-recompute —
-    required at this layout's scale: a naive "_nokv" version (recompute the
-    whole growing prefix from scratch for every single generated byte, one
-    O(pos^2) dense pass per byte) hits real MPS OOM well before L~5000
-    (measured directly: OOM'd at L~4900 attempting full recompute). Caching
-    keeps each step's forward pass small (existing cache + 1 new token),
-    not the whole prefix, and avoids ever rebuilding a large (L,L) mask.
-    """
-    if isinstance(chunks_arr, np.ndarray) and chunks_arr.ndim == 2:
-        chunks_list = [chunks_arr[k] for k in range(chunks_arr.shape[0])]
-    else:
-        chunks_list = list(chunks_arr)
-
-    wl        = pos_content['warmup_len']
-    sids      = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
-    L         = pos_content['L']
-    full_mask = torch.tensor(mask_np, dtype=torch.float32, device=device)
-    gt_full   = np.concatenate(chunks_list)
-
-    tok = np.zeros(L, dtype=np.int64)
-    for k, b in enumerate(pos_content['enc_blocks']):
-        tok[b['s0']:b['s1']]   = chunks_list[k]
-        tok[b['sl0']:b['sl1']] = sids
-
-    tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
-    tag_ids = np.array([i for _, i in tags], dtype=np.int64)
-    tok[tag_pos] = tag_ids
-
-    enc_end  = pos_content['enc_end']
-    enc_t    = torch.tensor(tok[:enc_end], dtype=torch.long, device=device)
-    enc_mask = full_mask[:enc_end, :enc_end]
-    _, kv_cache = model(enc_t, enc_mask, return_kv=True)
-    L_cached = enc_end
-
-    def _decode_segment(seg_start: int, rb: dict):
-        nonlocal kv_cache, L_cached
-        seg_end = rb['c0']
-        seg_len = seg_end - seg_start
-        seg_t    = torch.tensor(tok[seg_start:seg_end], dtype=torch.long, device=device)
-        seg_mask = full_mask[seg_start:seg_end, :L_cached + seg_len]
-        seg_logits, seg_kv = model(seg_t, seg_mask, past_kv=kv_cache,
-                                   return_kv=True, offset=L_cached)
-        kv_cache  = _cat_kv(kv_cache, seg_kv)
-        L_cached += seg_len
-
-        tok[rb['c0']] = int(seg_logits[-1].argmax())
-        for j in range(1, rb['out_len']):
-            prev_pos  = rb['c0'] + j - 1
-            prev_t    = torch.tensor([tok[prev_pos]], dtype=torch.long, device=device)
-            prev_mask = full_mask[prev_pos:prev_pos+1, :L_cached + 1]
-            prev_logits, prev_kv = model(prev_t, prev_mask, past_kv=kv_cache,
-                                         return_kv=True, offset=L_cached)
-            kv_cache  = _cat_kv(kv_cache, prev_kv)
-            L_cached += 1
-            tok[rb['c0'] + j] = int(prev_logits[-1].argmax())
-        if rb['out_len'] > 0:
-            last_pos  = rb['c1'] - 1
-            last_t    = torch.tensor([tok[last_pos]], dtype=torch.long, device=device)
-            last_mask = full_mask[last_pos:last_pos+1, :L_cached + 1]
-            _, last_kv = model(last_t, last_mask, past_kv=kv_cache,
-                               return_kv=True, offset=L_cached)
-            kv_cache  = _cat_kv(kv_cache, last_kv)
-            L_cached += 1
-
-        # Cache the `</response>` closing tag at position c1 too (its token
-        # id is already known — filled by the tok[tag_pos]=tag_ids line at
-        # the top of this function, before any decoding starts) — without
-        # this, L_cached stops one short of the next rec_block's own sl0
-        # (which sits right after this tag), and the next segment's
-        # assert seg_start == L_cached fails.
-        tag_pos_ = rb['c1']
-        tag_t    = torch.tensor([tok[tag_pos_]], dtype=torch.long, device=device)
-        tag_mask = full_mask[tag_pos_:tag_pos_+1, :L_cached + 1]
-        _, tag_kv = model(tag_t, tag_mask, past_kv=kv_cache, return_kv=True, offset=L_cached)
-        kv_cache  = _cat_kv(kv_cache, tag_kv)
-        L_cached += 1
-
-    turn_match_pcts: list[float] = []
-    prev_response: np.ndarray | None = None
-
-    for rb in pos_content['rec_blocks']:
-        src0 = rb['src0']
-        warmup_src = gt_full[:wl] if prev_response is None else prev_response[-wl:]
-
-        seg_start = rb['sl0']
-        assert seg_start == L_cached, f'segment gap: expected start {L_cached}, got {seg_start}'
-        tok[rb['sl0']:rb['sl1']] = sids
-        if wl > 0:
-            tok[rb['w0']:rb['w1']] = warmup_src
-
-        _decode_segment(seg_start, rb)
-
-        rb_gen    = tok[rb['c0']:rb['c1']]
-        rb_target = gt_full[src0 + wl:src0 + wl + rb['out_len']]
-        rb_match  = 100.0 * float(np.sum(rb_gen == rb_target)) / max(len(rb_target), 1)
-        turn_match_pcts.append(rb_match)
-        prev_response = rb_gen
 
     return dict(match_pct=(sum(turn_match_pcts) / len(turn_match_pcts) if turn_match_pcts else float('nan')),
                turn_match_pcts=turn_match_pcts)
@@ -2316,14 +1950,6 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     data_target_bits = hp.get('data_target_bits', None)
     repeat_batch = hp.get('repeat_batch', 1)  # gradient steps taken on the same sampled batch before resampling
     assert repeat_batch >= 1
-    # memory/compute knob: None (default) = one dense pass, zero overhead, current behavior.
-    # int N = N STATE-segments per forward pass; float f in (0,1] = fraction of segments per
-    # pass (scales with sequence length). Wired into the weave_mix/stitch_mix branches.
-    forward_granularity = hp.get('forward_granularity', None)
-    # time-axis (segment) gradient checkpointing — separate from and independent of
-    # HMNModel's own model-depth grad_checkpoint. Only meaningful when forward_granularity
-    # is set (nothing to checkpoint across segments otherwise).
-    segment_checkpoint = hp.get('segment_checkpoint', False)
     opt = torch.optim.AdamW(model.parameters(), lr=lr_max, weight_decay=wd, betas=(0.9, 0.999))
 
     curriculum = hp.get('curriculum', [])
@@ -2351,8 +1977,7 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             ls_max     = hp.get('ls_max', 0.0)
 
             _WEAVE_TRAIN_PATTERNS = dict(batch=traj_batch, stream=traj_stream,
-                                         interleave_delayed=traj_interleave_delayed,
-                                         suffix=traj_suffix)
+                                         interleave_delayed=traj_interleave_delayed)
             hops = stage.get('hops', -1)  # default -1 = unbounded (routing-style); hops=0 is invalid
 
             weave_mix_cfg = stage['weave_mix']  # list of {weight, pattern[, n_chunks, window_chunks]}
@@ -2422,21 +2047,16 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 else:
                     traj, t_pos_content, t_mask_t, t_tags, tok_t = _cached_batch
 
-                if forward_granularity is not None:
-                    loss = _forward_segmented(model, tok_t, traj['mask_np'], t_pos_content,
-                                              device, ls_max, forward_granularity,
-                                              segment_checkpoint=segment_checkpoint)
-                else:
-                    logits = model(tok_t, t_mask_t)
-                    nlls = []
-                    for rb in t_pos_content['rec_blocks']:
-                        if not rb['is_clean']:
-                            continue
-                        lp  = F.log_softmax(logits[:, rb['c0'] - 1:rb['c1'] - 1], dim=-1)
-                        tgt = tok_t[:, rb['c0']:rb['c1']]
-                        nll_per = _positional_ls_nll(lp, tgt, ls_max)
-                        nlls.append(nll_per.mean())
-                    loss = torch.stack(nlls).mean()
+                logits = model(tok_t, t_mask_t)
+                nlls = []
+                for rb in t_pos_content['rec_blocks']:
+                    if not rb['is_clean']:
+                        continue
+                    lp  = F.log_softmax(logits[:, rb['c0'] - 1:rb['c1'] - 1], dim=-1)
+                    tgt = tok_t[:, rb['c0']:rb['c1']]
+                    nll_per = _positional_ls_nll(lp, tgt, ls_max)
+                    nlls.append(nll_per.mean())
+                loss = torch.stack(nlls).mean()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
@@ -2473,147 +2093,6 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         _log(f'  val/weave/{traj["pattern"]:<20} match={m_:.1f}%')
                     vmean = sum(val_means) / len(val_means)
                     _log(f'  val/weave/MEAN               match={vmean:.1f}%')
-
-                    torch.save(dict(model=model.state_dict(), hp=hp, step=global_step),
-                              os.path.join(ckpt_dir, f'stage{stage_i}_last.pt'))
-                    if vmean > stage_best_val:
-                        stage_best_val = vmean
-                        torch.save(dict(model=model.state_dict(), hp=hp, step=global_step, val_mean=vmean),
-                                  os.path.join(ckpt_dir, f'stage{stage_i}_best.pt'))
-
-            torch.save(dict(model=model.state_dict(), hp=hp, step=global_step),
-                      os.path.join(ckpt_dir, f'stage{stage_i}_end.pt'))
-            _log(f'[stage {stage_i}] done. saved stage{stage_i}_end.pt (best={stage_best_val:.1f}%)')
-            continue
-
-        if 'stitch_mix' in stage:
-            # True continuous-decode training: chunk_positions_stitch builds a
-            # byte-precise query chain where only the very first query's warmup
-            # is genuine unseen ground truth — every later query's warmup is
-            # EXACTLY the previous query's own response (see that function's
-            # docstring). Mixes multiple src_stride entries (partial-stitch-depth
-            # supervision) the same way weave_mix mixes pattern/window_chunks.
-            n_chunks   = stage['n_chunks']
-            chunk_len  = stage['chunk_len']
-            state_len  = hp.get('state_len', 8)
-            state_vocab_size = hp.get('state_vocab_size', 2)
-            warmup_len = hp.get('warmup_len', 8)
-            B          = stage.get('B', 8)
-            n_steps    = stage.get('n_steps', 60000)
-            stage_eval_every = stage.get('eval_every', 5000)
-            ls_max     = hp.get('ls_max', 0.0)
-            hops = stage.get('hops', -1)  # default -1 = unbounded; hops=0 is invalid
-
-            stitch_mix_cfg = stage['stitch_mix']  # list of {weight, src_stride}
-            trajectories = []
-            for scfg in stitch_mix_cfg:
-                src_stride = scfg['src_stride']
-                built = chunk_positions_stitch(chunk_len, n_chunks, state_len, warmup_len,
-                                               src_stride, state_vocab_size=state_vocab_size)
-                pos_content, pos_mask, tags, L = (built['pos_content'], built['pos_mask'],
-                                                  built['tags'], built['L'])
-                mask_np = chunk_mask_fb_traj(pos_mask, hops=hops)
-                mask_t  = torch.tensor(mask_np, dtype=torch.float32, device=device)
-                trajectories.append(dict(weight=scfg['weight'], src_stride=src_stride, n_chunks=n_chunks,
-                                         pos_content=pos_content, mask_np=mask_np, mask_t=mask_t,
-                                         tags=tags, L=L))
-            traj_weights = np.array([t['weight'] for t in trajectories], dtype=np.float64)
-            traj_weights = traj_weights / traj_weights.sum()
-
-            _log(f'\n[stage {stage_i}] stitch_mix='
-                 f'{[(t["src_stride"], round(w, 2)) for t, w in zip(trajectories, traj_weights)]}  '
-                 f'chunk_len={chunk_len} n_chunks={n_chunks} state={state_len} wl={warmup_len} '
-                 f'hops={hops}  B={B}  steps={n_steps}')
-
-            lr_min      = hp.get('lr_min', 0.0)
-            cosine_T0   = hp.get('cosine_T0', 20000)
-            cosine_Tmul = hp.get('cosine_T_mult', 1)
-            lr_schedule = hp.get('lr_schedule', 'constant')
-
-            def _lr(s):
-                if s <= warmup_steps:
-                    return lr_max * s / max(warmup_steps, 1)
-                if lr_schedule != 'cosine_restarts':
-                    return lr_max
-                t = s - warmup_steps
-                T_i = cosine_T0
-                while t >= T_i:
-                    t -= T_i
-                    T_i = int(T_i * cosine_Tmul)
-                return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * t / max(T_i, 1)))
-
-            stage_best_val = -1.0
-            _cached_batch = None
-            pbar = tqdm(range(1, n_steps + 1), desc=f'stage{stage_i}', dynamic_ncols=True, file=status_file)
-            for local_step in pbar:
-                global_step += 1
-                lr = _lr(local_step)
-                for pg in opt.param_groups: pg['lr'] = lr
-
-                model.train(); opt.zero_grad()
-
-                if _cached_batch is None or (local_step - 1) % repeat_batch == 0:
-                    traj = trajectories[rng.choice(len(trajectories), p=traj_weights)]
-                    t_pos_content, t_mask_t, t_tags = traj['pos_content'], traj['mask_t'], traj['tags']
-                    tok_np = make_batch_stitch(rng, B, n_chunks, chunk_len, state_len, state_vocab_size,
-                                               t_pos_content, t_tags, data_kind=data_kind,
-                                               data_target_bits=data_target_bits)
-                    tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
-                    _cached_batch = (traj, t_pos_content, t_mask_t, t_tags, tok_t)
-                else:
-                    traj, t_pos_content, t_mask_t, t_tags, tok_t = _cached_batch
-
-                if forward_granularity is not None:
-                    loss = _forward_segmented(model, tok_t, traj['mask_np'], t_pos_content,
-                                              device, ls_max, forward_granularity,
-                                              segment_checkpoint=segment_checkpoint)
-                else:
-                    logits = model(tok_t, t_mask_t)
-                    nlls = []
-                    for rb in t_pos_content['rec_blocks']:
-                        if not rb['is_clean']:
-                            continue
-                        lp  = F.log_softmax(logits[:, rb['c0'] - 1:rb['c1'] - 1], dim=-1)
-                        tgt = tok_t[:, rb['c0']:rb['c1']]
-                        nll_per = _positional_ls_nll(lp, tgt, ls_max)
-                        nlls.append(nll_per.mean())
-                    loss = torch.stack(nlls).mean()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-
-                loss_f = float(loss.detach())
-                pbar.set_postfix(loss=f'{loss_f:.3f}', lr=f'{lr:.1e}', refresh=False)
-                if local_step % log_every == 0:
-                    _jlog(dict(step=global_step, loss=round(loss_f, 5), lr=lr))
-                    print(str(pbar), file=log_file, flush=True)
-
-                if local_step % stage_eval_every == 0 or local_step == n_steps:
-                    model.eval()
-                    elapsed = time.time() - t_start
-                    h, m = divmod(int(elapsed), 3600); m, s = divmod(m, 60)
-                    _log(f'\n--- stage={stage_i} step={local_step}/{n_steps}'
-                         f'  g={global_step}  loss={loss_f:.4f}  {h:02d}:{m:02d}:{s:02d} ---')
-
-                    val_means = []
-                    for traj in trajectories:
-                        val_seqs = make_test_sequences(n_chunks * chunk_len)
-                        val_n_seqs = hp.get('val_n_seqs')
-                        if val_n_seqs is not None:
-                            val_seqs = dict(list(val_seqs.items())[:val_n_seqs])
-                        pcts = []
-                        for sname, seq_bytes in val_seqs.items():
-                            chunks_list = [seq_bytes[k * chunk_len:(k + 1) * chunk_len]
-                                          for k in range(n_chunks)]
-                            r = ar_decode_stitch(model, np.array(chunks_list), state_len,
-                                                    state_vocab_size, traj['mask_np'],
-                                                      traj['pos_content'], traj['tags'], device)
-                            pcts.append(r['match_pct'])
-                        m_ = sum(pcts) / len(pcts)
-                        val_means.append(m_)
-                        _log(f'  val/stitch/src_stride={traj["src_stride"]:<4} match={m_:.1f}%')
-                    vmean = sum(val_means) / len(val_means)
-                    _log(f'  val/stitch/MEAN               match={vmean:.1f}%')
 
                     torch.save(dict(model=model.state_dict(), hp=hp, step=global_step),
                               os.path.join(ckpt_dir, f'stage{stage_i}_last.pt'))
