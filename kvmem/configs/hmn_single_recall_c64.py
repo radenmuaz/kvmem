@@ -32,6 +32,15 @@ Early-stopped 2026-07-15: eval_mean hit 100.0% at step 70000, dipped to 95.83%
 `stage0_best.pt` is from this run's best eval). Killed at step ~100000 rather
 than running the full 160000 — the last 60000 steps were pure plateau, no
 further gain. `cosine_T0`/`n_steps` trimmed to 100000 below to match.
+
+Ported to the `weave_mix`+`dsl=` path (`dsl='E1 Q(0,1)'`) instead of
+`chain_steps=[(0,1)]` — verified byte-identical mask/positions/tags against
+the old `chunk_positions_hop` path before switching (only cosmetic diff:
+`chunk_positions_traj`'s rec_blocks carry an extra `op_idx` field). Purely a
+config-definition change — the existing `stage0_best.pt` checkpoint (used as
+the warm-start for `hmn_weave_c64`/`hmn_stitch_src1024`/`hmn_recall_queue`/
+`hmn_weave_mix` and others) is untouched, since positions/masks are
+byte-identical regardless of which code path built them.
 """
 
 hp = dict(
@@ -52,7 +61,7 @@ hp = dict(
     val_n_seqs=3,
 
     curriculum=[
-        dict(n_chunks=1, chunk_len=64, n_refine=0, B=6, n_steps=100000, eval_every=10000,
-             chain_steps=[(0, 1)]),
+        dict(n_chunks=1, chunk_len=64, B=6, n_steps=100000, eval_every=10000,
+             weave_mix=[dict(weight=1.0, dsl='E1 Q(0,1)')]),
     ],
 )

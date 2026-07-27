@@ -637,7 +637,8 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
 
 def traj_batch(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = ' '.join(f'Q({i},{i + window_chunks})' for i in range(n_chunks - window_chunks + 1))
-    return parse_traj_dsl(f'E{n_chunks} {spans}')
+    ops, _ = parse_traj_dsl(f'E{n_chunks} {spans}')
+    return ops
 
 
 def traj_stream(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
@@ -646,13 +647,15 @@ def traj_stream(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
         if i > 0:
             dsl_parts.append('E')
         dsl_parts.append(f'Q({i},{i + window_chunks})')
-    return parse_traj_dsl(' '.join(dsl_parts))
+    ops, _ = parse_traj_dsl(' '.join(dsl_parts))
+    return ops
 
 
 def traj_interleave_delayed(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
     q_str = ' '.join(f'Q({s},{e})' for s, e in reversed(spans))  # query last span first
-    return parse_traj_dsl(f'E{n_chunks} {q_str}')
+    ops, _ = parse_traj_dsl(f'E{n_chunks} {q_str}')
+    return ops
 
 
 def traj_suffix(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
@@ -667,7 +670,8 @@ def traj_suffix(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     of "how far from the end the warmup anchor sits" — smaller
     `window_chunks` = warmup closer to the end = less left to generate."""
     assert window_chunks >= 2, 'window_chunks must be >=2 so there is a non-trivial response to generate'
-    return parse_traj_dsl(f'E{n_chunks} Q({n_chunks - window_chunks},{n_chunks})')
+    ops, _ = parse_traj_dsl(f'E{n_chunks} Q({n_chunks - window_chunks},{n_chunks})')
+    return ops
 
 
 def traj_repeat_query(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
@@ -675,7 +679,8 @@ def traj_repeat_query(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
     q_str = ' '.join(f'Q({s},{e})' for s, e in spans)
     first_s, first_e = spans[0]
-    return parse_traj_dsl(f'E{n_chunks} {q_str} Q({first_s},{first_e})')
+    ops, _ = parse_traj_dsl(f'E{n_chunks} {q_str} Q({first_s},{first_e})')
+    return ops
 
 
 def traj_long_hop_recovery(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
@@ -689,15 +694,26 @@ def traj_long_hop_recovery(n_chunks: int, window_chunks: int = 2) -> list[tuple]
 #
 # Grammar: E (ingest next chunk, must be followed by S) | E<n> (n ingest+
 # compress pairs) | S (emit STATE, claims preceding unclaimed E or else a
-# bare relay hop) | S<n> (n bare S ops) | Q(s,e) (query span [s,e))
+# bare relay hop) | S<n> (n bare S ops) | Q(s,e) (query span [s,e)) |
+# R<n> (n refine rounds — GLOBAL, applies uniformly to every Q in the
+# string, not per-query; bare R means R1; at most one R token per string)
 #
 # Examples: batch "E4 Q(0,2) Q(1,3) Q(2,4)"; stream "E2 Q(0,2) E S Q(1,3) E S
-# Q(2,4)"; decay_curve(4 hops) "E2 Q(0,2) S4 Q(0,2)"
+# Q(2,4)"; decay_curve(4 hops) "E2 Q(0,2) S4 Q(0,2)"; one refine round after
+# every query "E4 Q(0,2) Q(1,3) Q(2,4) R1"
+#
+# Returns (ops, n_refine) — n_refine=0 if no R token appears. Every internal
+# caller below (traj_batch/stream/interleave_delayed/suffix/repeat_query/
+# decay_curve) never emits an R token, so they just discard the n_refine
+# part; only a config's own explicit `dsl=` string (see the weave_mix
+# dispatch in train()) can set n_refine>0 today.
 # ---------------------------------------------------------------------------
 
-def parse_traj_dsl(s: str) -> list[tuple]:
+def parse_traj_dsl(s: str) -> tuple[list[tuple], int]:
     ops: list[tuple] = []
     next_chunk_idx = 0
+    n_refine = 0
+    seen_r = False
     for tok in s.split():
         if tok.startswith('Q('):
             inner = tok[2:-1]
@@ -709,13 +725,17 @@ def parse_traj_dsl(s: str) -> list[tuple]:
                 ops.append(('E', next_chunk_idx))
                 ops.append(('S', None))
                 next_chunk_idx += 1
+        elif tok.startswith('R'):
+            assert not seen_r, f'at most one R token allowed per DSL string, got a second in {s!r}'
+            seen_r = True
+            n_refine = int(tok[1:]) if len(tok) > 1 else 1
         elif tok.startswith('S'):
             n = int(tok[1:]) if len(tok) > 1 else 1
             for _ in range(n):
                 ops.append(('S', None))
         else:
             raise ValueError(f'unrecognized trajectory DSL token: {tok!r}')
-    return ops
+    return ops, n_refine
 
 
 def traj_decay_curve(n_noop_hops: int, window_chunks: int = 2) -> list[tuple]:
@@ -728,7 +748,8 @@ def traj_decay_curve(n_noop_hops: int, window_chunks: int = 2) -> list[tuple]:
     near-0% purely from length extrapolation, not decay. Only trust results
     from a checkpoint actually trained on decay_curve-shaped trajectories.
     """
-    return parse_traj_dsl(f'E{window_chunks} Q(0,{window_chunks}) S{n_noop_hops} Q(0,{window_chunks})')
+    ops, _ = parse_traj_dsl(f'E{window_chunks} Q(0,{window_chunks}) S{n_noop_hops} Q(0,{window_chunks})')
+    return ops
 
 
 # =============================================================================
@@ -2355,20 +2376,30 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                          suffix=traj_suffix)
             hops = stage.get('hops', -1)  # default -1 = unbounded (routing-style); hops=0 is invalid
 
-            weave_mix_cfg = stage['weave_mix']  # list of {weight, pattern[, n_chunks, window_chunks]}
+            weave_mix_cfg = stage['weave_mix']  # list of {weight, pattern[, n_chunks, window_chunks]} OR {weight, dsl}
             trajectories = []
             for wcfg in weave_mix_cfg:
-                pname = wcfg['pattern']
-                assert pname in _WEAVE_TRAIN_PATTERNS, (
-                    f"weave_mix pattern {pname!r} is not a train-mix candidate — only "
-                    f"{list(_WEAVE_TRAIN_PATTERNS)} are safe to train on; repeat_query/"
-                    f"long_hop_recovery/decay_curve are deliberately test-only "
-                    f"generalization probes (see docs/HISTORY.md §4c)")
-                w_n_chunks = wcfg.get('n_chunks', n_chunks)
-                w_window_chunks = wcfg.get('window_chunks', window_chunks)
-                ops = _WEAVE_TRAIN_PATTERNS[pname](w_n_chunks, w_window_chunks)
+                if 'dsl' in wcfg:
+                    # Explicit DSL string — bypasses the named-pattern lookup entirely, e.g.
+                    # dsl='E4 Q(0,2) Q(1,3) Q(2,4)' (see parse_traj_dsl's grammar comment).
+                    # n_chunks is derived from the DSL itself (count of 'E' ops), not passed
+                    # separately — the string is already the single source of truth for shape.
+                    pname = wcfg['dsl']  # used only for logging/bookkeeping below
+                    ops, w_n_refine = parse_traj_dsl(wcfg['dsl'])
+                    w_n_chunks = sum(1 for op, _ in ops if op == 'E')
+                else:
+                    pname = wcfg['pattern']
+                    assert pname in _WEAVE_TRAIN_PATTERNS, (
+                        f"weave_mix pattern {pname!r} is not a train-mix candidate — only "
+                        f"{list(_WEAVE_TRAIN_PATTERNS)} are safe to train on; repeat_query/"
+                        f"long_hop_recovery/decay_curve are deliberately test-only "
+                        f"generalization probes (see docs/HISTORY.md §4c)")
+                    w_n_chunks = wcfg.get('n_chunks', n_chunks)
+                    w_window_chunks = wcfg.get('window_chunks', window_chunks)
+                    w_n_refine = wcfg.get('n_refine', 0)
+                    ops = _WEAVE_TRAIN_PATTERNS[pname](w_n_chunks, w_window_chunks)
                 built = chunk_positions_traj(chunk_len, state_len, warmup_len, ops,
-                                             n_refine=0, state_vocab_size=state_vocab_size)
+                                             n_refine=w_n_refine, state_vocab_size=state_vocab_size)
                 pos_content, pos_mask, tags, L = (built['pos_content'], built['pos_mask'],
                                                   built['tags'], built['L'])
                 mask_np = chunk_mask_fb_traj(pos_mask, hops=hops)

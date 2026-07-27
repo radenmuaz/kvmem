@@ -14,6 +14,11 @@ val eval_mean=100.0% at step 60000 (loss=0.0266), and held 100.0% at every
 subsequent eval (70000/80000/90000/100000) — no dips, converged cleanly by
 step 60000 with the remaining 40000 steps a pure plateau.
 
+Ported to the `weave_mix`+`dsl=` path (`dsl='E1 Q(0,1)'`) instead of
+`chain_steps=[(0,1)]` — verified byte-identical mask/positions/tags against
+the old `chunk_positions_hop` path before switching (only cosmetic diff:
+`chunk_positions_traj`'s rec_blocks carry an extra `op_idx` field).
+
 Run (never two jobs at once):
     python3 -m kvmem.hmn --config kvmem/configs/hmn_single_recall_c64_repeat4.py --device mps
 """
@@ -37,7 +42,7 @@ hp = dict(
     val_n_seqs=3,
 
     curriculum=[
-        dict(n_chunks=1, chunk_len=64, n_refine=0, B=6, n_steps=100000, eval_every=10000,
-             chain_steps=[(0, 1)]),
+        dict(n_chunks=1, chunk_len=64, B=6, n_steps=100000, eval_every=10000,
+             weave_mix=[dict(weight=1.0, dsl='E1 Q(0,1)')]),
     ],
 )

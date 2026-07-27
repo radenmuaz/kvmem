@@ -64,26 +64,32 @@ hp = dict(
     wrong_token_weight=0.0,
     val_n_seqs=3,
 
+    # Each entry is spelled out as an explicit DSL string (see parse_traj_dsl's
+    # grammar comment, kvmem/hmn.py) rather than pattern='suffix'+n_chunks+
+    # window_chunks — e.g. 'E4 Q(2,4)' reads directly as "ingest+compress 4
+    # chunks, then one query recalling chunks [2,4) — i.e. warmup anchors at
+    # chunk 2, response covers chunk 2's tail + chunk 3 through the true end."
+    # No n_chunks/window_chunks bookkeeping needed — the string IS the shape.
     curriculum=[
         dict(n_chunks=4, chunk_len=64, B=6, n_steps=10000, eval_every=2000,
              weave_mix=[
-                 dict(weight=1.0, pattern='suffix', n_chunks=2, window_chunks=2),
-                 dict(weight=1.0, pattern='suffix', n_chunks=4, window_chunks=2),
-                 dict(weight=1.0, pattern='suffix', n_chunks=4, window_chunks=4),
+                 dict(weight=1.0, dsl='E2 Q(0,2)'),   # n_chunks=2, window_chunks=2 (whole thing)
+                 dict(weight=1.0, dsl='E4 Q(2,4)'),   # n_chunks=4, window_chunks=2 (anchor at chunk 2)
+                 dict(weight=1.0, dsl='E4 Q(0,4)'),   # n_chunks=4, window_chunks=4 (whole thing)
              ]),
         dict(n_chunks=8, chunk_len=64, B=6, n_steps=15000, eval_every=3000,
              weave_mix=[
-                 dict(weight=1.0, pattern='suffix', n_chunks=2, window_chunks=2),
-                 dict(weight=1.0, pattern='suffix', n_chunks=4, window_chunks=4),
-                 dict(weight=1.0, pattern='suffix', n_chunks=8, window_chunks=4),
-                 dict(weight=1.0, pattern='suffix', n_chunks=8, window_chunks=8),
+                 dict(weight=1.0, dsl='E2 Q(0,2)'),
+                 dict(weight=1.0, dsl='E4 Q(0,4)'),
+                 dict(weight=1.0, dsl='E8 Q(4,8)'),   # n_chunks=8, window_chunks=4 (anchor at chunk 4)
+                 dict(weight=1.0, dsl='E8 Q(0,8)'),   # n_chunks=8, window_chunks=8 (whole thing)
              ]),
         dict(n_chunks=16, chunk_len=64, B=6, n_steps=15000, eval_every=3000,
              weave_mix=[
-                 dict(weight=1.0, pattern='suffix', n_chunks=4, window_chunks=4),
-                 dict(weight=1.0, pattern='suffix', n_chunks=8, window_chunks=8),
-                 dict(weight=1.0, pattern='suffix', n_chunks=16, window_chunks=8),
-                 dict(weight=1.0, pattern='suffix', n_chunks=16, window_chunks=16),
+                 dict(weight=1.0, dsl='E4 Q(0,4)'),
+                 dict(weight=1.0, dsl='E8 Q(0,8)'),
+                 dict(weight=1.0, dsl='E16 Q(8,16)'),  # n_chunks=16, window_chunks=8 (anchor at chunk 8)
+                 dict(weight=1.0, dsl='E16 Q(0,16)'),  # n_chunks=16, window_chunks=16 (whole thing)
              ]),
     ],
 )
