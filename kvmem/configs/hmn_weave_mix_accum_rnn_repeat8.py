@@ -19,6 +19,13 @@ tests on the simpler single-chunk task.
 
 Run (never two jobs at once):
     python3 -m kvmem.hmn --config kvmem/configs/hmn_weave_mix_accum_rnn_repeat8.py --device mps
+
+`repeat_batch` moved from a stage-wide hp flag to a per-trajectory
+`weave_mix` entry key (default 1/no-repeat if omitted) — each `pattern=`
+entry below now carries its own explicit `repeat_batch=8` so a future rerun
+of this exact config reproduces the tested behavior (this is the run
+behind the 53.7% best-checkpoint result cited in CLAUDE.md; dropping the
+per-entry key would silently turn this into the un-repeated baseline).
 """
 
 hp = dict(
@@ -32,7 +39,6 @@ hp = dict(
     rmsnorm=True,
     name='hmn_weave_mix_accum_rnn_repeat8', seed=50,
     _pretrained_ckpt='logs/hmn_single_recall_c64/checkpoints/stage0_best.pt',
-    repeat_batch=8,
 
     state_len=8, state_vocab_size=2,
     warmup_len=8,
@@ -44,9 +50,9 @@ hp = dict(
         dict(n_chunks=4, chunk_len=16, window_chunks=2, B=6, n_steps=160000, eval_every=10000,
              hops=1,
              weave_mix=[
-                 dict(weight=1.0, pattern='batch'),
-                 dict(weight=1.0, pattern='stream'),
-                 dict(weight=1.0, pattern='interleave_delayed'),
+                 dict(weight=1.0, pattern='batch', repeat_batch=8),
+                 dict(weight=1.0, pattern='stream', repeat_batch=8),
+                 dict(weight=1.0, pattern='interleave_delayed', repeat_batch=8),
              ]),
     ],
 )

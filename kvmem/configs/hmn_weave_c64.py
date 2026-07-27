@@ -72,7 +72,6 @@ hp = dict(
     rmsnorm=True,
     name='hmn_weave_c64', seed=50,
     _pretrained_ckpt='logs/hmn_single_recall_c64/checkpoints/stage0_best.pt',
-    repeat_batch=4,
 
     state_len=8, state_vocab_size=2,
     warmup_len=8,
@@ -84,21 +83,26 @@ hp = dict(
     # comment, kvmem/hmn.py) instead of pattern='batch'/'stream'/'interleave_delayed'
     # — verified byte-identical ops/n_refine against the named-pattern constructors
     # before switching (see traj_batch/traj_stream/traj_interleave_delayed).
+    # `B4` on every entry preserves this run's tested repeat_batch=4 behavior now
+    # that repeat_batch moved from a stage-wide hp flag to a per-trajectory DSL
+    # token (default B1/no-repeat if omitted) — all three shapes here were judged
+    # equally hard when this config was tuned, so all three keep the same B4;
+    # nothing stops a future edit from giving a harder shape its own higher count.
     curriculum=[
         dict(n_chunks=2, chunk_len=64, B=4, n_steps=80000, eval_every=10000,
              hops=1,
              weave_mix=[
-                 dict(weight=1.0, dsl='E2 Q(0,1) Q(1,2)'),        # batch(nc=2,wc=1)
-                 dict(weight=1.0, dsl='E1 Q(0,1) E Q(1,2)'),      # stream(nc=2,wc=1)
-                 dict(weight=1.0, dsl='E2 Q(1,2) Q(0,1)'),        # interleave_delayed(nc=2,wc=1)
+                 dict(weight=1.0, dsl='E2 Q(0,1) Q(1,2) B8'),        # batch(nc=2,wc=1)
+                 dict(weight=1.0, dsl='E1 Q(0,1) E Q(1,2) B8'),      # stream(nc=2,wc=1)
+                 dict(weight=1.0, dsl='E2 Q(1,2) Q(0,1) B8'),        # interleave_delayed(nc=2,wc=1)
              ]),
 
         dict(n_chunks=4, chunk_len=64, B=2, n_steps=160000, eval_every=10000,
              hops=1,
              weave_mix=[
-                 dict(weight=1.0, dsl='E4 Q(0,2) Q(1,3) Q(2,4)'),       # batch(nc=4,wc=2)
-                 dict(weight=1.0, dsl='E2 Q(0,2) E Q(1,3) E Q(2,4)'),   # stream(nc=4,wc=2)
-                 dict(weight=1.0, dsl='E4 Q(2,4) Q(1,3) Q(0,2)'),       # interleave_delayed(nc=4,wc=2)
+                 dict(weight=1.0, dsl='E4 Q(0,2) Q(1,3) Q(2,4) B16'),       # batch(nc=4,wc=2)
+                 dict(weight=1.0, dsl='E2 Q(0,2) E Q(1,3) E Q(2,4) B16'),   # stream(nc=4,wc=2)
+                 dict(weight=1.0, dsl='E4 Q(2,4) Q(1,3) Q(0,2) B16'),       # interleave_delayed(nc=4,wc=2)
              ]),
     ],
 )

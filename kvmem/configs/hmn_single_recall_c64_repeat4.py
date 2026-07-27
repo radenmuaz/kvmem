@@ -14,10 +14,14 @@ val eval_mean=100.0% at step 60000 (loss=0.0266), and held 100.0% at every
 subsequent eval (70000/80000/90000/100000) — no dips, converged cleanly by
 step 60000 with the remaining 40000 steps a pure plateau.
 
-Ported to the `weave_mix`+`dsl=` path (`dsl='E1 Q(0,1)'`) instead of
+Ported to the `weave_mix`+`dsl=` path (`dsl='E1 Q(0,1) B4'`) instead of
 `chain_steps=[(0,1)]` — verified byte-identical mask/positions/tags against
 the old `chunk_positions_hop` path before switching (only cosmetic diff:
-`chunk_positions_traj`'s rec_blocks carry an extra `op_idx` field).
+`chunk_positions_traj`'s rec_blocks carry an extra `op_idx` field). The `B4`
+token is what actually reproduces this config's own name/purpose now that
+`repeat_batch` moved from a stage-wide hp flag to a per-trajectory DSL
+token (default B1/no-repeat if omitted) — dropping it would silently turn
+this into a duplicate of the baseline instead of the repeat4 ablation.
 
 Run (never two jobs at once):
     python3 -m kvmem.hmn --config kvmem/configs/hmn_single_recall_c64_repeat4.py --device mps
@@ -33,7 +37,6 @@ hp = dict(
     rope=True, yarn=True, null_kv=True,
     rmsnorm=True,
     name='hmn_single_recall_c64_repeat4', seed=48,
-    repeat_batch=4,
 
     state_len=8, state_vocab_size=2,
     warmup_len=8,
@@ -43,6 +46,6 @@ hp = dict(
 
     curriculum=[
         dict(n_chunks=1, chunk_len=64, B=6, n_steps=100000, eval_every=10000,
-             weave_mix=[dict(weight=1.0, dsl='E1 Q(0,1)')]),
+             weave_mix=[dict(weight=1.0, dsl='E1 Q(0,1) B4')]),
     ],
 )

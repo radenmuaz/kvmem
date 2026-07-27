@@ -637,7 +637,7 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
 
 def traj_batch(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = ' '.join(f'Q({i},{i + window_chunks})' for i in range(n_chunks - window_chunks + 1))
-    ops, _ = parse_traj_dsl(f'E{n_chunks} {spans}')
+    ops, _, _ = parse_traj_dsl(f'E{n_chunks} {spans}')
     return ops
 
 
@@ -647,14 +647,14 @@ def traj_stream(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
         if i > 0:
             dsl_parts.append('E')
         dsl_parts.append(f'Q({i},{i + window_chunks})')
-    ops, _ = parse_traj_dsl(' '.join(dsl_parts))
+    ops, _, _ = parse_traj_dsl(' '.join(dsl_parts))
     return ops
 
 
 def traj_interleave_delayed(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
     q_str = ' '.join(f'Q({s},{e})' for s, e in reversed(spans))  # query last span first
-    ops, _ = parse_traj_dsl(f'E{n_chunks} {q_str}')
+    ops, _, _ = parse_traj_dsl(f'E{n_chunks} {q_str}')
     return ops
 
 
@@ -670,7 +670,7 @@ def traj_suffix(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     of "how far from the end the warmup anchor sits" — smaller
     `window_chunks` = warmup closer to the end = less left to generate."""
     assert window_chunks >= 2, 'window_chunks must be >=2 so there is a non-trivial response to generate'
-    ops, _ = parse_traj_dsl(f'E{n_chunks} Q({n_chunks - window_chunks},{n_chunks})')
+    ops, _, _ = parse_traj_dsl(f'E{n_chunks} Q({n_chunks - window_chunks},{n_chunks})')
     return ops
 
 
@@ -679,7 +679,7 @@ def traj_repeat_query(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
     q_str = ' '.join(f'Q({s},{e})' for s, e in spans)
     first_s, first_e = spans[0]
-    ops, _ = parse_traj_dsl(f'E{n_chunks} {q_str} Q({first_s},{first_e})')
+    ops, _, _ = parse_traj_dsl(f'E{n_chunks} {q_str} Q({first_s},{first_e})')
     return ops
 
 
@@ -696,24 +696,33 @@ def traj_long_hop_recovery(n_chunks: int, window_chunks: int = 2) -> list[tuple]
 # compress pairs) | S (emit STATE, claims preceding unclaimed E or else a
 # bare relay hop) | S<n> (n bare S ops) | Q(s,e) (query span [s,e)) |
 # R<n> (n refine rounds — GLOBAL, applies uniformly to every Q in the
-# string, not per-query; bare R means R1; at most one R token per string)
+# string, not per-query; bare R means R1; at most one R token per string) |
+# B<n> (repeat_batch for THIS trajectory only — take n gradient steps on the
+# same sampled batch before resampling; bare B means B1; at most one B token
+# per string; default is 1 if no B token appears — not all trajectory shapes
+# are equally easy, so a harder shape in a weave_mix can ask for more
+# repeated steps per batch than an easier one mixed alongside it)
 #
 # Examples: batch "E4 Q(0,2) Q(1,3) Q(2,4)"; stream "E2 Q(0,2) E S Q(1,3) E S
 # Q(2,4)"; decay_curve(4 hops) "E2 Q(0,2) S4 Q(0,2)"; one refine round after
-# every query "E4 Q(0,2) Q(1,3) Q(2,4) R1"
+# every query "E4 Q(0,2) Q(1,3) Q(2,4) R1"; harder shape gets more repeated
+# steps per batch "E8 Q(0,8) B4"
 #
-# Returns (ops, n_refine) — n_refine=0 if no R token appears. Every internal
-# caller below (traj_batch/stream/interleave_delayed/suffix/repeat_query/
-# decay_curve) never emits an R token, so they just discard the n_refine
-# part; only a config's own explicit `dsl=` string (see the weave_mix
-# dispatch in train()) can set n_refine>0 today.
+# Returns (ops, n_refine, repeat_batch) — n_refine=0/repeat_batch=1 if no
+# R/B token appears. Every internal caller below (traj_batch/stream/
+# interleave_delayed/suffix/repeat_query/decay_curve) never emits an R or B
+# token, so they just discard both extra fields; only a config's own
+# explicit `dsl=` string (see the weave_mix dispatch in train()) can set
+# n_refine>0 / repeat_batch>1 today.
 # ---------------------------------------------------------------------------
 
-def parse_traj_dsl(s: str) -> tuple[list[tuple], int]:
+def parse_traj_dsl(s: str) -> tuple[list[tuple], int, int]:
     ops: list[tuple] = []
     next_chunk_idx = 0
     n_refine = 0
+    repeat_batch = 1
     seen_r = False
+    seen_b = False
     for tok in s.split():
         if tok.startswith('Q('):
             inner = tok[2:-1]
@@ -729,13 +738,17 @@ def parse_traj_dsl(s: str) -> tuple[list[tuple], int]:
             assert not seen_r, f'at most one R token allowed per DSL string, got a second in {s!r}'
             seen_r = True
             n_refine = int(tok[1:]) if len(tok) > 1 else 1
+        elif tok.startswith('B'):
+            assert not seen_b, f'at most one B token allowed per DSL string, got a second in {s!r}'
+            seen_b = True
+            repeat_batch = int(tok[1:]) if len(tok) > 1 else 1
         elif tok.startswith('S'):
             n = int(tok[1:]) if len(tok) > 1 else 1
             for _ in range(n):
                 ops.append(('S', None))
         else:
             raise ValueError(f'unrecognized trajectory DSL token: {tok!r}')
-    return ops, n_refine
+    return ops, n_refine, repeat_batch
 
 
 def traj_decay_curve(n_noop_hops: int, window_chunks: int = 2) -> list[tuple]:
@@ -748,7 +761,7 @@ def traj_decay_curve(n_noop_hops: int, window_chunks: int = 2) -> list[tuple]:
     near-0% purely from length extrapolation, not decay. Only trust results
     from a checkpoint actually trained on decay_curve-shaped trajectories.
     """
-    ops, _ = parse_traj_dsl(f'E{window_chunks} Q(0,{window_chunks}) S{n_noop_hops} Q(0,{window_chunks})')
+    ops, _, _ = parse_traj_dsl(f'E{window_chunks} Q(0,{window_chunks}) S{n_noop_hops} Q(0,{window_chunks})')
     return ops
 
 
@@ -2385,7 +2398,7 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     # n_chunks is derived from the DSL itself (count of 'E' ops), not passed
                     # separately — the string is already the single source of truth for shape.
                     pname = wcfg['dsl']  # used only for logging/bookkeeping below
-                    ops, w_n_refine = parse_traj_dsl(wcfg['dsl'])
+                    ops, w_n_refine, w_repeat_batch = parse_traj_dsl(wcfg['dsl'])
                     w_n_chunks = sum(1 for op, _ in ops if op == 'E')
                 else:
                     pname = wcfg['pattern']
@@ -2397,6 +2410,7 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     w_n_chunks = wcfg.get('n_chunks', n_chunks)
                     w_window_chunks = wcfg.get('window_chunks', window_chunks)
                     w_n_refine = wcfg.get('n_refine', 0)
+                    w_repeat_batch = wcfg.get('repeat_batch', 1)
                     ops = _WEAVE_TRAIN_PATTERNS[pname](w_n_chunks, w_window_chunks)
                 built = chunk_positions_traj(chunk_len, state_len, warmup_len, ops,
                                              n_refine=w_n_refine, state_vocab_size=state_vocab_size)
@@ -2406,12 +2420,13 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 mask_t  = torch.tensor(mask_np, dtype=torch.float32, device=device)
                 trajectories.append(dict(weight=wcfg['weight'], pattern=pname, n_chunks=w_n_chunks,
                                          pos_content=pos_content, mask_np=mask_np, mask_t=mask_t,
-                                         tags=tags, L=L))
+                                         tags=tags, L=L, repeat_batch=w_repeat_batch))
             traj_weights = np.array([t['weight'] for t in trajectories], dtype=np.float64)
             traj_weights = traj_weights / traj_weights.sum()
 
-            _log(f'\n[stage {stage_i}] weave_mix='
-                 f'{[(t["pattern"], t["n_chunks"], round(w, 2)) for t, w in zip(trajectories, traj_weights)]}  '
+            _weave_mix_summary = [(t['pattern'], t['n_chunks'], round(w, 2), f"B{t['repeat_batch']}")
+                                  for t, w in zip(trajectories, traj_weights)]
+            _log(f'\n[stage {stage_i}] weave_mix={_weave_mix_summary}  '
                  f'chunk_len={chunk_len} state={state_len} wl={warmup_len} '
                  f'hops={hops}  B={B}  steps={n_steps}')
 
@@ -2433,7 +2448,8 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * t / max(T_i, 1)))
 
             stage_best_val = -1.0
-            _cached_batch = None  # (traj, tok_np, tok_t) — reused for `repeat_batch` consecutive steps
+            _cached_batch = None  # (traj, pos_content, mask_t, tags, tok_t)
+            _cached_repeat_left = 0  # steps remaining on the cached batch — per-trajectory, see traj['repeat_batch']
             pbar = tqdm(range(1, n_steps + 1), desc=f'stage{stage_i}', dynamic_ncols=True, file=status_file)
             for local_step in pbar:
                 global_step += 1
@@ -2442,7 +2458,7 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
                 model.train(); opt.zero_grad()
 
-                if _cached_batch is None or (local_step - 1) % repeat_batch == 0:
+                if _cached_batch is None or _cached_repeat_left <= 0:
                     traj = trajectories[rng.choice(len(trajectories), p=traj_weights)]
                     t_pos_content, t_mask_t, t_tags = traj['pos_content'], traj['mask_t'], traj['tags']
                     tok_np = make_batch_tagged(rng, B, traj['n_chunks'], chunk_len, state_len, state_vocab_size,
@@ -2450,8 +2466,10 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                                data_target_bits=data_target_bits)
                     tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
                     _cached_batch = (traj, t_pos_content, t_mask_t, t_tags, tok_t)
+                    _cached_repeat_left = traj['repeat_batch']
                 else:
                     traj, t_pos_content, t_mask_t, t_tags, tok_t = _cached_batch
+                _cached_repeat_left -= 1
 
                 if forward_granularity is not None:
                     loss = _forward_segmented(model, tok_t, traj['mask_np'], t_pos_content,
