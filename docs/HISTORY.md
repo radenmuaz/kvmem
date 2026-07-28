@@ -776,3 +776,302 @@ directly to this project's own STATE-compression framing: the bet is that
 gradient descent discovers something closer to CTW-style order-blending or
 LSH-style similarity-sharing *automatically*, across arbitrary content types,
 rather than requiring a human to pick the right classical scheme per case.
+
+## 12. `hmn_adaptive_trainer.py` — adaptive weave_mix reweighting, and a discovered positional-shortcut bug
+
+**Motivation**: `hmn_weave_c64` mixes `batch`/`stream`/`interleave_delayed` at a
+fixed uniform weight/repeat_batch. `stream` reached 42-49% match while `batch`/
+`interleave_delayed` sat at 8-20% across multiple runs — a fixed uniform mix has
+no way to notice that split and lean into it. `kvmem/hmn_adaptive_trainer.py`
+(cloned from the 2026-07-27 `hmn_v3_backup.py` snapshot) adds exactly that: the
+`weave_mix` branch only (all other branches byte-identical to `hmn.py`) tracks
+each trajectory's own difficulty (`ema_loss`, a per-trajectory EMA of train loss,
+or `last_match`, the raw eval-time match%) and recomputes each trajectory's
+sampling weight at every eval step via `_adapt_reweight`/`_temp_softmax_rescale`
+— softmax over difficulty normalized to the mix's own mean, at a configurable
+temperature (`adapt_temp`, lower = more aggressive). `repeat_batch` adaptation
+was deliberately disabled (kept as one feedback signal at a time — weight only
+— rather than two coupled ones; the scaling line is commented, not deleted).
+The branch also uses a fixed-LR-after-linear-warmup schedule instead of cosine
+decay, since a decaying LR fights a training signal that keeps shifting as
+reweighting moves effort around.
+
+**First run** (`adapt_signal='train_loss'`, `adapt_temp=1.0` implicit default):
+stage0 final MEAN=25.0% (best 25.5%) vs. the non-adaptive baseline's 24.2%
+(best 25.1%) — essentially a wash on the aggregate, but a real redistribution:
+`interleave_delayed` improved +5.6pp (15.2%->20.8%) at the cost of `stream`
+dropping -2.4pp (49.1%->46.7%), matching the mechanism's design intent. Caveat:
+this comparison also differs in LR schedule (baseline cosine-decays by step
+80000, adaptive holds flat), so the redistribution can't be attributed to
+reweighting alone. **`batch` never improved in either run** (8.3% vs 7.4%,
+both near-random) despite `_adapt_reweight` giving it the *highest* weight of
+the three at several intermediate evals — sampling more of it didn't help,
+the first sign something structural (not just "needs more samples") was wrong.
+
+**Aggressiveness knob**: at T=1.0 (softmax temperature), weights barely moved
+off ~1/3 each for the loss spreads actually observed (e.g. `[3.68,2.92,4.59]`
+-> weights `[0.32,0.27,0.41]`). Added `adapt_temp` (lower = more aggressive,
+T->0 approaches one-hot on the single hardest trajectory) after an earlier,
+since-replaced `adapt_power` exponent design — replaced because the user asked
+for "a softmax temperature-like constant" specifically. At T=0.2, the same
+spread reallocates to `[0.22,0.09,0.69]`.
+
+**T=0.2 run revealed a real oscillation/thrashing failure mode**, live: at
+step 50000, `interleave_delayed` had been pushed to weight=0.96 (from a prior
+adaptation) yet scored 0.0% match at that eval, while the *starved* `batch`
+(weight=0.02) scored 42.0%. The mechanism then swung hard the other way —
+by step 56997, `batch`'s own EMA loss had risen to 8.23 (worst of the three,
+from lack of practice) and its weight climbed to 0.93, echoing the same
+instability. This is exactly the "no anti-oscillation memory" gap flagged
+before this run: weight is recomputed fresh from the latest snapshot every
+eval with no momentum across reweighting *events* themselves, so an
+overcorrection at one eval can set up an overcorrection in the opposite
+direction at the next.
+
+**The real culprit, found via `kvmem/probe_positional_shortcut.py`**: `traj1`
+(`batch`, `E2 Q(0,1) Q(1,2)`) and `traj3` (`interleave_delayed`,
+`E2 Q(1,2) Q(0,1)`) share a byte-identical `E2` encode prefix (same two STATE
+registers, same positions, same mask) and diverge only in query order. Probed
+directly: encode two independent random 64-byte chunks as usual, then feed
+query slot 1 (which normally recalls chunk index 0 — the STATE built
+*first*, i.e. farther in absolute position from the query) chunk 1's own real
+warmup bytes instead of chunk 0's. Result (n=8 trials, `hmn_weave_c64_adaptive`
+stage0_best.pt): swapped-warmup generation matched chunk 0's true continuation
+at 91.1% and chunk 1's true continuation at only 0.4% — **the model completely
+ignored the warmup content it was given and defaulted to whatever that query
+slot normally recalls.** This is pure position-addressed retrieval, not
+content-addressed — confirmed, not just hypothesized. It directly explains why
+`traj1`/`traj3` share a genuine training conflict: the SAME query-slot position
+is pulled toward "attend to STATE0" in `batch` and "attend to STATE1" in
+`interleave_delayed`, and since the model isn't reading warmup content at all,
+there's no content-based way to reconcile the two — mixing them (which
+`weave_mix` already does) doesn't fix this, since the shortcut isn't "always
+guess a fixed order," it's "ignore content entirely and use position," which
+mixing the two orders doesn't punish enough to unlearn.
+
+**Why RoPE is implicated, and why ALiBi/T5-relative-bias would NOT fix this**:
+RoPE (`apply_rope`, `kvmem/hmn.py`) gives every attention pair a smooth
+distance-based prior via absolute position (`torch.arange(offset, offset+L)`
+fed into the rotation, uniformly for every token including STATE/tag/
+structural positions, no different treatment for the one legitimate
+cross-block channel — the query's attention into its own STATE). ALiBi (Press
+et al. 2021) and T5's relative-position-bucket bias both drop the sin/cos
+rotation machinery but are STILL monotonic nearer-is-preferred distance
+decay — swapping RoPE for either would likely reproduce the same shortcut,
+since the shortcut isn't about rotation specifically, it's about *any*
+distance signal existing on that attention hop at all. NoPE (no positional
+encoding, Haviv et al. 2022; Kazemnejad et al. 2023 NeurIPS found it actually
+generalizes to longer sequences *better* than RoPE/ALiBi) is the class of fix
+that would actually remove the shortcut, if scoped to just the STATE-
+addressing attention (give STATE/structural positions a fixed/canonical
+position id so their distance from any later query is constant regardless of
+trajectory-specific query ordering, while leaving normal RoPE in place for
+in-block sequential byte generation, which genuinely needs relative order).
+CoPE (Contextual Position Encoding, Meta 2024 — position counters gated by
+content rather than raw index) is the more principled long-term answer but a
+larger new mechanism to build, not a drop-in swap. **Not yet implemented** —
+scoped as the next step, pending a decision to spend a from-scratch (or
+partially-warm-startable, TBD) training run to test it, since it changes a
+mechanism every existing checkpoint was trained under.
+
+**Randomizing query order was considered and rejected as insufficient**,
+given the probe result: `weave_mix` already mixes `batch` and
+`interleave_delayed` (i.e., across the training distribution, "query slot 1"
+already recalls chunk index 0 half the time and index 1 the other half) —
+this is already a form of order randomization at the trajectory-mix level,
+and it demonstrably has NOT fixed the shortcut (the probe was run against a
+checkpoint trained under exactly this mix). The shortcut survives random
+order-mixing because it isn't a memorized fixed correlation between position
+and chunk-index, it's a complete absence of content-based addressing — a
+strictly stronger problem that only removing the distance signal itself (not
+just decorrelating it from one fixed pattern) can fix.
+
+## 13. Three positional-shortcut fixes attempted — one abandoned mid-design, one shipped a real bug and got fixed, one failed outright
+
+Direct continuation of §12's diagnosis. Three separate mechanisms were built
+to remove the query-slot positional shortcut; this section is the record of
+what actually happened to each, in the order they were tried.
+
+### 13a. Dual-clock RoPE (`dual_rope`) — abandoned before completing a full run
+
+First attempt: `apply_rope_dual`/`_dual_positions` (`kvmem/hmn.py`) — two
+separate position clocks, `pos_state` (advances only at STATE-emission
+events, frozen everywhere else — so any query following the same encoding
+pass sees an identical macro-distance to every STATE regardless of query
+order) and `pos_local` (resets to 0 at the start of every encode/query
+block, preserving genuine local byte-order). **Caught a real bug before
+trusting it**: the first draft also advanced `pos_state` on a query's OWN
+recall-STATE row (built into every query for potential relay-chain use,
+even when no relay chain is actually in play), silently recreating the same
+query-order-dependent value the whole mechanism was built to remove — found
+via direct numerical inspection (`batch`'s two queries showed macro values
+2 and 3; should have been identical), not by training and observing failure.
+Fixed by excluding a query's own STATE row from `state_starts` entirely
+(only `enc_blocks`' STATE counts) — re-verified afterward: both queries in
+both `batch`/`interleave_delayed` then showed identical distance-to-
+STATE0/STATE1 regardless of order.
+
+**Abandoned anyway**, before any training run, once a further design
+discussion surfaced the STATE register's own cyclic token IDs
+(`_cyclic_state_ids`: with the default `state_vocab_size=2`, only 2 distinct
+IDs cycle through all `state_len=8` slots) as a second, independent source
+of ambiguity the reset-heavy two-clock design would need to keep getting
+right on top of the query-order fix — judged too much surface area for a
+mechanism that had already produced one bug. Superseded by 13b before a
+single training run was launched under it.
+
+### 13b. `rope_state_scale` — shipped with a real bug, caught by direct log comparison, then fixed
+
+Single-clock design (`_scaled_state_positions`, `kvmem/hmn.py`): every
+non-STATE token keeps its ordinary real position (identical to plain RoPE),
+while STATE-region tokens' real index gets divided by `state_scale` (e.g.
+1e6) — chosen specifically to avoid 13a's reset-based bug class entirely
+(no per-block-type bookkeeping to get wrong).
+
+**First version had a real bug, found by comparing against the original
+`hmn_single_recall_c64` baseline's own logs at matched step counts** — not
+by inspecting the position math in isolation (which looked correct: cross-
+query distance did collapse to numerically negligible, verified offline
+before trusting). The bug was that dividing the ENTIRE real index by
+`state_scale` also crushed the WITHIN-region spacing: real STATE0 slot
+positions 66-73 (native spacing 7) collapsed to a spacing of ~7e-6 after
+scaling — six orders of magnitude smaller, on top of `state_vocab_size=2`'s
+own content ambiguity, destroying BOTH channels a model needs to
+disambiguate individual STATE slots. This wasn't caught by the position-math
+verification alone; it only showed up as `hmn_single_recall_c64_scaledrope`
+training far worse than the baseline at matched steps (loss stuck ~2.9 vs.
+baseline's 0.03, val stuck at best=3.0% vs. baseline's 100%) — a
+single-chunk task with no cross-query ambiguity to fix at all, so the
+failure couldn't be explained by "the shortcut is still there," only by
+something breaking ordinary recall outright.
+
+**Fixed**: `pos[i] = (i - s0) + s0 / state_scale` for a STATE region
+starting at `s0` — within-region spacing stays native/unscaled (slot k's
+position is still exactly `k` more than slot k-1's), only the region's
+overall baseline (`s0`, where it sits in the whole sequence) gets
+compressed. Re-verified both properties simultaneously before trusting:
+within-STATE0 slot spacing came back to exactly `7.0` (matching the real
+7-position range), and cross-query invariance was still intact (`batch`'s
+and `interleave_delayed`'s same query slot see identical distance-to-
+STATE0/STATE1 to 6 decimal places, unaffected by the fix).
+
+**Result after the fix, `hmn_single_recall_c64_scaledrope` (rerun from
+scratch)**: tracked the ORIGINAL baseline's own convergence curve almost
+exactly through the first half of training (loss=1.560 at step 20000 vs.
+baseline's 1.5525 — essentially identical), then decelerated somewhat
+relative to baseline in the second half (loss=0.630 at step 80000 vs.
+baseline's ~0.01-0.02 by that point) but kept climbing to a final
+best-val=42.3% — far short of baseline's 100%, but two orders of magnitude
+better than the broken first version's 3.0%, and with no sign of being
+stuck (still improving when the stage ended). `hmn_weave_c64_scaledrope`
+(the actual `batch`/`interleave_delayed` test) is warm-started from this
+checkpoint and running as of this writing — see the live section below for
+current numbers, not yet resolved.
+
+### 13c. `relpos` (`kvmem/hmn_relpos.py`) — redesigned mid-flight, then failed outright
+
+Separate, independent mechanism: no RoPE at all, replaced with a learned
+bias baked directly into the SDPA `attn_mask` at exactly the "d steps back"
+relative positions (`relpos_k` distances, default 2) — motivated by the
+same probe result but attacking it from the opposite direction (remove
+essentially all distance signal except a small fixed local window, rather
+than scoping WHERE the signal applies as in 13a/13b).
+
+**First version** (originally named `relpos_shaw`, since it was literally
+Shaw et al. 2018-style relative position embeddings): a single learned
+constant per `(head, distance)` — same bias value added regardless of what
+token content was actually involved. Verified mechanically correct (a
+targeted test with the bias cranked to an extreme value showed attention
+collapsing ~100% onto the intended "d steps back" column).
+
+**Redesigned to a query-side content-dependent gate** after discussion of
+whether input-dependence would help: `Linear(d, relpos_k*n_heads)` applied
+to the QUERY's own current hidden state (not the key/attended-to token, and
+not a combined query-key dot product) — chosen specifically for KV-cache
+friendliness, since the query's own hidden state is already being freshly
+computed every decode step regardless of caching, unlike a key-side or
+combined version which would need an entirely new cached tensor threaded
+through `past_kv`/`return_kv` alongside K/V. This required the attention
+mask to gain a genuine per-example batch dimension (`(B,H,L,L_kv)` instead
+of the shared `(1,1,L,L_kv)` broadcast every other mechanism in this
+codebase uses), since content-dependent bias varies per training example
+where the old constant/permission mask didn't. Verified before trusting:
+batched forward ran cleanly and the computed gate values differed
+across different examples in the same batch (confirming genuine
+content-dependence, not an accidentally-shared constant). Renamed
+`relpos_shaw` -> `relpos_enabled` at this point, since the mechanism was no
+longer Shaw's design.
+
+**Result: failed outright.** `hmn_single_recall_c64_relpos` (single chunk,
+no cross-query ambiguity at all — the same trivial task 13b's base
+checkpoint reached 100% on, and the broken 13b bug still reached loss~2.9)
+finished its full 100000-step run at only **best=2.4%**, comparable to (very
+slightly worse than) 13b's diagnosed-broken 3.0% — loss never dropped below
+~3.5-3.7 for the entire run. Unlike 13b's bug, no code defect has been
+found in `relpos`'s implementation to explain this — the mechanism was
+verified mechanically correct at both the fixed-constant and
+content-dependent-gate stages. The most likely reading, not yet
+investigated further: restricting position information to a k=2-token
+local window may simply be insufficient signal for THIS task's genuinely
+local-order-dependent needs (byte-by-byte generation coherence), as
+distinct from the STATE-addressing shortcut it was built to remove — i.e.
+the mechanism may have successfully killed the shortcut while also being
+too weak to support ordinary recall, the same FAILURE MODE as 13b's first
+buggy version (breaks basic recall) but via a genuinely different cause
+(insufficient local signal vs. corrupted slot disambiguation).
+
+**Triggered a pre-authorized queue-reordering rule**: given `relpos`'s
+stage0 finished with best-val under a ~10% threshold (matching the
+"comparable to 13b's diagnosed-failure level" criterion), the training
+queue was reordered live — the `relpos` chain (including the
+already-auto-started `hmn_weave_c64_relpos`) was killed before wasting
+compute warm-starting from a broken base, and the fixed 13b `scaledrope`
+queue was promoted to run immediately instead of waiting its turn. `relpos`
+is not currently queued to resume; revisiting it (larger `relpos_k`? a
+key-side or combined gate despite the KV-cache cost? diagnosing why local-
+window-only position broke basic recall?) is unstarted follow-up work, not
+abandoned by a deliberate decision the way 13a was.
+
+### Current state (live, as of this writing)
+
+`hmn_weave_c64_scaledrope` (13b's fix) running, stage0 (n_chunks=2,
+80000 steps), warm-started from the 42.3%-best-val base checkpoint:
+
+| step | batch | stream | interleave_delayed | MEAN | loss |
+|---|---|---|---|---|---|
+| 10000 | 3.0% | 9.2% | 2.4% | 4.9% | 4.75 |
+| 20000 | 6.0% | 8.9% | 0.9% | 5.3% | 4.29 |
+| 30000 | 6.8% | 11.6% | 0.6% | 6.3% | 3.88 |
+| 40000 | 6.2% | 13.1% | 1.2% | 6.8% | 3.51 |
+
+Not yet resolved — `stream` climbing slowly as expected, `batch` roughly
+flat, `interleave_delayed` (the shape most directly implicated by the
+shared-`E2`-prefix conflict) still barely off its floor. Historical
+ceiling for `batch`/`interleave_delayed` under every prior mechanism was
+8-20%; `stream` historically reached 42-49% by the end of a full run. Stage0
+has 40000 steps left, then stage1 (n_chunks=4, 160000 steps) is the harder,
+more definitive test. This section should be updated once stage0/stage1
+finish with the actual resolution, not left as a live snapshot.
+
+**Re-ran `kvmem/probe_positional_shortcut.py` against this in-progress
+checkpoint** (`stage0_last.pt`, ~step 40000/80000, not converged) — first
+had to fix two real bugs the script itself had: it never passed any
+position argument to `model(...)` at all (would have silently tested the
+model under plain sequential positions rather than the `rope_state_scale`
+scheme it was actually trained under — meaningless result), and it built
+the permission mask with the default `hops=-1` instead of the actual
+trained `hops=1`. Both fixed (mirroring the same position/mask
+construction `train()`/`ar_decode_traj_nokv` use), verified to import and
+run cleanly. Result at this mid-training snapshot: baseline match=5.8%,
+swap-test match vs. the swapped-in content=2.2%, vs. the slot's usual
+content=7.1% — a 4.9pp gap, under the script's own 10pp threshold, so
+reported as `INCONCLUSIVE` rather than a clean win. But contrast the GAP
+SIZE against the original RoPE checkpoint's result (91.1% position / 0.4%
+content, a 90.7pp gap): the position-preference magnitude has collapsed by
+roughly an order of magnitude relative to the original gap, even before
+training has converged. Suggestive that the fix is genuinely reducing the
+shortcut's dominance rather than just moving aggregate match% around, but
+not conclusive on its own — both numbers are low simply because the model
+hasn't finished training yet, and the swap test hasn't been re-run against
+a converged checkpoint. Re-running this probe once stage0/stage1 actually
+finish is the natural follow-up for a definitive answer.

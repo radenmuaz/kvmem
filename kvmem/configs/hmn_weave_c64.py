@@ -93,7 +93,7 @@ hp = dict(
              hops=1,
              weave_mix=[
                  dict(weight=1.0, dsl='E2 Q(0,1) Q(1,2) B8'),        # batch(nc=2,wc=1)
-                 dict(weight=1.0, dsl='E1 Q(0,1) E Q(1,2) B8'),      # stream(nc=2,wc=1)
+                 dict(weight=1.0, dsl='E Q(0,1) E Q(1,2) B8'),      # stream(nc=2,wc=1)
                  dict(weight=1.0, dsl='E2 Q(1,2) Q(0,1) B8'),        # interleave_delayed(nc=2,wc=1)
              ]),
 

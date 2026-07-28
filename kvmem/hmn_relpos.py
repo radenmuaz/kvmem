@@ -1,10 +1,31 @@
 """
-kvmem/hmn.py — single-file HashMemNet (HMN) training stack: vocab/tag
-constants, position/mask builders, batch filling + AR-decode, model
-architecture, and the training loop.
+kvmem/hmn_relpos.py — fork of kvmem/hmn.py replacing RoPE entirely with a
+minimal, KV-cache-friendly relative-position mechanism (`relpos_enabled`,
+`MHAttention._add_relpos_bias`): a query-side, content-dependent learned
+bias added directly into the SDPA attn_mask at exactly the "d steps back"
+relative positions (d=1..relpos_k, default 2) — no rotation, no absolute
+position tracked at all. The bias comes from `Linear(d, relpos_k*n_heads)`
+applied to the QUERY's own current hidden state (not a fixed constant, and
+not the key token being attended to) — chosen specifically because it
+needs zero extra KV-cache state, unlike a key-side or combined query-key
+version (see `MHAttention.__init__`'s own docstring for the full
+comparison). Originally a fixed learned constant per (head, distance) —
+i.e. actually Shaw-et-al.-style relative position embeddings — before
+being replaced by this content-dependent version; the name changed
+accordingly since it's no longer that design.
 
-See docs/HMN_RECIPE.md for a from-scratch walkthrough and docs/HISTORY.md
-for design rationale and prior-mechanism history.
+Motivated by the same bug as kvmem/hmn.py's `rope_state_scale`:
+`kvmem/probe_positional_shortcut.py` measured that two DSL trajectories
+sharing an encode prefix but differing in query order were being resolved
+via pure query-slot POSITION rather than content. Restricting position
+information to a small fixed local window (rather than RoPE's full-range
+distance decay) removes the shortcut by construction — the query-to-STATE
+distance is never within `relpos_k` of any STATE region for any config
+this project uses (chunk_len=64 vs relpos_k=2).
+
+See docs/HISTORY.md for design rationale and prior-mechanism history
+(describes kvmem/hmn.py; this file only adds the mechanism described
+above on top).
 """
 from __future__ import annotations
 
@@ -340,24 +361,13 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
                 rec_blocks_m.append(dict(type='noop', span=None, op_idx=op_idx, sl0=sl0, sl1=sl1))
 
         else:  # 'Q'
-            # arg is (span_s, span_e) OR (span_s, span_e, warmup_start) — warmup_start
-            # is a BYTE offset within the span where the warmup/query excerpt begins
-            # (default 0 = the span's own first warmup_len bytes, today's behavior).
-            # Lets a query be "here's a ground-truth excerpt from somewhere in the
-            # middle, find it and continue" rather than always "here's the start."
-            if len(arg) == 3:
-                span_s, span_e, warmup_start = arg
-            else:
-                span_s, span_e = arg
-                warmup_start = 0
+            span_s, span_e = arg
             for k in range(span_s, span_e):
                 assert k in enc_blocks_c, \
                     f'query span {arg} references chunk {k} which has not been encoded yet — ' \
                     f'causal violation, fix the operations list'
             span_len = (span_e - span_s) * chunk_len
-            assert 0 <= warmup_start <= span_len - warmup_len, \
-                f'warmup_start={warmup_start} leaves no room for warmup_len={warmup_len} within span_len={span_len}'
-            out_len = span_len - warmup_start - warmup_len
+            out_len = span_len - warmup_len
             op_idx = op_count
             op_count += 1
 
@@ -396,15 +406,7 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
             initial_c, initial_m = _emit_round(0)
             rec_blocks_c.append(dict(type='initial', span=(span_s, span_e), span_len=span_len,
                                      out_len=out_len, is_clean=(n_refine == 0), op_idx=op_idx,
-                                     warmup_start=warmup_start,
-                                     # (warmup_start, warmup_start) — a degenerate single-value
-                                     # range — reuses make_batch_tagged's existing rw_xs
-                                     # mechanism to deterministically place the warmup/query
-                                     # excerpt at warmup_start rather than always byte 0, with
-                                     # no new batch-filling code needed. warmup_x_dist stays
-                                     # 'fixed' (rng.integers(x,x+1) always returns x anyway).
-                                     warmup_train_range=(warmup_start, warmup_start),
-                                     warmup_x_dist='fixed', **initial_c))
+                                     warmup_train_range=(0, 0), warmup_x_dist='fixed', **initial_c))
             rec_blocks_m.append(dict(type='initial', span=(span_s, span_e), op_idx=op_idx, **initial_m))
 
             prev_c0_c = initial_c['c0']
@@ -499,46 +501,6 @@ def _dual_positions(pos_content: dict, L: int) -> tuple[np.ndarray, np.ndarray]:
         pos_local[start:end] = idx - origin
 
     return pos_state, pos_local
-
-
-def _scaled_state_positions(pos_content: dict, L: int, state_scale: float) -> np.ndarray:
-    """Single-clock position array (used with plain apply_rope, NOT
-    apply_rope_dual) — every non-STATE token keeps its real, ordinary
-    absolute index (identical to plain RoPE, zero special-casing). Every
-    STATE-region token gets `(i - s0) + s0 / state_scale`: its position
-    WITHIN the region (i - s0) stays a native, unscaled integer (0, 1, 2,
-    ..., state_len-1 — full disambiguation power for the region's own
-    cyclic-token-ID slots, `_cyclic_state_ids`, which only has
-    `state_vocab_size` distinct IDs repeating through `state_len` slots and
-    needs SOME undamaged positional signal to tell them apart), while only
-    the region's overall BASELINE (s0, where it sits in the whole sequence)
-    gets compressed toward negligible.
-
-    BUG this replaced (caught by direct comparison against the original
-    hmn_single_recall_c64 baseline's logs, same step count, same task): an
-    earlier version divided the ENTIRE real index by state_scale, which
-    also crushed the WITHIN-region spacing (native spacing of ~state_len
-    collapsed to ~state_len/state_scale) — not just the intended
-    cross-region/cross-query distance. That version wasn't just failing to
-    fix the query-order shortcut, it was breaking ordinary single-chunk
-    recall outright (best val=3.0% vs the baseline's 100% at matched step
-    counts, loss stuck ~100x higher than baseline's near-zero). This
-    version preserves within-region spacing exactly while still killing
-    cross-region distance, verified before trusting (see the offline check
-    run before wiring this in)."""
-    pos = np.arange(L, dtype=np.float64)
-    state_regions: list[tuple[int, int]] = []
-    for cb in pos_content['enc_blocks']:
-        state_regions.append((cb['sl0'], cb['sl1']))
-    for rb in pos_content['rec_blocks']:
-        if rb['type'] in ('noop', 'initial'):
-            state_regions.append((rb['sl0'], rb['sl1']))
-        else:  # 'refine'
-            state_regions.append((rb['sla0'], rb['sla1']))
-            state_regions.append((rb['slb0'], rb['slb1']))
-    for s0, s1 in state_regions:
-        pos[s0:s1] = (pos[s0:s1] - s0) + s0 / state_scale
-    return pos
 
 
 def chunk_positions_stitch(chunk_len: int, n_chunks: int, state_len: int,
@@ -761,7 +723,7 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
 
 def traj_batch(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = ' '.join(f'Q({i},{i + window_chunks})' for i in range(n_chunks - window_chunks + 1))
-    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} {spans}')
+    ops, _, _ = parse_traj_dsl(f'E{n_chunks} {spans}')
     return ops
 
 
@@ -771,14 +733,14 @@ def traj_stream(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
         if i > 0:
             dsl_parts.append('E')
         dsl_parts.append(f'Q({i},{i + window_chunks})')
-    ops, _, _, _, _ = parse_traj_dsl(' '.join(dsl_parts))
+    ops, _, _ = parse_traj_dsl(' '.join(dsl_parts))
     return ops
 
 
 def traj_interleave_delayed(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
     q_str = ' '.join(f'Q({s},{e})' for s, e in reversed(spans))  # query last span first
-    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} {q_str}')
+    ops, _, _ = parse_traj_dsl(f'E{n_chunks} {q_str}')
     return ops
 
 
@@ -794,29 +756,7 @@ def traj_suffix(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     of "how far from the end the warmup anchor sits" — smaller
     `window_chunks` = warmup closer to the end = less left to generate."""
     assert window_chunks >= 2, 'window_chunks must be >=2 so there is a non-trivial response to generate'
-    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} Q({n_chunks - window_chunks},{n_chunks})')
-    return ops
-
-
-def traj_locate_and_continue(chunk_len: int, query_start: int) -> list[tuple]:
-    """Single unchunked span (n_chunks=1): encode the whole source (exactly
-    `chunk_len` bytes, embedded directly via the E(len) DSL token — no
-    external chunk_len= config override needed), then a single query whose
-    warmup/query excerpt starts at BYTE OFFSET `query_start` within the
-    source (not always 0) — the model has to LOCATE this ground-truth
-    excerpt (which could sit anywhere) rather than always finding it at a
-    fixed, predictable position, then continue generating from right after
-    it through the true end of the source. Validity (enough room left for
-    warmup_len + a non-trivial response) is enforced by
-    chunk_positions_traj's own Q-handling assert — this function's caller
-    is responsible for choosing a `query_start` that respects
-    `0 <= query_start <= chunk_len - min_recall_len - warmup_len`, see
-    kvmem/configs/hmn_single_recall_c64_locate.py for a concrete grid.
-    `warmup_len` is still supplied externally (weave_mix's per-entry
-    `warmup_len` override) — only chunk_len moved into the DSL string
-    itself, since that's the piece this function's whole design is about
-    varying freely across a mix without an external key per entry."""
-    ops, _, _, _, _ = parse_traj_dsl(f'E({chunk_len}) Q(0,1,{query_start})')
+    ops, _, _ = parse_traj_dsl(f'E{n_chunks} Q({n_chunks - window_chunks},{n_chunks})')
     return ops
 
 
@@ -825,7 +765,7 @@ def traj_repeat_query(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
     q_str = ' '.join(f'Q({s},{e})' for s, e in spans)
     first_s, first_e = spans[0]
-    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} {q_str} Q({first_s},{first_e})')
+    ops, _, _ = parse_traj_dsl(f'E{n_chunks} {q_str} Q({first_s},{first_e})')
     return ops
 
 
@@ -840,25 +780,10 @@ def traj_long_hop_recovery(n_chunks: int, window_chunks: int = 2) -> list[tuple]
 #
 # Grammar: E (ingest next chunk, must be followed by S) | E<n> (n ingest+
 # compress pairs) | S (emit STATE, claims preceding unclaimed E or else a
-# bare relay hop) | S<n> (n bare S ops) | Q(s,e) (query span [s,e), warmup
-# excerpt taken from BYTE OFFSET 0 within the span, today's default) |
-# Q(s,e,w) (same, but the warmup/query excerpt starts at BYTE OFFSET w
-# within the span instead of 0 — response covers everything from w+warmup_len
-# through the true end of the span, i.e. out_len is span-length-dependent,
-# not a fixed constant; used for "find this ground-truth excerpt wherever it
-# sits and continue" tasks, see traj_locate_and_continue) | Q(s,e,w,wl) (same,
-# but also sets warmup_len=wl for this trajectory — GLOBAL to the whole
-# string, like E(len)/R<n>/B<n>, NOT genuinely per-query: every downstream
-# consumer (chunk_positions_traj's out_len math, make_batch_tagged,
-# ar_decode_traj_nokv) reads one pos_content['warmup_len'] for the whole
-# trajectory, so if more than one Q in a string sets this 4th arg, all must
-# agree; falls back to the old external wcfg['warmup_len']/stage-level
-# warmup_len if no Q sets it, so existing configs using the dict key are
-# unaffected — Q(...,wl) is the preferred/newer form, same precedence
-# relationship E(len) has over the old chunk_len= key) | R<n> (n refine
-# rounds — GLOBAL, applies uniformly to every Q in the string, not
-# per-query; bare R means R1; at most one R token per string) | B<n>
-# (repeat_batch for THIS trajectory only — take n gradient steps on the
+# bare relay hop) | S<n> (n bare S ops) | Q(s,e) (query span [s,e)) |
+# R<n> (n refine rounds — GLOBAL, applies uniformly to every Q in the
+# string, not per-query; bare R means R1; at most one R token per string) |
+# B<n> (repeat_batch for THIS trajectory only — take n gradient steps on the
 # same sampled batch before resampling; bare B means B1; at most one B token
 # per string; default is 1 if no B token appears — not all trajectory shapes
 # are equally easy, so a harder shape in a weave_mix can ask for more
@@ -867,70 +792,28 @@ def traj_long_hop_recovery(n_chunks: int, window_chunks: int = 2) -> list[tuple]
 # Examples: batch "E4 Q(0,2) Q(1,3) Q(2,4)"; stream "E2 Q(0,2) E S Q(1,3) E S
 # Q(2,4)"; decay_curve(4 hops) "E2 Q(0,2) S4 Q(0,2)"; one refine round after
 # every query "E4 Q(0,2) Q(1,3) Q(2,4) R1"; harder shape gets more repeated
-# steps per batch "E8 Q(0,8) B4"; find-and-continue with warmup starting 20
-# bytes into a single 64-byte chunk "E1 Q(0,1,20)"; warmup_len=4 embedded
-# directly "E(16) Q(0,1,8,4)"
+# steps per batch "E8 Q(0,8) B4"
 #
-# Returns (ops, n_refine, repeat_batch, dsl_chunk_len, dsl_warmup_len) —
-# n_refine=0/repeat_batch=1/dsl_chunk_len=None/dsl_warmup_len=None if no
-# R/B/E(len)/Q(...,wl) appears. Every internal caller below (traj_batch/
-# stream/interleave_delayed/suffix/repeat_query/decay_curve) never emits
-# any of R/B/Q(...,wl), so they just discard those extra fields; only a
-# config's own explicit `dsl=` string (see the weave_mix dispatch in
-# train()) sets n_refine>0 / repeat_batch>1 / dsl_warmup_len today.
+# Returns (ops, n_refine, repeat_batch) — n_refine=0/repeat_batch=1 if no
+# R/B token appears. Every internal caller below (traj_batch/stream/
+# interleave_delayed/suffix/repeat_query/decay_curve) never emits an R or B
+# token, so they just discard both extra fields; only a config's own
+# explicit `dsl=` string (see the weave_mix dispatch in train()) can set
+# n_refine>0 / repeat_batch>1 today.
 # ---------------------------------------------------------------------------
 
-def parse_traj_dsl(s: str) -> tuple[list[tuple], int, int, int | None, int | None]:
+def parse_traj_dsl(s: str) -> tuple[list[tuple], int, int]:
     ops: list[tuple] = []
     next_chunk_idx = 0
     n_refine = 0
     repeat_batch = 1
-    dsl_chunk_len: int | None = None
-    dsl_warmup_len: int | None = None
     seen_r = False
     seen_b = False
-    seen_elen = False
     for tok in s.split():
         if tok.startswith('Q('):
             inner = tok[2:-1]
-            parts = inner.split(',')
-            if len(parts) == 4:
-                # Q(s,e,w,wl) — 4th arg sets warmup_len, GLOBAL to the string (like
-                # E(len)/R<n>/B<n>) rather than genuinely per-query — every consumer
-                # downstream (chunk_positions_traj's out_len math, make_batch_tagged,
-                # ar_decode_traj_nokv) reads a single pos_content['warmup_len'] for
-                # the whole trajectory, so a per-query value would need a much larger
-                # refactor that nothing here actually needs yet (every existing
-                # multi-Q trajectory — batch/stream/interleave_delayed — already
-                # shares one warmup_len across all its queries). If more than one Q
-                # in a string sets this, all must agree.
-                s_str, e_str, w_str, wl_str = parts
-                ops.append(('Q', (int(s_str), int(e_str), int(w_str))))
-                wl_here = int(wl_str)
-                assert dsl_warmup_len is None or dsl_warmup_len == wl_here, (
-                    f'conflicting warmup_len values from multiple Q(...,wl) in {s!r}: '
-                    f'{dsl_warmup_len} vs {wl_here}')
-                dsl_warmup_len = wl_here
-            elif len(parts) == 3:
-                s_str, e_str, w_str = parts
-                ops.append(('Q', (int(s_str), int(e_str), int(w_str))))
-            else:
-                s_str, e_str = parts
-                ops.append(('Q', (int(s_str), int(e_str))))
-        elif tok.startswith('E('):
-            # E(len) — GLOBAL to the string (like R<n>/B<n>), not per-E-token:
-            # sets the chunk_len every 'E' op in this string uses, embedded in
-            # the DSL itself instead of an external chunk_len= config override.
-            # Emits exactly one (E,S) pair, same as bare E. At most one E(len)
-            # token per string — chunk_positions_traj only supports a single
-            # uniform chunk_len across a whole ops list, so this token sets
-            # that one value rather than pretending per-chunk lengths exist.
-            assert not seen_elen, f'at most one E(len) token allowed per DSL string, got a second in {s!r}'
-            seen_elen = True
-            dsl_chunk_len = int(tok[2:-1])
-            ops.append(('E', next_chunk_idx))
-            ops.append(('S', None))
-            next_chunk_idx += 1
+            s_str, e_str = inner.split(',')
+            ops.append(('Q', (int(s_str), int(e_str))))
         elif tok.startswith('E'):
             n = int(tok[1:]) if len(tok) > 1 else 1
             for _ in range(n):
@@ -951,7 +834,7 @@ def parse_traj_dsl(s: str) -> tuple[list[tuple], int, int, int | None, int | Non
                 ops.append(('S', None))
         else:
             raise ValueError(f'unrecognized trajectory DSL token: {tok!r}')
-    return ops, n_refine, repeat_batch, dsl_chunk_len, dsl_warmup_len
+    return ops, n_refine, repeat_batch
 
 
 def traj_decay_curve(n_noop_hops: int, window_chunks: int = 2) -> list[tuple]:
@@ -964,7 +847,7 @@ def traj_decay_curve(n_noop_hops: int, window_chunks: int = 2) -> list[tuple]:
     near-0% purely from length extrapolation, not decay. Only trust results
     from a checkpoint actually trained on decay_curve-shaped trajectories.
     """
-    ops, _, _, _, _ = parse_traj_dsl(f'E{window_chunks} Q(0,{window_chunks}) S{n_noop_hops} Q(0,{window_chunks})')
+    ops, _, _ = parse_traj_dsl(f'E{window_chunks} Q(0,{window_chunks}) S{n_noop_hops} Q(0,{window_chunks})')
     return ops
 
 
@@ -1677,8 +1560,7 @@ def ar_decode_srs_stitched_tagged_nokv(model, chunks_arr, state_len: int, state_
 def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int,
                         mask_np: np.ndarray, pos_content: dict,
                         tags: list[tuple[int, int]], device,
-                        dual_rope: bool = False,
-                        rope_state_scale: float | None = None) -> dict:
+                        dual_rope: bool = False) -> dict:
     """
     AR decode for chunk_positions_traj layouts — same mechanics as
     ar_decode_srs_stitched_tagged_nokv (full-recompute, no KV cache; only the
@@ -1713,22 +1595,17 @@ def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int
     tag_ids = np.array([i for _, i in tags], dtype=np.int64)
     tok[tag_pos] = tag_ids
 
-    pos_state_full = pos_local_full = scaled_pos_full = None
+    pos_state_full = pos_local_full = None
     if dual_rope:
         ps, pl = _dual_positions(pos_content, L)
         pos_state_full = torch.tensor(ps, dtype=torch.long, device=device)
         pos_local_full = torch.tensor(pl, dtype=torch.long, device=device)
-    if rope_state_scale:
-        sp = _scaled_state_positions(pos_content, L, rope_state_scale)
-        scaled_pos_full = torch.tensor(sp, dtype=torch.float32, device=device)
 
     def _fwd_logits_at(pos: int) -> torch.Tensor:
         t = torch.tensor(tok[:pos], dtype=torch.long, device=device)
         m = full_mask[:pos, :pos]
         if dual_rope:
             logits = model(t, m, pos_state=pos_state_full[:pos], pos_local=pos_local_full[:pos])
-        elif rope_state_scale:
-            logits = model(t, m, offset=scaled_pos_full[:pos])
         else:
             logits = model(t, m)
         return logits[-1]
@@ -1749,18 +1626,15 @@ def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int
 
         span_s, span_e = rb['span']
         gt_span = np.concatenate(chunks_list[span_s:span_e])
-        ws = rb.get('warmup_start', 0)  # byte offset within the span (0 = today's default)
 
         # First-ever occurrence of ANY span starting at byte 0 uses ground
         # truth (nothing decoded yet); every other occurrence (including a
         # REPEATED query of the same span) chains from whatever was most
-        # recently decoded for that exact span. (warmup chaining across
-        # repeated queries only ever uses ws=0 in practice — a nonzero
-        # warmup_start is for the single-shot "find this excerpt" case.)
+        # recently decoded for that exact span.
         if span_s == 0 and rb['span'] not in decoded_by_span:
-            warmup_src = gt_span[ws:ws + wl]
+            warmup_src = gt_span[:wl]
         else:
-            warmup_src = decoded_by_span.get(rb['span'], gt_span)[ws:ws + wl]
+            warmup_src = decoded_by_span.get(rb['span'], gt_span)[:wl]
 
         if rb['type'] == 'initial':
             tok[rb['sl0']:rb['sl1']] = sids
@@ -1782,7 +1656,7 @@ def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int
             tok[rb['c0']:rb['c1']],
         ])
 
-        rb_target = gt_span[ws + wl:ws + wl + out_len]
+        rb_target = gt_span[wl:wl + out_len]
         rb_gen    = tok[rb['c0']:rb['c1']]
         rb_match  = 100.0 * float(np.sum(rb_gen[:len(rb_target)] == rb_target)) / max(len(rb_target), 1)
         turn_match_pcts.append(rb_match)
@@ -1981,11 +1855,50 @@ class MHAttention(nn.Module):
     def __init__(self, d: int, n_heads: int,
                  rope: bool = False, freqs: torch.Tensor | None = None,
                  null_kv: bool = False, qk_norm: bool = False,
-                 logit_cap: float = 0.0, attn_temp: bool = False):
+                 logit_cap: float = 0.0, attn_temp: bool = False,
+                 relpos_enabled: bool = False, relpos_k: int = 2):
         """null_kv=True: append a learnable (null_k, null_v) pair to the KV
         sequence before softmax — a "blank slot" to attend to when no real
         token is relevant, soft gating without hard masking. null_k inits to
-        zero (Q·null_k=0 initially) but is learned."""
+        zero (Q·null_k=0 initially) but is learned.
+
+        relpos_enabled=True: NO RoPE at all (this file's whole point — see
+        module docstring). Instead, a "d steps back" bias (d=1..relpos_k) is
+        added to the attention logit at query row i, key columns
+        i-1..i-relpos_k, baked directly into the SDPA attn_mask tensor
+        rather than modifying Q/K.
+
+        QUERY-SIDE CONTENT-DEPENDENT gate (replaced an earlier flat learned
+        constant, same value regardless of content): `self.relpos_gate =
+        Linear(d, relpos_k*n_heads)` projects each QUERY token's own input x
+        into a per-distance, per-head bias value — "how much does THIS
+        query, given what it actually represents, want to look d steps
+        back," rather than a fixed constant applied everywhere. Chosen
+        specifically for KV-cache friendliness: the query-side gate needs
+        NO extra cached state at all, since the current query's x is
+        already being freshly computed every decode step regardless of
+        caching (contrast: a KEY-side gate, or a combined query-key
+        version, would need caching an extra per-token tensor alongside
+        K/V, since a later query at distance d needs THAT PAST token's own
+        gate value, not something recomputable from the current step
+        alone). Because the gate depends on x, which varies per training
+        example, the mask now needs a REAL batch dimension (B,H,L,L_kv)
+        instead of the old shared (1,1,L,L_kv) broadcast every OTHER
+        mechanism in this codebase uses (permission masks are the same
+        across a batch of the same trajectory shape; content-dependent
+        bias is not).
+
+        Chosen k must stay well below chunk_len (64 in every config this
+        project uses so far) — a window that reaches as far as a STATE
+        region would reopen exactly the query-to-STATE distance shortcut
+        this whole file was built to avoid (see
+        kvmem/probe_positional_shortcut.py and docs/HISTORY.md §12); k=2 or
+        k=8 stay purely local (within-generation) with huge headroom to
+        spare. No absolute position is tracked at all (no offset-into-a-
+        continuous-clock the way RoPE needs); KV-cached decode only needs
+        `offset` (=L_past, already threaded through this file for other
+        reasons) to place each diagonal correctly across a cache boundary —
+        much simpler than RoPE's continuous rotation-angle bookkeeping."""
         super().__init__()
         self.n_heads = n_heads
         self.d_head  = d // n_heads
@@ -1994,6 +1907,8 @@ class MHAttention(nn.Module):
         self.qk_norm  = qk_norm
         self.logit_cap = logit_cap   # tanh soft-cap value (0 = disabled)
         self.attn_temp = attn_temp   # learned per-head temperature
+        self.relpos_enabled = relpos_enabled
+        self.relpos_k = relpos_k
         self.W_Q = nn.Linear(d, d, bias=False)
         self.W_K = nn.Linear(d, d, bias=False)
         self.W_V = nn.Linear(d, d, bias=False)
@@ -2004,6 +1919,11 @@ class MHAttention(nn.Module):
         if attn_temp:
             # log-scale per head, init 0 → temperature = 1/sqrt(d_head) at start
             self.log_attn_temp = nn.Parameter(torch.zeros(n_heads))
+        if relpos_enabled:
+            assert relpos_k >= 1
+            self.relpos_gate = nn.Linear(d, relpos_k * n_heads)
+            nn.init.zeros_(self.relpos_gate.weight)
+            nn.init.zeros_(self.relpos_gate.bias)  # starts as a no-op bias, same as the old constant's zero-init
         if freqs is not None:
             self.register_buffer('freqs', freqs)
         else:
@@ -2013,6 +1933,32 @@ class MHAttention(nn.Module):
     def _rms_normalize(x: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         norm = x.pow(2).mean(-1, keepdim=True).add(eps).rsqrt()
         return x * norm * scale
+
+    def _add_relpos_bias(self, m: torch.Tensor, x: torch.Tensor, L: int, offset: int) -> torch.Tensor:
+        """Adds gate[b,row,d-1,h] to m[b,h,row,row-d] (global "d steps back"
+        pair) for every d=1..relpos_k and every query row whose global index
+        is >=d — rows too close to the start simply have fewer of the k
+        diagonals apply (e.g. global row 0 gets none, row 1 gets only d=1).
+        `gate = self.relpos_gate(x)` is QUERY-SIDE and content-dependent —
+        computed fresh from this call's own x (the current query/queries
+        being processed), never from a cached past token, which is what
+        makes this KV-cache-friendly (see class docstring). `offset`
+        (=L_past for a KV-cached suffix pass) is the ONLY position
+        bookkeeping this needs, unlike RoPE's continuous rotation clock.
+        `m` must already have a REAL batch dimension matching x's (content-
+        dependent bias varies per example, unlike the permission mask)."""
+        H, K = self.n_heads, self.relpos_k
+        B = x.shape[0]
+        gate = self.relpos_gate(x).view(B, L, K, H)  # (B, L, relpos_k, n_heads)
+        row_idx = torch.arange(L, device=m.device)
+        global_row = offset + row_idx
+        for d in range(1, K + 1):
+            valid = global_row >= d
+            r = row_idx[valid]
+            c = global_row[valid] - d
+            g = gate[:, r, d - 1, :]        # (B, len(r), H)
+            m[:, :, r, c] += g.permute(0, 2, 1)  # (B, H, len(r))
+        return m
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor,
                 past_kv: tuple | None = None,
@@ -2066,6 +2012,10 @@ class MHAttention(nn.Module):
             out = torch.softmax(scores, dim=-1) @ V
         elif chunk > 0 and L > chunk:
             m = mask.unsqueeze(0).unsqueeze(0)           # (1,1,L_q,L_kv)
+            if self.relpos_enabled:
+                m = self._add_relpos_bias(m.expand(B, H, L, m.shape[-1]).clone(), x, L, offset)
+            else:
+                m = m.expand(B, H, L, m.shape[-1])
             parts = []
             for i in range(0, L, chunk):
                 parts.append(F.scaled_dot_product_attention(
@@ -2073,8 +2023,10 @@ class MHAttention(nn.Module):
                     attn_mask=m[:, :, i:i+chunk, :]))
             out = torch.cat(parts, dim=2)
         else:
-            out = F.scaled_dot_product_attention(Q, K, V,
-                                                 attn_mask=mask.unsqueeze(0).unsqueeze(0))
+            m = mask.unsqueeze(0).unsqueeze(0)
+            if self.relpos_enabled:
+                m = self._add_relpos_bias(m.expand(B, H, L, m.shape[-1]).clone(), x, L, offset)
+            out = F.scaled_dot_product_attention(Q, K, V, attn_mask=m)
         out = out.permute(0, 2, 1, 3).reshape(B, L, d)
         out = self.W_O(out)
         if not batched:
@@ -2197,12 +2149,14 @@ class SingleAttnBlock(nn.Module):
                  rope: bool = False, freqs: torch.Tensor | None = None,
                  null_kv: bool = False, qk_norm: bool = False,
                  rmsnorm: bool = False, logit_cap: float = 0.0,
-                 attn_temp: bool = False):
+                 attn_temp: bool = False, relpos_enabled: bool = False,
+                 relpos_k: int = 2):
         super().__init__()
         self.norm = _make_norm(d, rmsnorm)
         self.attn = MHAttention(d, n_heads, rope=rope, freqs=freqs,
                                 null_kv=null_kv, qk_norm=qk_norm,
-                                logit_cap=logit_cap, attn_temp=attn_temp)
+                                logit_cap=logit_cap, attn_temp=attn_temp,
+                                relpos_enabled=relpos_enabled, relpos_k=relpos_k)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor,
                 past_kv: tuple | None = None,
@@ -2241,6 +2195,8 @@ class HMNModel(nn.Module):
                  depth_scaled_init: bool = False,
                  logit_cap: float = 0.0,
                  attn_temp: bool = False,
+                 relpos_enabled: bool = False,
+                 relpos_k: int = 2,
                  tied_embed: bool = False,
                  V_out: int = 256):
         assert block_type in ('attn_mlp', 'dual_attn', 'single_attn')
@@ -2281,7 +2237,8 @@ class HMNModel(nn.Module):
             self.blocks = nn.ModuleList([
                 SingleAttnBlock(d, n_heads, rope=rope, freqs=freqs, null_kv=null_kv,
                                 qk_norm=qk_norm, rmsnorm=rmsnorm,
-                                logit_cap=logit_cap, attn_temp=attn_temp)
+                                logit_cap=logit_cap, attn_temp=attn_temp,
+                                relpos_enabled=relpos_enabled, relpos_k=relpos_k)
                 for _ in range(n_layers)
             ])
 
@@ -2389,9 +2346,7 @@ class HMNModel(nn.Module):
 
         kv_out = []
         L_past = past_kv[0][0].shape[2] if past_kv is not None else 0
-        # `offset` may be a full (L,) position tensor (see _scaled_state_positions) —
-        # `if offset` on a multi-element tensor raises, so branch on type explicitly.
-        _offset = offset if (isinstance(offset, torch.Tensor) or offset) else L_past
+        _offset = offset if offset else L_past
 
         for i, block in enumerate(self.blocks):
             pkv = past_kv[i] if past_kv is not None else None
@@ -2448,6 +2403,8 @@ def build_model(hp: dict, device=None) -> HMNModel:
         depth_scaled_init=hp.get('depth_scaled_init', False),
         logit_cap=hp.get('logit_cap', 0.0),
         attn_temp=hp.get('attn_temp', False),
+        relpos_enabled=hp.get('relpos_enabled', False),
+        relpos_k=hp.get('relpos_k', 2),
         tied_embed=hp.get('tied_embed', False),
         V_out=hp.get('V_out', 256),
     )
@@ -2664,13 +2621,6 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             B          = stage.get('B', 8)
             n_steps    = stage.get('n_steps', 60000)
             stage_eval_every = stage.get('eval_every', 5000)
-            early_stop_mean = stage.get('early_stop_mean', None)  # e.g. 80.0 — if val MEAN
-                                                                   # reaches this at any eval,
-                                                                   # move to the next curriculum
-                                                                   # stage immediately instead of
-                                                                   # burning the rest of n_steps.
-                                                                   # n_steps remains the hard cap
-                                                                   # if the threshold is never hit.
             ls_max     = hp.get('ls_max', 0.0)
 
             _WEAVE_TRAIN_PATTERNS = dict(batch=traj_batch, stream=traj_stream,
@@ -2681,35 +2631,6 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                                      # frozen macro clock during query phase,
                                                      # kills the query-order positional shortcut
                                                      # measured by kvmem/probe_positional_shortcut.py
-            rope_state_scale = hp.get('rope_state_scale', None)  # see _scaled_state_positions —
-                                                     # single-clock alternative to dual_rope: STATE
-                                                     # tokens' real position divided by this factor
-                                                     # (e.g. 1e6), everything else normal. Simpler,
-                                                     # no per-block reset bookkeeping; supersedes
-                                                     # dual_rope as the recommended mechanism (see
-                                                     # docs/HISTORY.md §12) — mutually exclusive with it
-            assert not (dual_rope and rope_state_scale), 'dual_rope and rope_state_scale are alternatives, not both'
-
-            # Adaptive weave_mix reweighting (merged from the former kvmem/hmn_adaptive_trainer.py
-            # fork) — every eval step, re-derive each trajectory's sampling weight from how much
-            # it's currently struggling, so training effort automatically shifts toward whichever
-            # shape(s) are lagging instead of staying fixed at whatever the config authored up
-            # front. Off by default (adaptive=False) — every existing config is unaffected.
-            adaptive        = hp.get('adaptive', False)
-            adapt_signal    = hp.get('adapt_signal', 'val_match')  # 'val_match' | 'train_loss'
-            assert adapt_signal in ('val_match', 'train_loss')
-            adapt_temp      = hp.get('adapt_temp', 1.0)  # softmax temperature over normalized
-                                                          # difficulty — lower = more aggressive
-            adapt_ema_alpha = hp.get('adapt_ema_alpha', 0.5)  # train_loss EMA smoothing (separate
-                                                               # from traj['last_loss'], which stays
-                                                               # a raw single-batch value for display)
-                                                               # — 0.5 (not the more conservative 0.9)
-                                                               # so the adapt signal reacts faster to
-                                                               # recent change rather than lagging behind it
-            adapt_floor     = hp.get('adapt_floor', 0.05)  # min relative weight share even for an
-                                                            # already-solved trajectory
-            _eval_count     = 0  # gates val_match-driven adaptation until the 2nd eval — the first
-                                 # reading is off the least-trained model, too noisy to act on
 
             weave_mix_cfg = stage['weave_mix']  # list of {weight, pattern[, n_chunks, window_chunks]} OR {weight, dsl}
             trajectories = []
@@ -2720,15 +2641,8 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     # n_chunks is derived from the DSL itself (count of 'E' ops), not passed
                     # separately — the string is already the single source of truth for shape.
                     pname = wcfg['dsl']  # used only for logging/bookkeeping below
-                    ops, w_n_refine, w_repeat_batch, w_dsl_chunk_len, w_dsl_warmup_len = parse_traj_dsl(wcfg['dsl'])
+                    ops, w_n_refine, w_repeat_batch = parse_traj_dsl(wcfg['dsl'])
                     w_n_chunks = sum(1 for op, _ in ops if op == 'E')
-                    # DSL-embedded E(len)/W<n> win if present; fall back to the old
-                    # external wcfg['chunk_len']/['warmup_len'] override, then the stage
-                    # default — E(len)/W<n> are the preferred/newer form (see
-                    # parse_traj_dsl's grammar comment), the wcfg keys stay supported
-                    # for existing configs.
-                    w_chunk_len = w_dsl_chunk_len if w_dsl_chunk_len is not None else wcfg.get('chunk_len', chunk_len)
-                    w_warmup_len = w_dsl_warmup_len if w_dsl_warmup_len is not None else wcfg.get('warmup_len', warmup_len)
                 else:
                     pname = wcfg['pattern']
                     assert pname in _WEAVE_TRAIN_PATTERNS, (
@@ -2740,74 +2654,30 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     w_window_chunks = wcfg.get('window_chunks', window_chunks)
                     w_n_refine = wcfg.get('n_refine', 0)
                     w_repeat_batch = wcfg.get('repeat_batch', 1)
-                    w_chunk_len = wcfg.get('chunk_len', chunk_len)
-                    w_warmup_len = wcfg.get('warmup_len', warmup_len)
                     ops = _WEAVE_TRAIN_PATTERNS[pname](w_n_chunks, w_window_chunks)
-                built = chunk_positions_traj(w_chunk_len, state_len, w_warmup_len, ops,
+                built = chunk_positions_traj(chunk_len, state_len, warmup_len, ops,
                                              n_refine=w_n_refine, state_vocab_size=state_vocab_size)
                 pos_content, pos_mask, tags, L = (built['pos_content'], built['pos_mask'],
                                                   built['tags'], built['L'])
                 mask_np = chunk_mask_fb_traj(pos_mask, hops=hops)
                 mask_t  = torch.tensor(mask_np, dtype=torch.float32, device=device)
-                pos_state_t = pos_local_t = scaled_pos_t = None
+                pos_state_t = pos_local_t = None
                 if dual_rope:
                     ps, pl = _dual_positions(pos_content, L)
                     pos_state_t = torch.tensor(ps, dtype=torch.long, device=device)
                     pos_local_t = torch.tensor(pl, dtype=torch.long, device=device)
-                if rope_state_scale:
-                    sp = _scaled_state_positions(pos_content, L, rope_state_scale)
-                    scaled_pos_t = torch.tensor(sp, dtype=torch.float32, device=device)
                 trajectories.append(dict(weight=wcfg['weight'], pattern=pname, n_chunks=w_n_chunks,
-                                         chunk_len=w_chunk_len,
                                          pos_content=pos_content, mask_np=mask_np, mask_t=mask_t,
                                          tags=tags, L=L, repeat_batch=w_repeat_batch,
-                                         pos_state_t=pos_state_t, pos_local_t=pos_local_t,
-                                         scaled_pos_t=scaled_pos_t,
-                                         base_weight=wcfg['weight'], ema_loss=None, last_match=None))
+                                         pos_state_t=pos_state_t, pos_local_t=pos_local_t))
             traj_weights = np.array([t['weight'] for t in trajectories], dtype=np.float64)
             traj_weights = traj_weights / traj_weights.sum()
 
-            def _log_weave_mix(tag=''):
-                summary = [(t['pattern'], t['n_chunks'], round(w, 2), f"B{t['repeat_batch']}")
-                          for t, w in zip(trajectories, traj_weights)]
-                _log(f'\n[stage {stage_i}] weave_mix{tag}={summary}  '
-                     f'chunk_len={chunk_len} state={state_len} wl={warmup_len} '
-                     f'hops={hops}  B={B}  steps={n_steps}')
-            _log_weave_mix()
-
-            def _temp_softmax_rescale(diffs):
-                """softmax(diffs/adapt_temp), rescaled so a perfectly uniform difficulty
-                maps every trajectory back to d=1.0 — preserves the convention the
-                floor-blending formula below assumes. Lower adapt_temp => peakier
-                softmax => more aggressive reallocation."""
-                n = len(diffs)
-                scores = diffs / adapt_temp
-                scores = scores - scores.max()  # shift for numerical stability; softmax is shift-invariant
-                exp_s = np.exp(scores)
-                p = exp_s / exp_s.sum()
-                return p * n
-
-            def _adapt_reweight():
-                """Recompute traj_weights (sampling probability only — repeat_batch
-                stays fixed at whatever the config set) from the chosen signal.
-                difficulty is normalized to the mix's own mean so a trajectory
-                exactly at the mix's average difficulty gets its base_weight back
-                unchanged; harder-than-average trajectories get scaled up, easier
-                ones scaled down (never below adapt_floor's relative share)."""
-                if adapt_signal == 'val_match':
-                    diffs = np.array([max(100.0 - (t['last_match'] if t['last_match'] is not None else 50.0), 0.0)
-                                      for t in trajectories])
-                else:
-                    known = [t['ema_loss'] for t in trajectories if t['ema_loss'] is not None]
-                    fallback = (sum(known) / len(known)) if known else 1.0
-                    diffs = np.array([t['ema_loss'] if t['ema_loss'] is not None else fallback
-                                      for t in trajectories])
-                diffs = diffs / max(diffs.mean(), 1e-8)  # 1.0 = mix-average difficulty
-                diffs = _temp_softmax_rescale(diffs)
-                for t, d in zip(trajectories, diffs):
-                    t['weight'] = t['base_weight'] * (adapt_floor + (1 - adapt_floor) * d)
-                new_weights = np.array([t['weight'] for t in trajectories], dtype=np.float64)
-                return new_weights / new_weights.sum()
+            _weave_mix_summary = [(t['pattern'], t['n_chunks'], round(w, 2), f"B{t['repeat_batch']}")
+                                  for t, w in zip(trajectories, traj_weights)]
+            _log(f'\n[stage {stage_i}] weave_mix={_weave_mix_summary}  '
+                 f'chunk_len={chunk_len} state={state_len} wl={warmup_len} '
+                 f'hops={hops}  B={B}  steps={n_steps}')
 
             lr_min      = hp.get('lr_min', 0.0)
             cosine_T0   = hp.get('cosine_T0', 20000)
@@ -2817,15 +2687,6 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             def _lr(s):
                 if s <= warmup_steps:
                     return lr_max * s / max(warmup_steps, 1)
-                if adaptive:
-                    # Fixed after linear warmup, NOT cosine, when adaptive reweighting
-                    # is on — a decaying schedule assumes the training signal gets
-                    # easier to fit over time; here the signal itself keeps shifting
-                    # as reweighting moves effort around, so annealing lr toward ~0
-                    # would blunt the model's ability to respond to a newly
-                    # up-weighted hard trajectory. cosine_T0/lr_schedule/lr_min are
-                    # ignored in this case.
-                    return lr_max
                 if lr_schedule != 'cosine_restarts':
                     return lr_max
                 t = s - warmup_steps
@@ -2849,7 +2710,7 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 if _cached_batch is None or _cached_repeat_left <= 0:
                     traj = trajectories[rng.choice(len(trajectories), p=traj_weights)]
                     t_pos_content, t_mask_t, t_tags = traj['pos_content'], traj['mask_t'], traj['tags']
-                    tok_np = make_batch_tagged(rng, B, traj['n_chunks'], traj['chunk_len'], state_len, state_vocab_size,
+                    tok_np = make_batch_tagged(rng, B, traj['n_chunks'], chunk_len, state_len, state_vocab_size,
                                                t_pos_content, t_tags, data_kind=data_kind,
                                                data_target_bits=data_target_bits)
                     tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
@@ -2860,16 +2721,13 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 _cached_repeat_left -= 1
 
                 if forward_granularity is not None:
-                    assert not dual_rope and not rope_state_scale, \
-                        'dual_rope/rope_state_scale + forward_granularity not yet supported together'
+                    assert not dual_rope, 'dual_rope + forward_granularity not yet supported together'
                     loss = _forward_segmented(model, tok_t, traj['mask_np'], t_pos_content,
                                               device, ls_max, forward_granularity,
                                               segment_checkpoint=segment_checkpoint)
                 else:
                     if dual_rope:
                         logits = model(tok_t, t_mask_t, pos_state=traj['pos_state_t'], pos_local=traj['pos_local_t'])
-                    elif rope_state_scale:
-                        logits = model(tok_t, t_mask_t, offset=traj['scaled_pos_t'])
                     else:
                         logits = model(tok_t, t_mask_t)
                     nlls = []
@@ -2886,22 +2744,9 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 opt.step()
 
                 loss_f = float(loss.detach())
-                # Per-trajectory loss — RAW, from whatever single batch was last
-                # sampled for that entry (no smoothing) — lets you watch each DSL
-                # entry's own loss directly (e.g. spot a rehearsal entry regressing/
-                # being forgotten as later stages/entries dominate sampling), not
-                # just the aggregate loss which only ever reflects whichever entry
-                # was sampled this exact step.
-                traj['last_loss'] = loss_f
-                traj['ema_loss'] = loss_f if traj['ema_loss'] is None else (
-                    adapt_ema_alpha * traj['ema_loss'] + (1 - adapt_ema_alpha) * loss_f)
-                _traj_loss_str = '[' + ','.join(f'{t["last_loss"]:.2f}' if t.get('last_loss') is not None else 'NA'
-                                                for t in trajectories) + ']'
-                pbar.set_postfix(loss=f'{loss_f:.3f}', lr=f'{lr:.1e}', traj_loss=_traj_loss_str, refresh=False)
+                pbar.set_postfix(loss=f'{loss_f:.3f}', lr=f'{lr:.1e}', refresh=False)
                 if local_step % log_every == 0:
-                    _jlog(dict(step=global_step, loss=round(loss_f, 5), lr=lr,
-                               traj_loss=[round(t['last_loss'], 4) if t.get('last_loss') is not None else None
-                                         for t in trajectories]))
+                    _jlog(dict(step=global_step, loss=round(loss_f, 5), lr=lr))
                     print(str(pbar), file=log_file, flush=True)
 
                 if local_step % stage_eval_every == 0 or local_step == n_steps:
@@ -2913,39 +2758,24 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
 
                     val_means = []
                     for traj in trajectories:
-                        val_seqs = make_test_sequences(traj['n_chunks'] * traj['chunk_len'])
+                        val_seqs = make_test_sequences(traj['n_chunks'] * chunk_len)
                         val_n_seqs = hp.get('val_n_seqs')
                         if val_n_seqs is not None:
                             val_seqs = dict(list(val_seqs.items())[:val_n_seqs])
                         pcts = []
                         for sname, seq_bytes in val_seqs.items():
-                            chunks_list = [seq_bytes[k * traj['chunk_len']:(k + 1) * traj['chunk_len']]
+                            chunks_list = [seq_bytes[k * chunk_len:(k + 1) * chunk_len]
                                           for k in range(traj['n_chunks'])]
                             r = ar_decode_traj_nokv(model, np.array(chunks_list), state_len,
                                                     state_vocab_size, traj['mask_np'],
                                                     traj['pos_content'], traj['tags'], device,
-                                                    dual_rope=dual_rope, rope_state_scale=rope_state_scale)
+                                                    dual_rope=dual_rope)
                             pcts.append(r['match_pct'])
                         m_ = sum(pcts) / len(pcts)
-                        traj['last_match'] = m_
                         val_means.append(m_)
-                        _ema_disp = f'{traj["ema_loss"]:.3f}' if traj['ema_loss'] is not None else 'NA'
-                        _log(f'  val/weave/{traj["pattern"]:<20} match={m_:.1f}%  ema_loss={_ema_disp}')
+                        _log(f'  val/weave/{traj["pattern"]:<20} match={m_:.1f}%')
                     vmean = sum(val_means) / len(val_means)
                     _log(f'  val/weave/MEAN               match={vmean:.1f}%')
-                    _eval_count += 1
-
-                    if adaptive:
-                        # val_match's very first reading is the noisiest possible signal
-                        # (least-trained model) — skip adapting on it, wait for the 2nd
-                        # eval. train_loss doesn't have this problem (its EMA has already
-                        # been accumulating every step since step 1).
-                        if adapt_signal == 'train_loss' or _eval_count >= 2:
-                            traj_weights = _adapt_reweight()
-                            _log_weave_mix(' (adapted)')
-                        else:
-                            _log(f'  [stage {stage_i}] adaptive=True but adapt_signal=val_match '
-                                 f'skips adapting until the 2nd eval (this is eval #{_eval_count})')
 
                     torch.save(dict(model=model.state_dict(), hp=hp, step=global_step),
                               os.path.join(ckpt_dir, f'stage{stage_i}_last.pt'))
@@ -2953,12 +2783,6 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         stage_best_val = vmean
                         torch.save(dict(model=model.state_dict(), hp=hp, step=global_step, val_mean=vmean),
                                   os.path.join(ckpt_dir, f'stage{stage_i}_best.pt'))
-
-                    if early_stop_mean is not None and vmean >= early_stop_mean:
-                        _log(f'  [stage {stage_i}] EARLY STOP: val MEAN {vmean:.1f}% >= '
-                             f'early_stop_mean={early_stop_mean} at step {local_step}/{n_steps} '
-                             f'— moving to next stage now instead of burning the remaining steps.')
-                        break
 
             torch.save(dict(model=model.state_dict(), hp=hp, step=global_step),
                       os.path.join(ckpt_dir, f'stage{stage_i}_end.pt'))
