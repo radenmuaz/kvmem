@@ -1075,3 +1075,223 @@ not conclusive on its own — both numbers are low simply because the model
 hasn't finished training yet, and the swap test hasn't been re-run against
 a converged checkpoint. Re-running this probe once stage0/stage1 actually
 finish is the natural follow-up for a definitive answer.
+
+### 14. `hmn_locate_nope_curriculum_dense` — is the architecture or the dataset a limiting factor?
+
+Two independent diagnostic questions asked while `hmn_locate_nope_curriculum_dense`
+was mid-run (`lr_max=1e-4`, stage0 already at MEAN=59.9% by step 72000, stage1
+in progress) — both answered `NO`, with the actual reproducible script
+preserved at **`kvmem/probe_signal_propagation.py`** (`--mode signal` /
+`--mode ambiguity`).
+
+**Is the 8-layer/d=64/n_heads=4/NoPE architecture too limiting** (vanishing
+gradients, degenerate attention that never sharpens, exploding activations)?
+Compared a fresh random-init model against `stage0_best.pt` (both `single_attn`,
+`rope=False`, `null_kv=True`, `rmsnorm=True`) on per-layer activation norm,
+attention entropy, and gradient norm, plus a short 300-step CPU training run.
+**Two real bugs found and fixed in the diagnostic itself before trusting any
+result** (per this project's own house rule — verify infra before trusting
+it): (1) first run evaluated `stage0_best.pt` (trained only on `chunk_len=8`)
+against a `chunk_len=16` batch it had never seen, making the pretrained model
+look worse than random init (loss 17.6 vs 5.5) — fixed by testing on one of
+stage0's own trajectories instead; (2) the attention-entropy normalization
+divided by `log(n_valid)`, and rows with exactly one attendable position
+(`n_valid=1`, common for early causal rows) have `log(1)=0` — any epsilon
+clamp on that denominator blew a near-zero numerator up into the millions
+(`attn_entropy=1753215` in the first run) — fixed by excluding `n_valid<2`
+rows from the normalized average rather than clamping.
+
+**Result, post-fix**: gradient norm is LARGER in early layers than late ones
+(layer0=0.52→layer7=0.10 at random init; layer0=9.49→layer7=2.45 pretrained)
+— the healthy, expected residual-network pattern (skip connections carry
+gradient to early layers nearly unattenuated), not vanishing gradients.
+Activation norm grows across depth (0.3→30.1) but each block re-normalizes
+its own input via RMSNorm before attention, so this is normal transformer
+behavior, not instability. Attention entropy at random init is uniformly
+diffuse (0.73-0.90 every layer); after training, layer 1 sharpens to 0.30 —
+real evidence the architecture DOES learn decisive, content-based attention
+under NoPE, not permanently-uniform. **Verdict: no evidence of an
+architectural/signal-propagation ceiling** — the slow real-run convergence
+(tens of thousands of steps even at the easiest stage) looks like the
+expected cost of learning genuine content-only locate, not a capacity limit.
+
+**Is `data_kind='random'` (uniform i.i.d. bytes) itself a limiting factor** —
+i.e., does the training data contain genuine ambiguity (the TRUE warmup
+excerpt's exact byte string recurring elsewhere in the same chunk, making
+"locate this" unsolvable in principle for that sample)? Measured empirically
+per `(chunk_len, warmup_len)` pair used across this project's locate configs:
+under 0.1% even at the shortest tested `warmup_len=2`, `chunk_len=64`
+(cross-checked against the birthday-bound approximation for "does ANY
+duplicate window-pair exist in the chunk," ~3% — consistent once accounting
+for the two being different questions: only 2 of ~63 windows are the
+colliding pair even when one exists, so P(the specific TRUE excerpt is one of
+them) ≈ 2/63 × 3% ≈ 0.1%). **Verdict: the dataset is not a meaningful
+limiting factor** — if anything, uniform random (max-entropy, incompressible)
+data is close to the best-case distribution for this task, since structured/
+repetitive data would introduce MORE genuine duplicate substrings, not fewer.
+The near-garbage qualitative output seen at `warmup_len=2` (documented in
+CLAUDE.md's positional-shortcut/qualitative-decode entries) is better
+explained as a learning-difficulty issue — the exact-match attention
+algorithm is harder to learn from only 2 bytes of signal — than a
+data-imposed ceiling.
+
+### 15. `kvmem/hmn_notags.py` — the STATE-role ambiguity, opcode tokens, and end-of-turn STATE redesign
+
+A design conversation (not yet fully implemented as of this writing — see
+"Status" at the end) that started from a real gap in the chat-tag-free
+fork and ended up redesigning how STATE emissions work generally, in a way
+that also resolves a genuine architectural redundancy present in `hmn.py`
+too, not just the fork.
+
+**The original gap**: without chat tags, an encode chunk's claim-STATE and
+a query's own round-0 recall-STATE use the exact same token family
+(`_cyclic_state_ids(..., family=0)`) — there is no vocab-level signal
+distinguishing "this STATE just claimed an encode chunk" from "this STATE
+is a fresh query's blank register." The only available signal is the
+local order pattern (raw bytes precede an encode-claim; raw bytes follow a
+query's STATE) — real, but weaker than what `HMN_QUERY_OPEN` used to give
+for free. Separately: bare no-op relay hops (`S<n>` tokens) ALSO share
+that same family in `hmn.py` itself, tags or no tags — chat tags never
+disambiguated *that* case in the original file either.
+
+**First proposed fix, then generalized**: give no-op hops their own STATE
+family (a third family alongside regular/feedback). Then generalized
+further into a **factorized opcode + shared value alphabet**: instead of
+N separate families (each with its own private `state_vocab_size`-sized
+alphabet), use ONE opcode token per STATE emission (`update`/`noop`/
+`feedback` — 3 values) followed by `state_len` value tokens drawn from a
+SINGLE shared alphabet reused across all three roles. Vocab cost: `3 +
+state_vocab_size` extra IDs instead of `3 × state_vocab_size` — smaller,
+but the real benefit is representational: the model learns what "value 0
+vs value 1" means ONCE, shared across every role, instead of relearning it
+independently per family. Given how step/data-constrained this whole
+project is, that's a real sample-efficiency argument, not just a
+vocab-size nicety.
+
+**The double-state redundancy** (found by asking "isn't this redundant"
+about the query's own STATE existing *separately* from the encode's claim-
+STATE): a query's round-0 STATE is a genuinely separate emission from the
+chunk's claim-STATE it reads from — is that ever necessary, or just
+architectural uniformity? Precise answer, derived from `_relay_source`
+(reads `prev_rb['sl0':'sl1']` — literally *this op's own* STATE, not
+whatever it read): a query's own STATE emission is **needed whenever a
+later op relays from it** — true under any `hops` setting, because it's
+what lets a chain accumulate (`state_t=f(state_{t-1},x_t)`) rather than
+stay static. It's **provably redundant only for the terminal op** (the
+last, or only, op in a chain) — nothing downstream ever reads its STATE,
+so warmup/response could attend directly to whatever single source it
+would have read, with zero behavioral difference. For every current
+`weave_mix` locate config (`n_chunks=1`, one query, nothing after it) —
+trivially the terminal op of a length-1 chain — this redundancy is real
+and applies right now.
+
+**The `hops=-1` vs `hops=1` distinction that motivated going further**: the
+query-STATE's *aggregation* role (reading from MULTIPLE priors at once)
+only exists under `hops=-1` (unbounded/routing) — under `hops=1` there's
+only ever one accessible prior, so "aggregation" doesn't apply. But the
+STATE emission is still not redundant for non-terminal ops under `hops=1`
+— it's the transition-function OUTPUT itself, the actual `h_t=f(h_{t-1},
+x_t)`, which is what the next op needs to relay from. Masking alone can't
+substitute for this (masking controls which EXISTING positions attend to
+which; it can't manufacture a value that was never computed and written
+into the sequence) — so "just merge the hop into a single state via
+correct masking" works ONLY for the terminal op, not in general.
+
+**The redesign this converged on**: keep exactly one STATE block per op
+(never two), but reposition it to the END of a query's turn instead of the
+start, and let warmup/response attend DIRECTLY to whatever `hops` makes
+available (no intermediate "pre-filter" register they're forced through
+first):
+```
+current:  [STATE][warmup][response]      — STATE computed first, a forced pre-filter
+redesign: [warmup][response][STATE]      — warmup/response attend directly to hops-permitted
+                                            priors; STATE computed LAST, purely as the
+                                            chain-continuation handoff for the next op
+```
+This isn't a new shape invented from nothing — it's exactly what refine
+rounds already do for `slb` (the STATE built *after* incorporating argmax
+feedback, handed forward as what the next round reads), generalized to
+every op instead of only refine rounds. Mechanically: `S` already claims
+the immediately-preceding unclaimed `E` (encode-STATE) or falls back to a
+bare no-op hop — this redesign extends the SAME claim logic so `S` can
+ALSO claim an immediately-preceding, just-finished `Q` (building its
+end-of-turn STATE from whatever `hops` permits plus its own warmup+
+response), making a terminal query (no trailing `S`) and a non-terminal
+query (`Q(...) S`) an *explicit, visible* distinction in the DSL itself,
+not an implicit one buried in `_relay_source` logic.
+
+**Worked trajectories, verified by hand before any code was written** (per
+this project's own house rule — verify masking changes against the actual
+matrix, not just "does it run"), using `chunk_len=4, state_len=2,
+warmup_len=1`, `OP_U`=update opcode:
+- **Single recall** (`E,S,Q` — terminal): `[c0 c1 c2 c3][OP_U sA0 sA1][w r0 r1 r2]` — ONE STATE block total (the query's own is omitted — terminal, nothing relays from it). L=11.
+- **Batch** (`E1 E2 Q1 Q2`, `Q1` has a successor): `[c0][OP_U sA][c1][OP_U sB][w1 r1][OP_U sQ1][w2 r2]` — `Q1` gets an end-of-turn STATE (needed, `Q2` relays from it); `Q2` (terminal) doesn't. `Q1` (op_idx=0, exempt) sees BOTH `sA` and `sB` directly — both already exist causally, since batch groups encodes before any query.
+- **Stream** (`E1 Q1 E2 Q2`, same op roles, interleaved order): `[c0][OP_U sA][w1 r1][OP_U sQ1][c1][OP_U sB][w2 r2]` — same block set, reordered. `Q1` only ever sees `sA` (`sB` doesn't exist yet causally — nothing to do with `hops`). Under `hops=1`, `Q2` is blocked from `sA` AND `sB` directly, relying solely on `sQ1` — computed *before chunk1 even existed*. **This reproduces, from the redesigned mechanism, the exact structural bottleneck already observed empirically**: `hmn_weave_mix_accum_rnn_repeat8`'s persistent weak spot at "op1" (4.2-8.3% match, the one op that stays weak in every pattern) is precisely this case — the first non-exempt op under `hops=1`, structurally starved of any channel to its own chunk's compressed content when the ordering is stream-like. Confirms the redesign doesn't hide or change this known limitation, only removes the redundant pre-filter step around it.
+- **3-query chain** (`E1 Q1 E2 Q2 E3 Q3`) isolates where `hops=1` and `hops=2` actually diverge — identical everywhere except `Q3`'s row (the first op with two distinct priors to bound between): `hops=1` gives `Q3` only `sQ2`; `hops=2` gives `Q3` both `sQ2` AND `sQ1` — a genuine "skip connection" to two hops back, still bounded (unlike `hops=-1`, which would also include every encoding-pass STATE regardless of distance).
+
+**Refine rounds — a real boundary problem found, and why it's refine-only**:
+worked through a hypothetical refine trajectory (ground-truth round-0 feed,
+model's own argmax fed back, a `feedback`-opcode STATE, repeat, final
+update) and found a genuine ambiguity `chunk_positions_traj`'s existing
+design doesn't have: a refine round's argmax feedback (`am`, the model's
+OWN argmax predictions read off the previous round's response logits, per
+`use_actual_argmax=True`) sits directly adjacent to that previous round's
+response (`r`) — BOTH raw byte-range tokens (0-255), with no vocab-level
+or structural cue marking where one ends and the other begins. This is
+NOT the same situation as `E`→STATE or STATE→`warmup` transitions (raw
+bytes vs. STATE-range IDs 259+ are already vocab-distinguishable) — it's
+the one place two *different-role* regions share the *same* token range
+with nothing between them.
+
+**Why this doesn't also apply to encode/query boundaries**: given the
+discipline "always add a trailing `S` after `E` or `Q` unless it's truly
+the last op in the whole trajectory," every op's content is immediately
+followed by a STATE commit (vocab-distinguishable), so two ops' raw
+content is never directly adjacent. Framed precisely: **encode is a
+special case of query** — both are "process content, then commit an
+update to STATE," differing only in that encode's content is pure
+ground-truth (a chunk) while a query's is ground-truth-prefix (`warmup`)
++ free generation (`response`). Refine's `r`→`am` transition is different
+in kind: it happens *inside* one op's own refine elaboration, BEFORE any
+commit — the "always commit before the next thing" discipline doesn't
+protect it, because nothing commits between them.
+
+**Fix, refine-only**: move the `feedback` opcode to PRECEDE the argmax
+content instead of following it — `[r0][OP_F][am0][sF0 sF1][w1][r1]`
+rather than `[r0][am0][OP_F sF0 sF1][w1][r1]`. `OP_F` now announces
+"feedback content starts here" before the ambiguous raw bytes arrive; the
+STATE values (`sF`) still need no separate marker since raw-byte→STATE-ID
+remains vocab-distinguishable on its own. Deliberately scoped to refine
+only — encode/query commit-boundaries stay marker-free by the trailing-`S`
+discipline, not by adding more opcodes.
+
+**Status**: implemented and verified for round-0 (non-refine) — `kvmem/
+hmn_notags.py`'s `chunk_positions_traj` (asserts `n_refine==0`; `S` now
+claims either a pending `E` or a just-finished `Q`, opcode-prefixed
+`1+state_len`-wide STATE blocks), `chunk_mask_fb_traj` (rewritten around a
+single positive `allowed_state`-based allowlist per op instead of the old
+three-part chunk-blackout/nochain-blackout/bottleneck logic — noticeably
+simpler, not just different), `make_batch_tagged`, and `ar_decode_traj_
+nokv` all updated. Directly verified against ALL FOUR hand-derived
+trajectories above (single-recall, batch, stream, 3-query hops=1-vs-2) via
+a standalone script checking exact block-to-block mask permissions — every
+assertion passed, including the subtle `hops=1`-vs-`hops=2` divergence and
+the stream+`hops=1` structural bottleneck reproducing exactly as predicted
+from first principles. Full training smoke-tested clean through
+`hmn_notags_w25.py`'s 4-stage curriculum (updated to `V=271`: 256 bytes +
+3 opcodes + 12 reserved shared STATE values, replacing the old `V=268`
+per-role-family layout) with no errors, and a longer (3000-step, stage0
+only) run confirmed genuine loss decline (5.545→4.655) — gradients flow
+correctly, no structural bug silently preventing learning.
+
+Refine-round support (the `feedback`-opcode-before-content boundary fix
+worked out just above) is NOT implemented — `n_refine>0` still asserts.
+**The originally-discussed "archive `hmn.py` to `hmn_v4_backup.py`,
+promote `hmn_notags.py` to be the new `hmn.py`" step has NOT happened and
+needs explicit reconfirmation before it does** — `hmn_notags.py` only
+ports the `weave_mix` path; `chunk_positions_hop`/`chunk_positions_iq_
+global_rw_tagged`/`chunk_positions_stitch` (the `chain_steps`/`stitch_mix`
+paths) still reference deleted tag constants and would break immediately,
+and a large fraction of the ~25 configs referencing `kvmem.hmn` use those
+paths, not `weave_mix`. Promoting the fork wholesale right now would take
+all of them down.

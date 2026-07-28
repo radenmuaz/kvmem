@@ -1,52 +1,7 @@
 """
-kvmem/hmn.py — HashMemNet (HMN). Single-file consolidated implementation.
-
-CHAT-TAG-FREE by design: no `HMN_SRC_OPEN/CLOSE`, `HMN_QUERY_OPEN/CLOSE`,
-`HMN_RESPONSE_OPEN/CLOSE` boundary-marker tokens are ever emitted into the
-packed sequence. `chunk_positions_traj` places region content back-to-back
-with NO wrapper tokens: an encode ('E') region is exactly `chunk_len` raw
-bytes, a query's round-0 layout is warmup directly followed by response (no
-QUERY_OPEN/CLOSE, no RESPONSE_OPEN/CLOSE), and a refine round's
-argmax-feedback/second-STATE/warmup/response run together the same way.
-**E/S/Q/R region boundaries are INFERRED, not marked** — the only
-structural signal available to the model is byte-content type (raw data
-bytes are 0-255; STATE placeholder IDs are 256+) and relative position.
-This replaced an earlier tagged design (preserved as `hmn_v4_backup.py`,
-see the dated-snapshot table in CLAUDE.md) after a design review found the
-tagged vocab's per-turn STATE role was ambiguous for serial chunk
-ingestion (e.g. `E1 S E2 S Q1 S Q2` — the `S` before `Q2` could be read as
-either an encode-claim or a query-recall STATE with no way to disambiguate
-from token identity alone). Fixed via:
-
-- A factorized **opcode + shared value alphabet** (`HMN_OP_UPDATE`/`_NOOP`/
-  `_FEEDBACK`, `HMN_STATE_0`) — every STATE emission is `[opcode_token,
-  value_0, ..., value_{state_len-1}]`, `V=271` (256 bytes + 3 opcodes + 12
-  reserved shared STATE values).
-- A query's own STATE is no longer a pre-filter register before
-  warmup/response — it's built AFTER (end-of-turn), claimed by an explicit
-  trailing `'S'` in the operations list, and omitted entirely for a
-  terminal query (nothing relays from it, so there's nothing to build —
-  see docs/HISTORY.md §15 for the full derivation, including why this
-  isn't redundant for any op with a successor, and the refine-round
-  argmax/feedback-opcode boundary-fix design that places `OP_FEEDBACK`
-  before the argmax content rather than after).
-
-ALL FOUR stage-dispatch paths use this same mechanism: `weave_mix`
-(`chunk_positions_traj`, native), `chain_steps` (`chunk_positions_hop`, a
-thin wrapper delegating to `chunk_positions_traj`), the legacy global-
-window `traj_mix` path (`chunk_positions_iq_global_rw_tagged`, its own
-port — genuinely different shape, fixed-size sliding window rather than
-"through the end of span"), and `stitch_mix` (`chunk_positions_stitch`,
-its own port — continuous byte-address stitching, not chunk-aligned).
-Each verified individually via direct mask-matrix inspection plus an
-end-to-end train+eval smoke test (see docs/HISTORY.md §15's "Status").
-
-NLL loss covers the warmup region too, not just the response/continuation
-(`rb['w0']:rb['c1']` instead of `rb['c0']:rb['c1']`) — without chat tags
-marking "this is where the query starts," scoring reconstruction of the
-warmup bytes themselves (available as ground truth in the input either
-way) gives the model a training signal for recognizing "I am now in a
-query's warmup region" from content/position alone.
+kvmem/hmn.py — single-file HashMemNet (HMN) training stack: vocab/tag
+constants, position/mask builders, batch filling + AR-decode, model
+architecture, and the training loop.
 
 See docs/HMN_RECIPE.md for a from-scratch walkthrough and docs/HISTORY.md
 for design rationale and prior-mechanism history.
@@ -71,57 +26,42 @@ from kvmem.structured_data import generate_structured_chunks
 
 
 # =============================================================================
-# Vocab / tags — THIS FORK HAS NO CHAT TAGS, AND NO PER-ROLE STATE FAMILIES
+# Vocab / tags
 #
-# Layout: 256 data bytes, then 3 opcode tokens, then a SHARED STATE value
-# alphabet. No HMN_SRC_OPEN/CLOSE/HMN_QUERY_OPEN/CLOSE/HMN_RESPONSE_OPEN/
-# CLOSE (the 6 chat-tag ids hmn.py reserves at 256-261) — chunk_positions_
-# traj never emits them. See docs/HISTORY.md §15 for the full design
-# rationale behind what follows.
-#
-# Every STATE emission (encode-claim, query end-of-turn, refine feedback,
-# bare relay no-op) is now `[opcode_token, value_0, value_1, ..., value_
-# {state_len-1}]` — ONE opcode token marking the ROLE, followed by
-# `state_len` value tokens drawn from a SINGLE SHARED alphabet reused
-# across every role (the opcode alone carries the role distinction now).
-# This replaces hmn.py's per-role token FAMILIES (regular STATE family +
-# a separate feedback_state family, each with its own private
-# state_vocab_size-sized alphabet) — factorizing role from value is
-# cheaper (`3 + state_vocab_size` extra ids instead of `3 * state_vocab_
-# size`) AND lets the model learn what "value 0 vs value 1" means ONCE,
-# shared across every role, instead of relearning it independently per
-# family.
+# Layout: 256 data bytes, then 6 fixed chat-tag ids (256-261), then STATE
+# placeholders (262+) occupying the tail so vocab growth (state_vocab_size)
+# is always a pure tail-append — see docs/HISTORY.md for the pre-reorder
+# scheme this replaced.
 # =============================================================================
 
 DATA_LO = 0x20   # legacy: data restricted to [0x20, 0xFF]
 
-# Opcode tokens — one per STATE emission, marking what role that STATE plays:
-#   update   — ordinary STATE update: an encode's claim, or a query's
-#              end-of-turn STATE built from its own warmup+response.
-#   noop     — pure relay pass-through, nothing new incorporated (rare,
-#              opt-in — e.g. decay_curve-style trajectories; no currently-
-#              implemented trajectory in this fork emits it yet).
-#   feedback — a refine round's post-argmax-feedback STATE (RESERVED —
-#              refine rounds are not yet implemented in this fork; see
-#              docs/HISTORY.md §15's "Status").
-HMN_OP_UPDATE   = 256
-HMN_OP_NOOP     = 257
-HMN_OP_FEEDBACK = 258
+# Generic tag vocabulary, reused identically at every chain step/round — no
+# per-step/per-round variants (turn identity comes from position only).
+HMN_SRC_OPEN       = 256   # <src>
+HMN_SRC_CLOSE      = 257   # </src>
+HMN_QUERY_OPEN     = 258   # <query>
+HMN_QUERY_CLOSE    = 259   # </query>
+HMN_RESPONSE_OPEN  = 260   # <response>
+HMN_RESPONSE_CLOSE = 261   # </response>
 
-# First STATE value id — the shared alphabet, reused regardless of opcode.
-HMN_STATE_0 = 259
+# First STATE placeholder id — everything up to hp['V'] is STATE alphabet.
+HMN_STATE_0 = 262
 
-# 256 bytes + 3 opcodes + 12 reserved STATE value ids (headroom for
-# state_vocab_size growth, same reservation convention hmn.py used for its
-# own V=274 — actual configs use state_vocab_size=2 today).
-HMN_TAG_VOCAB_SIZE = 271
+# 256 bytes + 6 chat tags + 12 reserved STATE ids.
+HMN_TAG_VOCAB_SIZE = 274
 
 
-def _cyclic_state_ids(state_len: int, state_vocab_size: int = 2) -> list[int]:
-    """Cycles through the SHARED value alphabet — no `family` parameter
-    anymore (that's what opcode tokens replace, see module comment above)."""
+def _cyclic_state_ids(state_len: int, state_vocab_size: int = 2, family: int = 0) -> list[int]:
+    # `family` selects which same-size block of the STATE tail to draw from
+    # (family 0 = regular STATE, family 1 = feedback_state's own alphabet).
     assert state_vocab_size >= 1
-    return [HMN_STATE_0 + (i % state_vocab_size) for i in range(state_len)]
+    base = HMN_STATE_0 + family * state_vocab_size
+    return [base + (i % state_vocab_size) for i in range(state_len)]
+
+
+# family index for a refine round's feedback_state alphabet (see _cyclic_state_ids)
+HMN_FEEDBACK_STATE_FAMILY = 1
 
 
 # =============================================================================
@@ -134,41 +74,65 @@ def chunk_positions_iq_global_rw_tagged(n_chunks: int, chunk_len: int, state_len
                                         warmup_x_dist: str = 'uniform',
                                         n_refine: int = 0) -> dict:
     """
-    Returns dict(pos_content=..., pos_mask=..., tags=[], L=...) — REDESIGNED
-    (docs/HISTORY.md §15, opcode/no-chat-tag mechanism). Always exactly ONE
-    global query (round-0 + optional refine rounds) spanning the WHOLE
-    `n_chunks` source but with a FIXED response length
-    (`window_chunks*chunk_len - warmup_len`, a sliding window that can start
-    anywhere in `[0, x_max]` via `warmup_x_fixed`/`warmup_x_dist`) — this is
-    why it's NOT delegated to `chunk_positions_traj` like `chunk_positions_
-    hop` was: that function's out_len is always "through the end of the
-    span," not a fixed window size. Always terminal (nothing ever relays
-    from this — the caller uses the simpler `chunk_mask_fb`, no hops/relay
-    concept applies here at all), so there is no end-of-turn STATE, ever —
-    same principle as any terminal query in chunk_positions_traj.
+    Returns dict(pos_content=..., pos_mask=..., tags=[(position, token_id), ...], L=...).
 
-    Sequence: per chunk k: chunk_k bytes, then STATE (opcode=update). Then
-    round 0: warmup, response, THEN (if n_refine>0) each refine round:
-    [OP_FEEDBACK][argmax feedback][feedback STATE values][re-presented
-    warmup][new response] — same layout/boundary-fix rationale as
-    chunk_positions_traj's refine rounds.
+    Sequence (n_refine=0): per chunk k: <src> chunk_k </src> STATE, then
+    round 0 (initial): STATE <query> warmup </query> <response> out </response>.
+    Each n_refine>0 round appends: state <response> argmax </response>
+    feedback_state <query> warmup </query> <response> out </response>.
     """
     enc_blocks_c: list[dict] = []
     enc_blocks_m: list[dict] = []
-    tags: list[tuple[int, int]] = []  # stays empty — no chat tags in this fork
+    tags: list[tuple[int, int]] = []
     offset = 0
 
     for _ in range(n_chunks):
+        tags.append((offset, HMN_SRC_OPEN)); offset += 1
         s0 = offset; s1 = s0 + chunk_len; offset = s1
-        sl0 = offset; sl1 = sl0 + state_len + 1; offset = sl1  # +1 for the opcode token
+        tags.append((offset, HMN_SRC_CLOSE)); offset += 1
+        sl0 = offset; sl1 = sl0 + state_len; offset = sl1
+
         enc_blocks_c.append(dict(s0=s0, s1=s1, sl0=sl0, sl1=sl1))
-        enc_blocks_m.append(dict(s0=s0, s1=s1, sl0=sl0, sl1=sl1))
+        enc_blocks_m.append(dict(s0=s0 - 1, s1=s1 + 1, sl0=sl0, sl1=sl1))
 
     enc_end = offset
+
     out_len = window_chunks * chunk_len - warmup_len
 
-    w0 = offset; w1 = w0 + warmup_len; offset = w1
-    c0 = offset; c1 = c0 + out_len; offset = c1
+    query_open, query_close = HMN_QUERY_OPEN, HMN_QUERY_CLOSE
+
+    def _emit_round(round_idx: int):
+        # round_idx == 0: STATE + <query>/<response>; round_idx > 0: state +
+        # argmax + feedback_state + <query>/<response> (refine).
+        nonlocal offset
+        if round_idx == 0:
+            sl0 = offset; sl1 = sl0 + state_len; offset = sl1
+            tags.append((offset, query_open)); offset += 1
+            w0 = offset; w1 = w0 + warmup_len; offset = w1
+            tags.append((offset, query_close)); offset += 1
+            tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+            c0 = offset; c1 = c0 + out_len; offset = c1
+            tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+            return (dict(sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1),
+                    dict(sl0=sl0, sl1=sl1, w0=w0 - 1, w1=w1 + 1, c0=c0 - 1, c1=c1 + 1))
+        else:
+            sla0 = offset; sla1 = sla0 + state_len; offset = sla1
+            tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+            am0 = offset; am1 = am0 + out_len; offset = am1
+            tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+            slb0 = offset; slb1 = slb0 + state_len; offset = slb1
+            tags.append((offset, query_open)); offset += 1
+            w0 = offset; w1 = w0 + warmup_len; offset = w1
+            tags.append((offset, query_close)); offset += 1
+            tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+            c0 = offset; c1 = c0 + out_len; offset = c1
+            tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+            c_fields = dict(sla0=sla0, sla1=sla1, am0=am0, am1=am1, slb0=slb0, slb1=slb1,
+                            w0=w0, w1=w1, c0=c0, c1=c1)
+            m_fields = dict(sla0=sla0, sla1=sla1, am0=am0 - 1, am1=am1 + 1,
+                            slb0=slb0, slb1=slb1, w0=w0 - 1, w1=w1 + 1,
+                            c0=c0 - 1, c1=c1 + 1)
+            return c_fields, m_fields
 
     src_len = n_chunks * chunk_len
     x_max = src_len - warmup_len - out_len
@@ -176,31 +140,22 @@ def chunk_positions_iq_global_rw_tagged(n_chunks: int, chunk_len: int, state_len
     eval_offsets = [i * chunk_len for i in range(n_windows)]
     train_range = (warmup_x_fixed, warmup_x_fixed) if warmup_x_fixed is not None else (0, x_max)
     _dist = 'fixed' if warmup_x_fixed is not None else warmup_x_dist
+
+    initial_c, initial_m = _emit_round(0)
     rw_extra = dict(warmup_train_range=train_range, warmup_x_dist=_dist,
                     warmup_valid_offsets=eval_offsets, window_chunks=window_chunks)
-
     rec_blocks_c = [dict(type='initial', span=(0, n_chunks), span_len=src_len,
-                         out_len=out_len, is_clean=(n_refine == 0), op_idx=0,
-                         w0=w0, w1=w1, c0=c0, c1=c1, sl0=None, sl1=None, **rw_extra)]
-    rec_blocks_m = [dict(type='initial', span=(0, n_chunks), op_idx=0,
-                         w0=w0, w1=w1, c0=c0, c1=c1, sl0=None, sl1=None)]
+                         out_len=out_len, is_clean=(n_refine == 0), **initial_c, **rw_extra)]
+    rec_blocks_m = [dict(type='initial', **initial_m)]
 
-    prev_c0 = c0
+    prev_c0_c = initial_c['c0']
     for _ in range(n_refine):
-        opf0 = offset; offset += 1
-        am0 = offset; am1 = am0 + out_len; offset = am1
-        sl0 = offset; sl1 = sl0 + state_len; offset = sl1
-        rw0 = offset; rw1 = rw0 + warmup_len; offset = rw1
-        rc0 = offset; rc1 = rc0 + out_len; offset = rc1
+        refine_c, refine_m = _emit_round(1)
         rec_blocks_c.append(dict(type='refine', span=(0, n_chunks), span_len=src_len,
-                                 out_len=out_len, is_clean=True, op_idx=0,
-                                 opf0=opf0, am0=am0, am1=am1, sl0=sl0, sl1=sl1,
-                                 w0=rw0, w1=rw1, c0=rc0, c1=rc1,
-                                 argmax_src_c0=prev_c0, end_sl0=None, end_sl1=None, **rw_extra))
-        rec_blocks_m.append(dict(type='refine', span=(0, n_chunks), op_idx=0,
-                                 opf0=opf0, am0=am0, am1=am1, sl0=sl0, sl1=sl1,
-                                 w0=rw0, w1=rw1, c0=rc0, c1=rc1, end_sl0=None, end_sl1=None))
-        prev_c0 = rc0
+                                 out_len=out_len, is_clean=True,
+                                 argmax_src_c0=prev_c0_c, **refine_c, **rw_extra))
+        rec_blocks_m.append(dict(type='refine', **refine_m))
+        prev_c0_c = refine_c['c0']
 
     L = offset
 
@@ -218,26 +173,91 @@ def chunk_positions_hop(n_chunks: int, chunk_len: int, state_len: int,
                          warmup_len: int, chain_steps: list[tuple[int, int]],
                          n_refine: int = 2, state_vocab_size: int = 2) -> dict:
     """
-    THIN WRAPPER over `chunk_positions_traj` (docs/HISTORY.md §15) — chain_steps
-    is structurally "encode all n_chunks up front, then query each span in
-    sequence, each one relaying to the next" — exactly `chunk_positions_traj`'s
-    batch-style operations list, with an explicit trailing 'S' after every
-    chain step except the last (which needs no end-of-turn STATE — nothing
-    relays from it, the double-state-redundancy fix). Reuses the already-
-    verified opcode/end-of-turn-STATE mechanism and masking instead of a
-    separate, duplicate implementation — see chunk_positions_traj's own
-    docstring for the layout/opcode details this now shares.
+    Chain steps threaded in sequence, each with its own local round-0(+refine)
+    block. Chain step i's own round-0 STATE region doubles as both its own
+    recall register and the relay source the next chain step reads via a
+    genuine attention permission (see chunk_mask_fb_hop), not a forced copy.
     """
-    ops: list[tuple] = []
-    for i in range(n_chunks):
-        ops.append(('E', i))
-        ops.append(('S', None))
-    for i, span in enumerate(chain_steps):
-        ops.append(('Q', span))
-        if i < len(chain_steps) - 1:  # every step but the last relays forward
-            ops.append(('S', None))
-    return chunk_positions_traj(chunk_len, state_len, warmup_len, ops,
-                                n_refine=n_refine, state_vocab_size=state_vocab_size)
+    enc_blocks_c: list[dict] = []
+    enc_blocks_m: list[dict] = []
+    tags: list[tuple[int, int]] = []
+    offset = 0
+
+    for _ in range(n_chunks):
+        tags.append((offset, HMN_SRC_OPEN)); offset += 1
+        s0 = offset; s1 = s0 + chunk_len; offset = s1
+        tags.append((offset, HMN_SRC_CLOSE)); offset += 1
+        sl0 = offset; sl1 = sl0 + state_len; offset = sl1
+
+        enc_blocks_c.append(dict(s0=s0, s1=s1, sl0=sl0, sl1=sl1))
+        enc_blocks_m.append(dict(s0=s0 - 1, s1=s1 + 1, sl0=sl0, sl1=sl1))
+
+    enc_end = offset
+    rec_blocks_c: list[dict] = []
+    rec_blocks_m: list[dict] = []
+
+    query_open, query_close = HMN_QUERY_OPEN, HMN_QUERY_CLOSE
+
+    for chain_step_i, span in enumerate(chain_steps):
+        span_s, span_e = span
+        span_len = (span_e - span_s) * chunk_len
+        out_len  = span_len - warmup_len
+
+        def _emit_round(round_idx: int):
+            nonlocal offset
+            if round_idx == 0:
+                sl0 = offset; sl1 = sl0 + state_len; offset = sl1
+                tags.append((offset, query_open)); offset += 1
+                w0 = offset; w1 = w0 + warmup_len; offset = w1
+                tags.append((offset, query_close)); offset += 1
+                tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+                c0 = offset; c1 = c0 + out_len; offset = c1
+                tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+                c_fields = dict(sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1)
+                m_fields = dict(sl0=sl0, sl1=sl1, w0=w0 - 1, w1=w1 + 1, c0=c0 - 1, c1=c1 + 1)
+                return c_fields, m_fields
+            else:
+                sla0 = offset; sla1 = sla0 + state_len; offset = sla1
+                tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+                am0 = offset; am1 = am0 + out_len; offset = am1
+                tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+                slb0 = offset; slb1 = slb0 + state_len; offset = slb1
+                tags.append((offset, query_open)); offset += 1
+                w0 = offset; w1 = w0 + warmup_len; offset = w1
+                tags.append((offset, query_close)); offset += 1
+                tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+                c0 = offset; c1 = c0 + out_len; offset = c1
+                tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+                c_fields = dict(sla0=sla0, sla1=sla1, am0=am0, am1=am1, slb0=slb0, slb1=slb1,
+                                w0=w0, w1=w1, c0=c0, c1=c1)
+                m_fields = dict(sla0=sla0, sla1=sla1, am0=am0 - 1, am1=am1 + 1,
+                                slb0=slb0, slb1=slb1, w0=w0 - 1, w1=w1 + 1,
+                                c0=c0 - 1, c1=c1 + 1)
+                return c_fields, m_fields
+
+        initial_c, initial_m = _emit_round(0)
+        rec_blocks_c.append(dict(type='initial', span=span, span_len=span_len,
+                                 out_len=out_len, is_clean=(n_refine == 0),
+                                 warmup_train_range=(0, 0), warmup_x_dist='fixed', **initial_c))
+        rec_blocks_m.append(dict(type='initial', span=span, **initial_m))
+
+        prev_c0_c = initial_c['c0']
+        for _ in range(n_refine):
+            refine_c, refine_m = _emit_round(1)
+            rec_blocks_c.append(dict(type='refine', span=span, span_len=span_len,
+                                     out_len=out_len, is_clean=True,
+                                     argmax_src_c0=prev_c0_c, **refine_c))
+            rec_blocks_m.append(dict(type='refine', span=span, **refine_m))
+            prev_c0_c = refine_c['c0']
+
+    L = offset
+
+    pos_content = dict(enc_blocks=enc_blocks_c, rec_blocks=rec_blocks_c,
+                       enc_end=enc_end, warmup_len=warmup_len, L=L)
+    pos_mask = dict(enc_blocks=enc_blocks_m, rec_blocks=rec_blocks_m,
+                    enc_end=enc_end, warmup_len=warmup_len, L=L)
+
+    return dict(pos_content=pos_content, pos_mask=pos_mask, tags=tags, L=L)
 
 
 def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
@@ -249,51 +269,17 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
     interleave-delayed, repeat-query, ...) is just a different `operations`
     list fed to this same function.
 
-    REDESIGNED (see docs/HISTORY.md §15 for the full derivation) — every
-    STATE emission (encode-claim, query end-of-turn, bare no-op relay hop)
-    is now `[opcode_token, value_0, ..., value_{state_len-1}]`: ONE opcode
-    token (HMN_OP_UPDATE/NOOP/FEEDBACK) marking the ROLE, then `state_len`
-    value tokens from a SHARED alphabet. `sl0:sl1` below spans the WHOLE
-    block (opcode + values), size `1+state_len` — chosen deliberately so
-    every existing mask-rule reference to `sl0:sl1` keeps working
-    unchanged, just one token wider.
-
-    A query's own STATE is no longer emitted BEFORE its warmup/response —
-    warmup/response now attend DIRECTLY to whatever `hops` makes available
-    (no intermediate pre-filter register). A query's end-of-turn STATE
-    (built from warmup+response, needed ONLY if a later op will relay from
-    it) is emitted AFTER, claimed by an explicit trailing 'S' — exactly the
-    same claim mechanism 'S' already uses for a pending 'E'. A terminal
-    query (nothing relays from it) simply has no trailing 'S' and gets no
-    STATE of its own at all — see the double-state-redundancy derivation
-    in docs/HISTORY.md §15.
-
     operations: list of ops, each one of:
-      ('E', chunk_idx)        — ingest chunk_idx's raw bytes only. Must be
-                                immediately followed by ('S', None) to claim it.
-      ('S', None)              — claims, in priority order: (1) an immediately-
-                                preceding unclaimed 'E' (encode-claim STATE,
-                                opcode=update), (2) an immediately-preceding
-                                just-finished 'Q' with no STATE of its own yet
-                                (query's end-of-turn STATE, opcode=update),
-                                (3) otherwise a bare relay-only no-op hop
-                                (opcode=noop, blocked from all raw chunks, no
-                                local recall target).
-      ('Q', (span_s, span_e))  — query/recall chunks [span_s, span_e); emits
-                                ONLY warmup+response, no STATE (see above).
-                                Every chunk in the span must already be
-                                encoded (causal requirement, asserted below).
-
-    n_refine>0: each refine round is `[OP_FEEDBACK][argmax feedback, out_len
-    raw bytes][feedback STATE values][re-presented warmup][new response]` —
-    see docs/HISTORY.md §15's refine-trajectory + boundary-fix derivation
-    for why OP_FEEDBACK precedes the argmax content specifically (argmax
-    feedback and the previous round's response are both raw byte-range
-    tokens with no other structural cue marking the boundary between them).
-    A refine round's `sl0/sl1` are ALWAYS its feedback STATE values (not
-    optional) — a separate `end_sl0/end_sl1` holds the OPTIONAL end-of-turn
-    STATE, claimable by a trailing 'S' only on the last round emitted for
-    this op (same terminal-op-omission rule as round-0-only queries).
+      ('E', chunk_idx)        — ingest chunk_idx's raw bytes only (<src>...</src>).
+                                Must be immediately followed by ('S', None).
+      ('S', None)              — emit one STATE region. Claims the immediately
+                                preceding unclaimed 'E' (that chunk's own
+                                encoding-STATE) if there is one; otherwise a
+                                bare relay-only no-op hop (blocked from all raw
+                                chunks, no local recall target).
+      ('Q', (span_s, span_e))  — query/recall chunks [span_s, span_e). Every
+                                chunk in the span must already be encoded
+                                (causal requirement, asserted below).
 
     Relay: same single-hop STATE-to-STATE attention permission as
     chunk_positions_hop (see chunk_mask_fb_traj), grouped by op_idx instead of
@@ -304,27 +290,16 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
     """
     enc_blocks_c: dict[int, dict] = {}
     enc_blocks_m: dict[int, dict] = {}
-    tags: list[tuple[int, int]] = []  # stays empty in this fork — no chat tags ever emitted
+    tags: list[tuple[int, int]] = []
     offset = 0
+
+    query_open, query_close = HMN_QUERY_OPEN, HMN_QUERY_CLOSE
 
     rec_blocks_c: list[dict] = []
     rec_blocks_m: list[dict] = []
     op_count = 0  # counts 'Q' ops AND bare 'S' ops — both produce a relay-eligible STATE
 
-    pending_chunk_idx: int | None = None   # unclaimed 'E' waiting for its 'S'
-    pending_query_i: int | None = None     # index into rec_blocks_c of a just-finished
-                                            # 'Q' still eligible to be claimed by a trailing 'S'
-
-    def _emit_state_block(opcode: int):
-        """[opcode_token, value_0, ..., value_{state_len-1}] — returns (sl0, sl1)
-        spanning the WHOLE block (opcode included) so every mask rule below
-        can keep treating `sl0:sl1` as one contiguous STATE region."""
-        nonlocal offset
-        sl0 = offset
-        offset += 1  # opcode token position, filled by make_batch_tagged/decode with `opcode`
-        offset += state_len  # value token positions, cyclic shared alphabet
-        sl1 = offset
-        return sl0, sl1
+    pending_chunk_idx: int | None = None  # unclaimed 'E' waiting for its 'S'
 
     for op, arg in operations:
         if op == 'E':
@@ -332,52 +307,32 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
             assert chunk_idx not in enc_blocks_c, f'chunk {chunk_idx} encoded twice'
             assert pending_chunk_idx is None, \
                 f"chunk {pending_chunk_idx}'s 'E' was never followed by 'S' before chunk {chunk_idx}'s 'E'"
-            # No HMN_SRC_OPEN/CLOSE wrapper — the chunk_len raw bytes sit directly at
-            # `offset`, back-to-back with whatever preceded them. Boundary inferred.
+            tags.append((offset, HMN_SRC_OPEN)); offset += 1
             s0 = offset; s1 = s0 + chunk_len; offset = s1
+            tags.append((offset, HMN_SRC_CLOSE)); offset += 1
             enc_blocks_c[chunk_idx] = dict(s0=s0, s1=s1)  # sl0/sl1 filled in when 'S' claims it, below
-            enc_blocks_m[chunk_idx] = dict(s0=s0, s1=s1)  # no ±1 padding — no flanking tag to include
+            enc_blocks_m[chunk_idx] = dict(s0=s0 - 1, s1=s1 + 1)
             pending_chunk_idx = chunk_idx
 
         elif op == 'S':
+            sl0 = offset; sl1 = sl0 + state_len; offset = sl1
             if pending_chunk_idx is not None:
                 # Claims the immediately-preceding unclaimed 'E' — this IS
                 # that chunk's own encoding-STATE (encoding isolation role),
                 # NOT part of the single-hop relay chain (same as the shared
                 # encoding pass always was — see chunk_mask_fb_traj's
                 # encoding-isolation handling, unchanged).
-                sl0, sl1 = _emit_state_block(HMN_OP_UPDATE)
                 enc_blocks_c[pending_chunk_idx]['sl0'] = sl0
                 enc_blocks_c[pending_chunk_idx]['sl1'] = sl1
                 enc_blocks_m[pending_chunk_idx]['sl0'] = sl0
                 enc_blocks_m[pending_chunk_idx]['sl1'] = sl1
                 pending_chunk_idx = None
-            elif pending_query_i is not None:
-                # Claims the just-finished 'Q' (or its last refine round) — its
-                # END-OF-TURN STATE, built from whatever the relay/hops window
-                # made available to its warmup+response PLUS its own warmup+
-                # response content (see docs/HISTORY.md §15). Needed only when a
-                # LATER op will relay from it — a terminal query has no trailing
-                # 'S' and simply never gets one (the double-state-redundancy
-                # fix). 'initial' type stores this in sl0/sl1 (never otherwise
-                # used, since round-0-only queries have no feedback values);
-                # 'refine' type stores it in end_sl0/end_sl1 (sl0/sl1 on a
-                # refine block always holds that round's feedback STATE values).
-                sl0, sl1 = _emit_state_block(HMN_OP_UPDATE)
-                claimed_type = rec_blocks_c[pending_query_i]['type']
-                key0, key1 = ('sl0', 'sl1') if claimed_type == 'initial' else ('end_sl0', 'end_sl1')
-                rec_blocks_c[pending_query_i][key0] = sl0
-                rec_blocks_c[pending_query_i][key1] = sl1
-                rec_blocks_m[pending_query_i][key0] = sl0
-                rec_blocks_m[pending_query_i][key1] = sl1
-                pending_query_i = None
             else:
-                # Bare 'S' — no immediately-preceding unclaimed 'E' or 'Q' —
-                # this is a relay-only no-op hop (formerly a separate 'N' op
-                # type). Same relay-read permission as a claimed STATE (see
+                # Bare 'S' — no immediately-preceding unclaimed 'E' — this is
+                # a relay-only no-op hop (formerly a separate 'N' op type).
+                # Same relay-read permission as a 'Q' op's STATE row (see
                 # chunk_mask_fb_traj) but no local recall bottleneck rules
                 # (nothing to bound a warmup/response region around).
-                sl0, sl1 = _emit_state_block(HMN_OP_NOOP)
                 op_idx = op_count
                 op_count += 1
                 rec_blocks_c.append(dict(type='noop', span=None, is_clean=False,
@@ -406,63 +361,60 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
             op_idx = op_count
             op_count += 1
 
-            # No pre-filter STATE — warmup/response sit directly at `offset`,
-            # attending straight to whatever chunk_mask_fb_traj's hops-permitted
-            # sources allow (see module docstring / docs/HISTORY.md §15).
-            w0 = offset; w1 = w0 + warmup_len; offset = w1
-            c0 = offset; c1 = c0 + out_len; offset = c1
+            def _emit_round(round_idx: int):
+                nonlocal offset
+                if round_idx == 0:
+                    sl0 = offset; sl1 = sl0 + state_len; offset = sl1
+                    tags.append((offset, query_open)); offset += 1
+                    w0 = offset; w1 = w0 + warmup_len; offset = w1
+                    tags.append((offset, query_close)); offset += 1
+                    tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+                    c0 = offset; c1 = c0 + out_len; offset = c1
+                    tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+                    c_fields = dict(sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1)
+                    m_fields = dict(sl0=sl0, sl1=sl1, w0=w0 - 1, w1=w1 + 1, c0=c0 - 1, c1=c1 + 1)
+                    return c_fields, m_fields
+                else:
+                    sla0 = offset; sla1 = sla0 + state_len; offset = sla1
+                    tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+                    am0 = offset; am1 = am0 + out_len; offset = am1
+                    tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+                    slb0 = offset; slb1 = slb0 + state_len; offset = slb1
+                    tags.append((offset, query_open)); offset += 1
+                    w0 = offset; w1 = w0 + warmup_len; offset = w1
+                    tags.append((offset, query_close)); offset += 1
+                    tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
+                    c0 = offset; c1 = c0 + out_len; offset = c1
+                    tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
+                    c_fields = dict(sla0=sla0, sla1=sla1, am0=am0, am1=am1, slb0=slb0, slb1=slb1,
+                                    w0=w0, w1=w1, c0=c0, c1=c1)
+                    m_fields = dict(sla0=sla0, sla1=sla1, am0=am0 - 1, am1=am1 + 1,
+                                    slb0=slb0, slb1=slb1, w0=w0 - 1, w1=w1 + 1,
+                                    c0=c0 - 1, c1=c1 + 1)
+                    return c_fields, m_fields
 
-            rw_extra = dict(warmup_start=warmup_start,
-                            # (warmup_start, warmup_start) — a degenerate single-value range —
-                            # reuses make_batch_tagged's existing rw_xs mechanism to
-                            # deterministically place the warmup/query excerpt at warmup_start
-                            # rather than always byte 0, with no new batch-filling code needed.
-                            # warmup_x_dist stays 'fixed' (rng.integers(x,x+1) always returns x).
-                            warmup_train_range=(warmup_start, warmup_start), warmup_x_dist='fixed')
+            initial_c, initial_m = _emit_round(0)
             rec_blocks_c.append(dict(type='initial', span=(span_s, span_e), span_len=span_len,
                                      out_len=out_len, is_clean=(n_refine == 0), op_idx=op_idx,
-                                     w0=w0, w1=w1, c0=c0, c1=c1,
-                                     sl0=None, sl1=None,  # filled in IF a trailing 'S' claims this
-                                                          # Q AND n_refine==0 (no refine rounds follow)
-                                     **rw_extra))
-            rec_blocks_m.append(dict(type='initial', span=(span_s, span_e), op_idx=op_idx,
-                                     w0=w0, w1=w1, c0=c0, c1=c1, sl0=None, sl1=None))
-            pending_query_i = len(rec_blocks_c) - 1
+                                     warmup_start=warmup_start,
+                                     # (warmup_start, warmup_start) — a degenerate single-value
+                                     # range — reuses make_batch_tagged's existing rw_xs
+                                     # mechanism to deterministically place the warmup/query
+                                     # excerpt at warmup_start rather than always byte 0, with
+                                     # no new batch-filling code needed. warmup_x_dist stays
+                                     # 'fixed' (rng.integers(x,x+1) always returns x anyway).
+                                     warmup_train_range=(warmup_start, warmup_start),
+                                     warmup_x_dist='fixed', **initial_c))
+            rec_blocks_m.append(dict(type='initial', span=(span_s, span_e), op_idx=op_idx, **initial_m))
 
-            # Refine rounds (docs/HISTORY.md §15's refine-trajectory + boundary-fix
-            # derivation): each round is [OP_FEEDBACK][argmax feedback, out_len raw
-            # bytes][feedback STATE values][re-presented warmup][new response]. OP_F
-            # precedes the argmax content specifically because argmax feedback and
-            # the previous round's response are BOTH raw byte-range tokens with
-            # nothing else marking the boundary between them (unlike E->STATE or
-            # STATE->warmup, which are already vocab-distinguishable) — see the
-            # "boundary problem" discussion in docs/HISTORY.md §15. The feedback
-            # STATE values themselves need no separate marker (raw-byte->STATE-ID
-            # is already vocab-distinguishable). `sl0/sl1` here are ALWAYS the
-            # feedback values (not optional, unlike 'initial' type) — a genuinely
-            # separate `end_sl0/end_sl1` holds the optional end-of-turn STATE,
-            # claimable by a trailing 'S' only on the LAST round emitted.
-            prev_c0 = c0
+            prev_c0_c = initial_c['c0']
             for _ in range(n_refine):
-                opf0 = offset; offset += 1
-                am0 = offset; am1 = am0 + out_len; offset = am1
-                sl0 = offset; sl1 = sl0 + state_len; offset = sl1
-                rw0 = offset; rw1 = rw0 + warmup_len; offset = rw1
-                rc0 = offset; rc1 = rc0 + out_len; offset = rc1
+                refine_c, refine_m = _emit_round(1)
                 rec_blocks_c.append(dict(type='refine', span=(span_s, span_e), span_len=span_len,
                                          out_len=out_len, is_clean=True, op_idx=op_idx,
-                                         opf0=opf0, am0=am0, am1=am1, sl0=sl0, sl1=sl1,
-                                         w0=rw0, w1=rw1, c0=rc0, c1=rc1,
-                                         argmax_src_c0=prev_c0,
-                                         end_sl0=None, end_sl1=None,  # filled in IF a trailing
-                                                                      # 'S' claims THIS round
-                                         **rw_extra))
-                rec_blocks_m.append(dict(type='refine', span=(span_s, span_e), op_idx=op_idx,
-                                         opf0=opf0, am0=am0, am1=am1, sl0=sl0, sl1=sl1,
-                                         w0=rw0, w1=rw1, c0=rc0, c1=rc1,
-                                         end_sl0=None, end_sl1=None))
-                prev_c0 = rc0
-                pending_query_i = len(rec_blocks_c) - 1
+                                         argmax_src_c0=prev_c0_c, **refine_c))
+                rec_blocks_m.append(dict(type='refine', span=(span_s, span_e), op_idx=op_idx, **refine_m))
+                prev_c0_c = refine_c['c0']
 
     assert pending_chunk_idx is None, \
         f"chunk {pending_chunk_idx}'s 'E' was never followed by 'S' — every 'E' needs an 'S' right after it"
@@ -607,18 +559,11 @@ def chunk_positions_stitch(chunk_len: int, n_chunks: int, state_len: int,
     ground truth) rather than chunk_positions_traj's fresh-ground-truth-
     per-window recall.
 
-    REDESIGNED (docs/HISTORY.md §15, opcode/no-chat-tag/end-of-turn-STATE
-    mechanism) — reuses the same generic rec_block shape (type/op_idx/
-    sl0.../c0/c1) `chunk_positions_traj` uses, so `chunk_mask_fb_traj` (keys
-    off op_idx, not span) works unchanged. `src0` (absolute byte offset
-    into the source) replaces `span` — a chunk-index tuple doesn't apply
-    here since windows aren't chunk-aligned. Every query EXCEPT THE LAST
-    gets an end-of-turn STATE (opcode=update, claimed implicitly here since
-    every non-final query always needs one — the stitch chain's whole
-    continuity mechanism depends on the relay, unlike chunk_positions_traj's
-    general case where it's conditional on an explicit trailing 'S'); the
-    final query is terminal, no end-of-turn STATE (same double-state-
-    redundancy rule as everywhere else).
+    Reuses the same generic rec_block shape (type/op_idx/sl0.../c0/c1) as
+    chunk_positions_traj, so chunk_mask_fb_traj (keys off op_idx, not
+    span) and _forward_segmented/_iter_forward_segments work unchanged.
+    `src0` (absolute byte offset into the source) replaces `span` — a
+    chunk-index tuple doesn't apply here since windows aren't chunk-aligned.
 
     `src_stride` need not evenly divide `(src_len - warmup_len)` — the
     LAST query's response is simply clipped shorter than `src_stride` so
@@ -639,33 +584,36 @@ def chunk_positions_stitch(chunk_len: int, n_chunks: int, state_len: int,
 
     enc_blocks_c: list[dict] = []
     enc_blocks_m: list[dict] = []
-    tags: list[tuple[int, int]] = []  # stays empty — no chat tags in this fork
+    tags: list[tuple[int, int]] = []
     offset = 0
     for _ in range(n_chunks):
+        tags.append((offset, HMN_SRC_OPEN)); offset += 1
         s0 = offset; s1 = s0 + chunk_len; offset = s1
-        sl0 = offset; sl1 = sl0 + state_len + 1; offset = sl1  # +1 for the opcode token
+        tags.append((offset, HMN_SRC_CLOSE)); offset += 1
+        sl0 = offset; sl1 = sl0 + state_len; offset = sl1
         enc_blocks_c.append(dict(s0=s0, s1=s1, sl0=sl0, sl1=sl1))
-        enc_blocks_m.append(dict(s0=s0, s1=s1, sl0=sl0, sl1=sl1))
+        enc_blocks_m.append(dict(s0=s0 - 1, s1=s1 + 1, sl0=sl0, sl1=sl1))
     enc_end = offset
 
+    query_open, query_close = HMN_QUERY_OPEN, HMN_QUERY_CLOSE
     rec_blocks_c: list[dict] = []
     rec_blocks_m: list[dict] = []
     for i in range(n_queries):
         src0 = i * src_stride
         out_len = min(src_stride, src_len - warmup_len - src0)  # last query clipped to land exactly on src_len
         assert out_len > 0
+        sl0 = offset; sl1 = sl0 + state_len; offset = sl1
+        tags.append((offset, query_open)); offset += 1
         w0 = offset; w1 = w0 + warmup_len; offset = w1
+        tags.append((offset, query_close)); offset += 1
+        tags.append((offset, HMN_RESPONSE_OPEN)); offset += 1
         c0 = offset; c1 = c0 + out_len; offset = c1
-        is_last = (i == n_queries - 1)
-        if is_last:
-            sl0 = sl1 = None
-        else:
-            sl0 = offset; offset += 1; offset += state_len; sl1 = offset
+        tags.append((offset, HMN_RESPONSE_CLOSE)); offset += 1
         rec_blocks_c.append(dict(type='initial', src0=src0, out_len=out_len,
                                  is_clean=True, op_idx=i,
                                  sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1))
         rec_blocks_m.append(dict(type='initial', op_idx=i,
-                                 sl0=sl0, sl1=sl1, w0=w0, w1=w1, c0=c0, c1=c1))
+                                 sl0=sl0, sl1=sl1, w0=w0 - 1, w1=w1 + 1, c0=c0 - 1, c1=c1 + 1))
 
     L = offset
     pos_content = dict(enc_blocks=enc_blocks_c, rec_blocks=rec_blocks_c,
@@ -677,20 +625,10 @@ def chunk_positions_stitch(chunk_len: int, n_chunks: int, state_len: int,
 
 def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
     """
-    Mask for chunk_positions_traj layouts (REDESIGNED — see docs/HISTORY.md
-    §15). No pre-filter STATE row anymore: warmup/response attend DIRECTLY
-    to whatever `hops` makes available, via one positive allowlist ("own"
-    set) instead of the old three-part chunk-blackout + nochain-blackout +
-    bottleneck logic — a row is allowed to see its own local content
-    (warmup/response, or the sources an end-of-turn STATE was built from)
-    PLUS `allowed_state` (below), and blocked from everything else by
-    construction (raw chunks and other ops' content are simply never IN
-    the allowlist, no separate blocking rule needed for them). `hops`
-    semantics unchanged: op_idx==0 is always exempt (entry point, same role
-    as an RNN's h_0=f(x_0)); hops=-1 gives every op permanent access to all
-    encoding-pass STATE PLUS the union of every earlier op's own STATE;
-    hops>=1 blocks encoding-pass access for op_idx>0, leaving the bounded
-    N-op relay window as the ONLY channel.
+    Mask for chunk_positions_traj layouts — same relay exception as
+    chunk_mask_fb_hop, but grouped by `op_idx` instead of chain-step span
+    since the same span can recur (repeat-query). `hops` semantics identical
+    to chunk_mask_fb_hop's, with "the first" meaning op_idx==0.
     """
     if hops == 0:
         raise ValueError("hops=0 is invalid — use hops=-1 for unbounded "
@@ -705,30 +643,27 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
     enc_blocks = pos['enc_blocks']
     rec_blocks = pos['rec_blocks']
 
+    is_any_chunk = np.zeros(L, dtype=bool)
+    for b in enc_blocks:
+        is_any_chunk |= (c >= b['s0']) & (c < b['s1'])
+
     is_any_enc_state = np.zeros(L, dtype=bool)
     for b in enc_blocks:
         is_any_enc_state |= (c >= b['sl0']) & (c < b['sl1'])
 
+    is_any_rec_output = np.zeros(L, dtype=bool)
+    for rb2 in rec_blocks:
+        if 'c0' in rb2:  # 'noop' blocks have no output region
+            is_any_rec_output |= (c >= rb2['c0']) & (c < rb2['c1'])
+
     last_rb_of_op: dict[int, int] = {}
-    op_first_w0: dict[int, int] = {}  # each op's FIRST (round-0) w0 — see 'refine' handling below
     for i_rb, rb in enumerate(rec_blocks):
         last_rb_of_op[rb['op_idx']] = i_rb  # last write wins -> last rec_block per relay-producing op
-        if rb['type'] == 'initial':
-            op_first_w0[rb['op_idx']] = rb['w0']
 
     def _relay_source(prev_rb: dict) -> tuple[int, int]:
-        # 'noop' type always has a real STATE in sl0/sl1 (never optional — a
-        # bare relay hop always produces one). 'initial' type stores its
-        # (optional) end-of-turn STATE in sl0/sl1 too (never otherwise used
-        # by that type). 'refine' type's sl0/sl1 always holds that round's
-        # feedback STATE values, so its end-of-turn STATE (if any) lives in
-        # the separate end_sl0/end_sl1 fields instead.
-        key0, key1 = ('sl0', 'sl1') if prev_rb['type'] in ('initial', 'noop') else ('end_sl0', 'end_sl1')
-        assert prev_rb[key0] is not None, (
-            f"op_idx={prev_rb['op_idx']} has no end-of-turn STATE (terminal — no trailing "
-            f"'S' claimed it) but a later op is trying to relay from it. Fix the operations "
-            f"list: add an 'S' right after this op if anything downstream needs to relay from it.")
-        return prev_rb[key0], prev_rb[key1]
+        if prev_rb['type'] == 'initial' or prev_rb['type'] == 'noop':
+            return prev_rb['sl0'], prev_rb['sl1']
+        return prev_rb['slb0'], prev_rb['slb1']
 
     def _relay_ranges(op_idx: int) -> list[tuple[int, int]]:
         back_range = range(1, op_idx + 1) if hops == -1 else range(1, hops + 1)
@@ -740,93 +675,78 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
             ranges.append(_relay_source(rec_blocks[last_rb_of_op[src_op]]))
         return ranges
 
-    def _allowed_state(op_idx: int) -> np.ndarray:
-        """The STATE positions this op's warmup/response/end-of-turn-STATE
-        are allowed to attend to directly — permanent encoding-pass access
-        if op_idx==0 (entry point) or hops==-1 (unbounded/routing), PLUS
-        the relay window for op_idx>0 under any hops setting."""
-        allowed = np.zeros(L, dtype=bool)
-        if op_idx == 0 or hops == -1:
-            allowed |= is_any_enc_state
-        if op_idx > 0:
-            for lo, hi in _relay_ranges(op_idx):
-                allowed |= (c >= lo) & (c < hi)
-        return allowed
+    def _prior_blocked_union(i_rb: int) -> np.ndarray:
+        prior_all = np.zeros(L, dtype=bool)
+        for prev_rb in rec_blocks[:i_rb]:
+            if prev_rb['type'] == 'noop':
+                prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
+            elif prev_rb['type'] == 'initial':
+                prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
+                prior_all |= (c >= prev_rb['w0'])  & (c < prev_rb['w1'])
+                prior_all |= (c >= prev_rb['c0'])  & (c < prev_rb['c1'])
+            else:  # 'refine'
+                prior_all |= (c >= prev_rb['sla0']) & (c < prev_rb['sla1'])
+                prior_all |= (c >= prev_rb['am0'])  & (c < prev_rb['am1'])
+                prior_all |= (c >= prev_rb['slb0']) & (c < prev_rb['slb1'])
+                prior_all |= (c >= prev_rb['w0'])   & (c < prev_rb['w1'])
+                prior_all |= (c >= prev_rb['c0'])   & (c < prev_rb['c1'])
+        return prior_all
 
-    # Encoding isolation: an encode chunk's claim-STATE blocked from every
-    # OTHER chunk's raw bytes directly (unchanged from before the redesign).
     for k, b in enumerate(enc_blocks):
         sl_row = (r >= b['sl0']) & (r < b['sl1'])
         for j, bj in enumerate(enc_blocks):
             if j == k: continue
             blocked |= sl_row[:, None] & ((c >= bj['s0']) & (c < bj['s1']))[None, :]
 
-    for rb in rec_blocks:
-        allowed_state = _allowed_state(rb['op_idx'])
-
+    for i_rb, rb in enumerate(rec_blocks):
         if rb['type'] == 'noop':
-            # No local content — purely a relay pass-through, "own" is just
-            # whatever the relay/permanent-access rule permits.
             sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
-            blocked |= sl_row[:, None] & ~allowed_state[None, :]
-            continue
+            blocked |= sl_row[:, None] & is_any_chunk[None, :]
+            if hops >= 1 and rb['op_idx'] > 0:
+                blocked |= sl_row[:, None] & is_any_enc_state[None, :]
 
-        if rb['type'] != 'initial':
-            continue  # 'refine' handled entirely in its own loop below
+            prior_all = _prior_blocked_union(i_rb)
+            for lo, hi in _relay_ranges(rb['op_idx']):
+                prior_all = prior_all & ~((c >= lo) & (c < hi))
+            blocked |= sl_row[:, None] & prior_all[None, :]
+            # a no-op has no warmup/response fields to bound
 
-        # type == 'initial': warmup/response attend directly to allowed_state +
-        # their own local content — no intermediate pre-filter STATE row anymore.
-        if rb['w0'] < rb['w1']:
-            wm_row = (r >= rb['w0']) & (r < rb['w1'])
-            own = allowed_state | (c >= rb['w0']) & (c < rb['w1'])
-            blocked |= wm_row[:, None] & ~own[None, :]
-        out_row = (r >= rb['c0']) & (r < rb['c1'])
-        own = (allowed_state |
-               (c >= rb['w0']) & (c < rb['w1']) |
-               (c >= rb['c0']) & (c < rb['c1']))
-        blocked |= out_row[:, None] & ~own[None, :]
-
-        if rb['sl0'] is not None:
-            # This op has an end-of-turn STATE (non-terminal — a later op will
-            # relay from it) — built from allowed_state + its OWN warmup+response.
+        elif rb['type'] == 'initial':
             sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
-            own_end = (allowed_state |
-                      (c >= rb['w0']) & (c < rb['w1']) |
-                      (c >= rb['c0']) & (c < rb['c1']))
-            blocked |= sl_row[:, None] & ~own_end[None, :]
+            blocked |= sl_row[:, None] & is_any_chunk[None, :]
+            if hops >= 1 and rb['op_idx'] > 0:
+                blocked |= sl_row[:, None] & is_any_enc_state[None, :]
 
-    # 'refine' type: no nochain-blackout needed WITHIN one op's own rounds
-    # (they're all internal elaboration of the SAME op, not a boundary
-    # between different ops — see docs/HISTORY.md §15) — every row here is
-    # simply allowed to see allowed_state PLUS everything this op has done
-    # so far (from its round-0 w0 onward; causal already caps at the row's
-    # own position, so this can never leak into a DIFFERENT op's content,
-    # since no other op's positions fall inside [op_start, r] for r within
-    # this op's own span).
-    for rb in rec_blocks:
-        if rb['type'] != 'refine':
-            continue
-        allowed_state = _allowed_state(rb['op_idx'])
-        own = allowed_state | (c >= op_first_w0[rb['op_idx']])
+            prior_all = _prior_blocked_union(i_rb)
+            for lo, hi in _relay_ranges(rb['op_idx']):
+                prior_all = prior_all & ~((c >= lo) & (c < hi))
+            blocked |= sl_row[:, None] & prior_all[None, :]
 
-        # OP_FEEDBACK + argmax content treated as one contiguous block for
-        # masking purposes (see the boundary-fix rationale in the module's
-        # refine docstring above).
-        am_row = (r >= rb['opf0']) & (r < rb['am1'])
-        blocked |= am_row[:, None] & ~own[None, :]
+            if rb['w0'] < rb['w1']:
+                wm_row = (r >= rb['w0']) & (r < rb['w1'])
+                own = (c >= rb['sl0']) & (c < rb['sl1']) | (c >= rb['w0']) & (c < rb['w1'])
+                blocked |= wm_row[:, None] & ~own[None, :]
+            out_row = (r >= rb['c0']) & (r < rb['c1'])
+            own = ((c >= rb['sl0']) & (c < rb['sl1']) |
+                   (c >= rb['w0'])  & (c < rb['w1'])  |
+                   (c >= rb['c0'])  & (c < rb['c1']))
+            blocked |= out_row[:, None] & ~own[None, :]
 
-        sl_row = (r >= rb['sl0']) & (r < rb['sl1'])  # feedback STATE values
-        blocked |= sl_row[:, None] & ~own[None, :]
+        else:  # type == 'refine'
+            sla_row = (r >= rb['sla0']) & (r < rb['sla1'])
+            am_row  = (r >= rb['am0'])  & (r < rb['am1'])
+            slb_row = (r >= rb['slb0']) & (r < rb['slb1'])
+            blocked |= (sla_row | am_row | slb_row)[:, None] & (is_any_chunk | is_any_rec_output)[None, :]
 
-        if rb['w0'] < rb['w1']:
-            wm_row = (r >= rb['w0']) & (r < rb['w1'])
-            blocked |= wm_row[:, None] & ~own[None, :]
-        out_row = (r >= rb['c0']) & (r < rb['c1'])
-        blocked |= out_row[:, None] & ~own[None, :]
-
-        if rb['end_sl0'] is not None:  # optional end-of-turn STATE (last round only)
-            end_row = (r >= rb['end_sl0']) & (r < rb['end_sl1'])
-            blocked |= end_row[:, None] & ~own[None, :]
+            wm_row  = (r >= rb['w0'])  & (r < rb['w1'])
+            out_row = (r >= rb['c0'])  & (r < rb['c1'])
+            own_slb = (c >= rb['slb0']) & (c < rb['slb1'])
+            own_wm  = (c >= rb['w0'])   & (c < rb['w1'])
+            own_out = (c >= rb['c0'])   & (c < rb['c1'])
+            allowed = own_slb | own_wm | own_out
+            if rb['w0'] < rb['w1']:
+                blocked |= wm_row[:, None] & ~(own_slb | own_wm)[None, :]
+            blocked |= out_row[:, None] & ~allowed[None, :]
 
     visible = causal & ~blocked
     return np.where(visible, 0.0, -1e9).astype(np.float32)
@@ -840,35 +760,25 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def traj_batch(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
-    # 'S' after every Q but the last — each query but the final one needs an
-    # end-of-turn STATE for the NEXT query to relay from (docs/HISTORY.md
-    # §15's double-state-redundancy rule: terminal query only, not every
-    # query, gets to skip its own STATE). Missing this means chunk_mask_fb_
-    # traj's relay lookup raises for op_idx>0 the moment there's more than
-    # one query — caught by a smoke test of this exact function before
-    # trusting the redesign with multi-query configs.
-    q_strs = [f'Q({i},{i + window_chunks})' for i in range(n_chunks - window_chunks + 1)]
-    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} ' + ' S '.join(q_strs))
+    spans = ' '.join(f'Q({i},{i + window_chunks})' for i in range(n_chunks - window_chunks + 1))
+    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} {spans}')
     return ops
 
 
 def traj_stream(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     dsl_parts = [f'E{window_chunks}']
-    n_q = n_chunks - window_chunks + 1
-    for i in range(n_q):
+    for i in range(n_chunks - window_chunks + 1):
         if i > 0:
             dsl_parts.append('E')
         dsl_parts.append(f'Q({i},{i + window_chunks})')
-        if i < n_q - 1:  # every query but the last needs an end-of-turn STATE
-            dsl_parts.append('S')
     ops, _, _, _, _ = parse_traj_dsl(' '.join(dsl_parts))
     return ops
 
 
 def traj_interleave_delayed(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
-    q_strs = [f'Q({s},{e})' for s, e in reversed(spans)]  # query last span first
-    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} ' + ' S '.join(q_strs))
+    q_str = ' '.join(f'Q({s},{e})' for s, e in reversed(spans))  # query last span first
+    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} {q_str}')
     return ops
 
 
@@ -913,10 +823,9 @@ def traj_locate_and_continue(chunk_len: int, query_start: int) -> list[tuple]:
 def traj_repeat_query(n_chunks: int, window_chunks: int = 2) -> list[tuple]:
     """TEST-ONLY."""
     spans = [(i, i + window_chunks) for i in range(n_chunks - window_chunks + 1)]
-    q_strs = [f'Q({s},{e})' for s, e in spans]
+    q_str = ' '.join(f'Q({s},{e})' for s, e in spans)
     first_s, first_e = spans[0]
-    q_strs.append(f'Q({first_s},{first_e})')  # repeated final query — genuinely terminal, no trailing S
-    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} ' + ' S '.join(q_strs))
+    ops, _, _, _, _ = parse_traj_dsl(f'E{n_chunks} {q_str} Q({first_s},{first_e})')
     return ops
 
 
@@ -1065,28 +974,212 @@ def traj_decay_curve(n_noop_hops: int, window_chunks: int = 2) -> list[tuple]:
 
 def chunk_mask_fb(pos: dict) -> np.ndarray:
     """
-    THIN WRAPPER — `chunk_positions_iq_global_rw_tagged` always produces a
-    single query (round-0 + optional refine rounds) all sharing `op_idx=0`,
-    which `chunk_mask_fb_traj` treats as the ALWAYS-exempt entry point
-    (permanent access to every encoding-pass STATE, regardless of `hops`) —
-    exactly this function's "global" access semantics, with no relay concept
-    needed at all since there is never an op_idx>0 here. `hops` value passed
-    is irrelevant (op_idx=0 is exempt from it either way) — kept as -1 for
-    clarity.
+    Feedback-argmax refine layout mask. Nochain blackout: each round-0 STATE
+    row is blocked from ALL tokens in prior rec_blocks (STATE, warmup, argmax,
+    output), not just prior STATEs — blocking only STATEs lets the model
+    chain through prior output tokens instead of encoding independently.
     """
-    return chunk_mask_fb_traj(pos, hops=-1)
+    L = pos['L']
+    r = np.arange(L); c = np.arange(L)
+    causal  = c[None, :] <= r[:, None]
+    blocked = np.zeros((L, L), dtype=bool)
+
+    enc_blocks = pos['enc_blocks']
+    rec_blocks = pos['rec_blocks']
+
+    is_any_chunk = np.zeros(L, dtype=bool)
+    for b in enc_blocks:
+        is_any_chunk |= (c >= b['s0']) & (c < b['s1'])
+
+    # Refine turns must reach earlier turns' output only via their explicit
+    # argmax copy, never by attending straight to c0:c1 — those tokens are
+    # ground truth during training but greedy-decoded at eval, so a direct
+    # path lets training cheat via leaked ground truth.
+    is_any_rec_output = np.zeros(L, dtype=bool)
+    for rb2 in rec_blocks:
+        is_any_rec_output |= (c >= rb2['c0']) & (c < rb2['c1'])
+
+    # Encoding isolation: encoding STATE_k blocked from chunk_j (j≠k)
+    for k, b in enumerate(enc_blocks):
+        sl_row = (r >= b['sl0']) & (r < b['sl1'])
+        for j, bj in enumerate(enc_blocks):
+            if j == k: continue
+            blocked |= sl_row[:, None] & ((c >= bj['s0']) & (c < bj['s1']))[None, :]
+
+    for i_rb, rb in enumerate(rec_blocks):
+        if rb['type'] == 'initial':
+            sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
+            blocked |= sl_row[:, None] & is_any_chunk[None, :]
+            # nochain blackout: round-0 STATE blocked from ALL tokens in prior
+            # rec_blocks, not just their STATE (see chunk_mask_fb docstring)
+            prior_all = np.zeros(L, dtype=bool)
+            for prev_rb in rec_blocks[:i_rb]:
+                if prev_rb['type'] == 'initial':
+                    prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
+                    prior_all |= (c >= prev_rb['w0'])  & (c < prev_rb['w1'])
+                    prior_all |= (c >= prev_rb['c0'])  & (c < prev_rb['c1'])
+                else:
+                    prior_all |= (c >= prev_rb['sla0']) & (c < prev_rb['sla1'])
+                    prior_all |= (c >= prev_rb['am0'])  & (c < prev_rb['am1'])
+                    prior_all |= (c >= prev_rb['slb0']) & (c < prev_rb['slb1'])
+                    prior_all |= (c >= prev_rb['w0'])   & (c < prev_rb['w1'])
+                    prior_all |= (c >= prev_rb['c0'])   & (c < prev_rb['c1'])
+            blocked |= sl_row[:, None] & prior_all[None, :]
+            if rb['w0'] < rb['w1']:
+                wm_row = (r >= rb['w0']) & (r < rb['w1'])
+                own = (c >= rb['sl0']) & (c < rb['sl1']) | (c >= rb['w0']) & (c < rb['w1'])
+                blocked |= wm_row[:, None] & ~own[None, :]
+            out_row = (r >= rb['c0']) & (r < rb['c1'])
+            own = ((c >= rb['sl0']) & (c < rb['sl1']) |
+                   (c >= rb['w0'])  & (c < rb['w1'])  |
+                   (c >= rb['c0'])  & (c < rb['c1']))
+            blocked |= out_row[:, None] & ~own[None, :]
+
+        else:  # type == 'refine'
+            sla_row = (r >= rb['sla0']) & (r < rb['sla1'])
+            am_row  = (r >= rb['am0'])  & (r < rb['am1'])
+            slb_row = (r >= rb['slb0']) & (r < rb['slb1'])
+            blocked |= (sla_row | am_row | slb_row)[:, None] & (is_any_chunk | is_any_rec_output)[None, :]
+
+            wm_row  = (r >= rb['w0'])  & (r < rb['w1'])
+            out_row = (r >= rb['c0'])  & (r < rb['c1'])
+            own_slb = (c >= rb['slb0']) & (c < rb['slb1'])
+            own_wm  = (c >= rb['w0'])   & (c < rb['w1'])
+            own_out = (c >= rb['c0'])   & (c < rb['c1'])
+            allowed = own_slb | own_wm | own_out
+            if rb['w0'] < rb['w1']:
+                blocked |= wm_row[:, None] & ~(own_slb | own_wm)[None, :]
+            blocked |= out_row[:, None] & ~allowed[None, :]
+
+    visible = causal & ~blocked
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
 
 
 def chunk_mask_fb_hop(pos: dict, hops: int = -1) -> np.ndarray:
     """
-    THIN WRAPPER — `chunk_positions_hop` now delegates to `chunk_positions_traj`
-    (docs/HISTORY.md §15), which numbers rec_blocks by `op_idx` (assigned
-    sequentially, one per chain step in order) rather than a separate
-    chain-step grouping — identical relay semantics, so `chunk_mask_fb_traj`
-    (already verified against multiple hand-derived trajectories) applies
-    directly with no adaptation needed.
+    Mask for chunk_positions_hop layouts — identical to chunk_mask_fb except
+    one exception to the nochain blackout: a round-0 STATE row may also
+    attend to the relay window's chain steps' last-round STATE (the relay
+    exception).
+
+    hops: 0 is invalid (raises). -1 (default) = unbounded — every chain step
+    sees the union of ALL earlier chain steps' STATE plus permanent encoding-
+    pass access (routing-style). N>=1 = bounded recurrent window — union of
+    only the last N chain steps' STATE, AND every chain step past the first
+    is additionally blocked from the encoding pass directly, making the
+    relay window its only channel (genuine h_t=f(h_{t-1..t-N}, x_t)).
     """
-    return chunk_mask_fb_traj(pos, hops=hops)
+    if hops == 0:
+        raise ValueError("hops=0 is invalid — use hops=-1 for unbounded "
+                         "(routing-style, full access to every prior chain "
+                         "step's STATE and the encoding pass) or hops>=1 for "
+                         "a bounded N-hop recurrent window.")
+    L = pos['L']
+    r = np.arange(L); c = np.arange(L)
+    causal  = c[None, :] <= r[:, None]
+    blocked = np.zeros((L, L), dtype=bool)
+
+    enc_blocks = pos['enc_blocks']
+    rec_blocks = pos['rec_blocks']
+
+    is_any_chunk = np.zeros(L, dtype=bool)
+    for b in enc_blocks:
+        is_any_chunk |= (c >= b['s0']) & (c < b['s1'])
+
+    is_any_enc_state = np.zeros(L, dtype=bool)
+    for b in enc_blocks:
+        is_any_enc_state |= (c >= b['sl0']) & (c < b['sl1'])
+
+    is_any_rec_output = np.zeros(L, dtype=bool)
+    for rb2 in rec_blocks:
+        is_any_rec_output |= (c >= rb2['c0']) & (c < rb2['c1'])
+
+    # Group rec_block indices by chain step so the relay exception can find
+    # the immediately preceding chain step's last rec_block.
+    chain_step_of_rb: list[int] = []
+    span_to_idx: dict[tuple, int] = {}
+    for rb in rec_blocks:
+        if rb['span'] not in span_to_idx:
+            span_to_idx[rb['span']] = len(span_to_idx)
+        chain_step_of_rb.append(span_to_idx[rb['span']])
+    last_rb_of_chain_step: dict[int, int] = {}
+    for i_rb, ci in enumerate(chain_step_of_rb):
+        last_rb_of_chain_step[ci] = i_rb  # last write wins -> last index per chain step
+
+    for k, b in enumerate(enc_blocks):
+        sl_row = (r >= b['sl0']) & (r < b['sl1'])
+        for j, bj in enumerate(enc_blocks):
+            if j == k: continue
+            blocked |= sl_row[:, None] & ((c >= bj['s0']) & (c < bj['s1']))[None, :]
+
+    for i_rb, rb in enumerate(rec_blocks):
+        if rb['type'] == 'initial':
+            sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
+            blocked |= sl_row[:, None] & is_any_chunk[None, :]
+
+            this_chain_step = chain_step_of_rb[i_rb]
+            if hops >= 1 and this_chain_step > 0:
+                blocked |= sl_row[:, None] & is_any_enc_state[None, :]
+            # relay exception: union of the last `hops` chain steps' own last-round STATE
+            relay_ranges: list[tuple[int, int]] = []
+            back_range = range(1, this_chain_step + 1) if hops == -1 else range(1, hops + 1)
+            for back in back_range:
+                src_chain_step = this_chain_step - back
+                if src_chain_step < 0:
+                    break
+                src_last_i_rb = last_rb_of_chain_step[src_chain_step]
+                src_last_rb = rec_blocks[src_last_i_rb]
+                if src_last_rb['type'] == 'initial':
+                    relay_ranges.append((src_last_rb['sl0'], src_last_rb['sl1']))
+                else:
+                    relay_ranges.append((src_last_rb['slb0'], src_last_rb['slb1']))
+
+            prior_all = np.zeros(L, dtype=bool)
+            for prev_rb in rec_blocks[:i_rb]:
+                if prev_rb['type'] == 'initial':
+                    prior_all |= (c >= prev_rb['sl0']) & (c < prev_rb['sl1'])
+                    prior_all |= (c >= prev_rb['w0'])  & (c < prev_rb['w1'])
+                    prior_all |= (c >= prev_rb['c0'])  & (c < prev_rb['c1'])
+                else:
+                    prior_all |= (c >= prev_rb['sla0']) & (c < prev_rb['sla1'])
+                    prior_all |= (c >= prev_rb['am0'])  & (c < prev_rb['am1'])
+                    prior_all |= (c >= prev_rb['slb0']) & (c < prev_rb['slb1'])
+                    prior_all |= (c >= prev_rb['w0'])   & (c < prev_rb['w1'])
+                    prior_all |= (c >= prev_rb['c0'])   & (c < prev_rb['c1'])
+            for lo, hi in relay_ranges:
+                relay_cols = (c >= lo) & (c < hi)
+                prior_all = prior_all & ~relay_cols
+            blocked |= sl_row[:, None] & prior_all[None, :]
+
+            # relay visibility is NOT extended to warmup/output rows — only the STATE row itself
+            if rb['w0'] < rb['w1']:
+                wm_row = (r >= rb['w0']) & (r < rb['w1'])
+                own = (c >= rb['sl0']) & (c < rb['sl1']) | (c >= rb['w0']) & (c < rb['w1'])
+                blocked |= wm_row[:, None] & ~own[None, :]
+            out_row = (r >= rb['c0']) & (r < rb['c1'])
+            own = ((c >= rb['sl0']) & (c < rb['sl1']) |
+                   (c >= rb['w0'])  & (c < rb['w1'])  |
+                   (c >= rb['c0'])  & (c < rb['c1']))
+            blocked |= out_row[:, None] & ~own[None, :]
+
+        else:  # type == 'refine'
+            sla_row = (r >= rb['sla0']) & (r < rb['sla1'])
+            am_row  = (r >= rb['am0'])  & (r < rb['am1'])
+            slb_row = (r >= rb['slb0']) & (r < rb['slb1'])
+            blocked |= (sla_row | am_row | slb_row)[:, None] & (is_any_chunk | is_any_rec_output)[None, :]
+
+            wm_row  = (r >= rb['w0'])  & (r < rb['w1'])
+            out_row = (r >= rb['c0'])  & (r < rb['c1'])
+            own_slb = (c >= rb['slb0']) & (c < rb['slb1'])
+            own_wm  = (c >= rb['w0'])   & (c < rb['w1'])
+            own_out = (c >= rb['c0'])   & (c < rb['c1'])
+            allowed = own_slb | own_wm | own_out
+            if rb['w0'] < rb['w1']:
+                blocked |= wm_row[:, None] & ~(own_slb | own_wm)[None, :]
+            blocked |= out_row[:, None] & ~allowed[None, :]
+
+    visible = causal & ~blocked
+    return np.where(visible, 0.0, -1e9).astype(np.float32)
 
 
 # =============================================================================
@@ -1232,25 +1325,11 @@ def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
                       data_kind: str = 'random', data_target_bits: float | None = None) -> np.ndarray:
     """data_kind: 'random' (default, uniform bytes) or a structured-data
     generator name (kvmem/structured_data.py) — each batch item gets a fresh
-    call so the model can't bake a fixed rule into static weights.
-
-    REDESIGNED for the opcode/end-of-turn-STATE mechanism (docs/HISTORY.md
-    §15) — every STATE block (`sl0:sl1`, `1+state_len` wide) is filled as
-    `[opcode_token, value_0, ..., value_{state_len-1}]`. A query's 'initial'
-    rec_block has NO end-of-turn STATE (`sl0 is None`) unless a trailing
-    'S' claimed it — in that terminal case there's nothing to fill beyond
-    warmup/response.
-
-    'refine' type rec_blocks: fills `am0:am1` with the ROUND'S OWN GROUND
-    TRUTH bytes (same content the previous round's response targets) as a
-    placeholder — this is NOT the `use_actual_argmax` mechanism (feeding
-    the model's own predictions back in), which requires a forward pass
-    BETWEEN rounds and doesn't exist in the weave_mix training loop today
-    (only the chain_steps/iq_global loops have that injection logic, not
-    yet ported — see docs/HISTORY.md §15). Fine for exercising the
-    data-construction/masking shapes; NOT a faithful refine-training signal
-    until argmax injection is wired into the weave_mix loop too."""
+    call so the model can't bake a fixed rule into static weights."""
     sids = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
+    sids_feedback_state = np.array(
+        _cyclic_state_ids(state_len, state_vocab_size, family=HMN_FEEDBACK_STATE_FAMILY),
+        dtype=np.int64)
     wl = pos_content['warmup_len']
     L = pos_content['L']
     tok = np.zeros((B, L), dtype=np.int64)
@@ -1263,19 +1342,19 @@ def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
 
     for k, b in enumerate(pos_content['enc_blocks']):
         tok[:, b['s0']:b['s1']] = segs[:, k, :]
-        tok[:, b['sl0']] = HMN_OP_UPDATE
-        tok[:, b['sl0'] + 1:b['sl1']] = sids
+        tok[:, b['sl0']:b['sl1']] = sids
 
+    rw_xs: np.ndarray | None = None
     for rb in pos_content['rec_blocks']:
         if rb['type'] == 'noop':
-            tok[:, rb['sl0']] = HMN_OP_NOOP
-            tok[:, rb['sl0'] + 1:rb['sl1']] = sids
+            tok[:, rb['sl0']:rb['sl1']] = sids
             continue
 
         span_s, span_e = rb['span']
         gt = np.concatenate([segs[:, i, :] for i in range(span_s, span_e)], axis=1)
 
         if rb['type'] == 'initial':
+            tok[:, rb['sl0']:rb['sl1']] = sids
             x_min, x_max = rb['warmup_train_range']
             _xdist = rb.get('warmup_x_dist', 'uniform')
             if _xdist == 'arcsine':
@@ -1288,27 +1367,15 @@ def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
                 X = rw_xs[b_idx]
                 tok[b_idx, rb['w0']:rb['w1']] = gt[b_idx, X:X + wl]
                 tok[b_idx, rb['c0']:rb['c1']] = gt[b_idx, X + wl:X + wl + rb['out_len']]
-
-            if rb['sl0'] is not None:  # non-terminal: end-of-turn STATE, claimed by a trailing 'S'
-                tok[:, rb['sl0']] = HMN_OP_UPDATE
-                tok[:, rb['sl0'] + 1:rb['sl1']] = sids
-
-        else:  # 'refine' — see this function's docstring re: placeholder (not real) argmax feedback
-            x_min, x_max = rb['warmup_train_range']
-            rw_xs = np.array([int(rng.integers(x_min, x_max + 1)) for _ in range(B)])
-            tok[:, rb['opf0']] = HMN_OP_FEEDBACK
+        else:  # 'refine'
+            tok[:, rb['sla0']:rb['sla1']] = sids
+            tok[:, rb['slb0']:rb['slb1']] = sids_feedback_state
+            assert rw_xs is not None
             for b_idx in range(B):
                 X = rw_xs[b_idx]
-                tok[b_idx, rb['am0']:rb['am1']] = gt[b_idx, X + wl:X + wl + rb['out_len']]  # placeholder
+                tok[b_idx, rb['am0']:rb['am1']] = gt[b_idx, X + wl:X + wl + rb['out_len']]
                 tok[b_idx, rb['w0']:rb['w1']]   = gt[b_idx, X:X + wl]
                 tok[b_idx, rb['c0']:rb['c1']]   = gt[b_idx, X + wl:X + wl + rb['out_len']]
-            # sl0:sl1 is the feedback VALUES ONLY (state_len wide, no opcode slot of
-            # its own — OP_FEEDBACK already sits at opf0, before am; see
-            # chunk_positions_traj's refine layout).
-            tok[:, rb['sl0']:rb['sl1']] = sids
-            if rb['end_sl0'] is not None:  # last round, non-terminal: end-of-turn STATE
-                tok[:, rb['end_sl0']] = HMN_OP_UPDATE
-                tok[:, rb['end_sl0'] + 1:rb['end_sl1']] = sids
 
     tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
     tag_ids = np.array([i for _, i in tags], dtype=np.int64)
@@ -1341,18 +1408,15 @@ def make_batch_stitch(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
 
     for k, b in enumerate(pos_content['enc_blocks']):
         tok[:, b['s0']:b['s1']] = segs[:, k, :]
-        tok[:, b['sl0']]        = HMN_OP_UPDATE
-        tok[:, b['sl0'] + 1:b['sl1']] = sids
+        tok[:, b['sl0']:b['sl1']] = sids
 
     wl = pos_content['warmup_len']
     for rb in pos_content['rec_blocks']:
         assert rb['type'] == 'initial', 'chunk_positions_stitch only ever produces initial rec_blocks'
         src0 = rb['src0']
+        tok[:, rb['sl0']:rb['sl1']] = sids
         tok[:, rb['w0']:rb['w1']] = src[:, src0:src0 + wl]
         tok[:, rb['c0']:rb['c1']] = src[:, src0 + wl:src0 + wl + rb['out_len']]
-        if rb['sl0'] is not None:  # every query but the last (see chunk_positions_stitch)
-            tok[:, rb['sl0']]        = HMN_OP_UPDATE
-            tok[:, rb['sl0'] + 1:rb['sl1']] = sids
 
     tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
     tag_ids = np.array([i for _, i in tags], dtype=np.int64)
@@ -1374,14 +1438,16 @@ def ar_decode_iq_global_rw_tagged(model, chunks_arr, state_len: int, state_vocab
 
     wl = pos_content['warmup_len']
     sids = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
+    sids_feedback_state = np.array(
+        _cyclic_state_ids(state_len, state_vocab_size, family=HMN_FEEDBACK_STATE_FAMILY),
+        dtype=np.int64)
     L = pos_content['L']
     full_mask = torch.tensor(mask_np, dtype=torch.float32, device=device)
 
     tok = np.zeros(L, dtype=np.int64)
     for k, b in enumerate(pos_content['enc_blocks']):
-        tok[b['s0']:b['s1']] = chunks_list[k]
-        tok[b['sl0']]        = HMN_OP_UPDATE
-        tok[b['sl0'] + 1:b['sl1']] = sids
+        tok[b['s0']:b['s1']]   = chunks_list[k]
+        tok[b['sl0']:b['sl1']] = sids
 
     tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
     tag_ids = np.array([i for _, i in tags], dtype=np.int64)
@@ -1428,27 +1494,21 @@ def ar_decode_iq_global_rw_tagged(model, chunks_arr, state_len: int, state_vocab
         span_s, span_e = rb['span']
         gt_span = np.concatenate(chunks_list[span_s:span_e])
 
-        if rb['type'] == 'refine':
-            # Real argmax feedback: _decode_segment for the PREVIOUS round already
-            # ran the model and wrote its own greedy predictions into
-            # tok[argmax_src_c0:...] (see ar_decode_traj_nokv for the same pattern).
-            tok[rb['opf0']] = HMN_OP_FEEDBACK
+        if rb['type'] == 'initial':
+            tok[rb['sl0']:rb['sl1']] = sids
+            if wl > 0:
+                tok[rb['w0']:rb['w1']] = gt_span[warmup_offset:warmup_offset + wl].astype(np.int64)
+            # seg_start must equal L_cached exactly — sweeps in every tag
+            # token between the last cached position and c0 automatically.
+            _decode_segment(L_cached, rb)
+        else:  # 'refine'
+            tok[rb['sla0']:rb['sla1']] = sids
             src_c0 = rb['argmax_src_c0']
             tok[rb['am0']:rb['am1']] = tok[src_c0:src_c0 + rb['out_len']]
-            tok[rb['sl0']:rb['sl1']] = sids  # feedback VALUES only (opcode already at opf0)
-
-        if wl > 0:
-            tok[rb['w0']:rb['w1']] = gt_span[warmup_offset:warmup_offset + wl].astype(np.int64)
-        # seg_start must equal L_cached exactly — sweeps in every new-content
-        # token between the last cached position and c0 automatically.
-        _decode_segment(L_cached, rb)
-
-        end_key0 = 'sl0' if rb['type'] == 'initial' else 'end_sl0'
-        end_key1 = 'sl1' if rb['type'] == 'initial' else 'end_sl1'
-        if rb[end_key0] is not None:  # non-terminal (never happens for this function today,
-                                       # every query here is terminal — kept for consistency)
-            tok[rb[end_key0]]                = HMN_OP_UPDATE
-            tok[rb[end_key0] + 1:rb[end_key1]] = sids
+            tok[rb['slb0']:rb['slb1']] = sids_feedback_state
+            if wl > 0:
+                tok[rb['w0']:rb['w1']] = gt_span[warmup_offset:warmup_offset + wl].astype(np.int64)
+            _decode_segment(L_cached, rb)
 
         rb_target = gt_span[warmup_offset + wl: warmup_offset + wl + rb['out_len']]
         rb_gen    = tok[rb['c0']:rb['c1']]
@@ -1504,15 +1564,17 @@ def ar_decode_srs_stitched_tagged_nokv(model, chunks_arr, state_len: int, state_
     src_len   = n_chunks * chunk_len
     wl        = pos_content['warmup_len']
     sids      = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
+    sids_feedback_state = np.array(
+        _cyclic_state_ids(state_len, state_vocab_size, family=HMN_FEEDBACK_STATE_FAMILY),
+        dtype=np.int64)
     L         = pos_content['L']
     full_mask = torch.tensor(mask_np, dtype=torch.float32, device=device)
     gt_full   = np.concatenate(chunks_list)
 
     tok = np.zeros(L, dtype=np.int64)
     for k, b in enumerate(pos_content['enc_blocks']):
-        tok[b['s0']:b['s1']] = chunks_list[k]
-        tok[b['sl0']]        = HMN_OP_UPDATE
-        tok[b['sl0'] + 1:b['sl1']] = sids
+        tok[b['s0']:b['s1']]   = chunks_list[k]
+        tok[b['sl0']:b['sl1']] = sids
 
     tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
     tag_ids = np.array([i for _, i in tags], dtype=np.int64)
@@ -1543,25 +1605,19 @@ def ar_decode_srs_stitched_tagged_nokv(model, chunks_arr, state_len: int, state_
         warmup_src = (gt_full[win_byte_lo:win_byte_lo + wl] if win_byte_lo == 0
                      else decoded_bytes[win_byte_lo:win_byte_lo + wl])
 
-        if rb['type'] == 'refine':
-            # Real argmax feedback: _decode_segment for the PREVIOUS round already
-            # ran the model and wrote its own greedy predictions into
-            # tok[argmax_src_c0:...], so this is genuinely "feed the model its own
-            # prior guess" — no extra plumbing needed (see ar_decode_traj_nokv).
-            tok[rb['opf0']] = HMN_OP_FEEDBACK
+        if rb['type'] == 'initial':
+            tok[rb['sl0']:rb['sl1']] = sids
+            if wl > 0:
+                tok[rb['w0']:rb['w1']] = warmup_src
+            _decode_segment(rb)
+        else:  # 'refine'
+            tok[rb['sla0']:rb['sla1']] = sids
             src_c0 = rb['argmax_src_c0']
             tok[rb['am0']:rb['am1']] = tok[src_c0:src_c0 + rb['out_len']]
-            tok[rb['sl0']:rb['sl1']] = sids  # feedback VALUES only (opcode already at opf0)
-
-        if wl > 0:
-            tok[rb['w0']:rb['w1']] = warmup_src
-        _decode_segment(rb)
-
-        end_key0 = 'sl0' if rb['type'] == 'initial' else 'end_sl0'
-        end_key1 = 'sl1' if rb['type'] == 'initial' else 'end_sl1'
-        if rb[end_key0] is not None:  # non-terminal: end-of-turn STATE, built AFTER warmup+response
-            tok[rb[end_key0]]                = HMN_OP_UPDATE
-            tok[rb[end_key0] + 1:rb[end_key1]] = sids
+            tok[rb['slb0']:rb['slb1']] = sids_feedback_state
+            if wl > 0:
+                tok[rb['w0']:rb['w1']] = warmup_src
+            _decode_segment(rb)
 
         out_len = rb['out_len']
         decoded_bytes[win_byte_lo + wl:win_byte_lo + wl + out_len] = tok[rb['c0']:rb['c1']]
@@ -1641,15 +1697,17 @@ def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int
     chunk_len = len(chunks_list[0])
     wl        = pos_content['warmup_len']
     sids      = np.array(_cyclic_state_ids(state_len, state_vocab_size), dtype=np.int64)
+    sids_feedback_state = np.array(
+        _cyclic_state_ids(state_len, state_vocab_size, family=HMN_FEEDBACK_STATE_FAMILY),
+        dtype=np.int64)
     L         = pos_content['L']
     full_mask = torch.tensor(mask_np, dtype=torch.float32, device=device)
     gt_full   = np.concatenate(chunks_list)
 
     tok = np.zeros(L, dtype=np.int64)
     for k, b in enumerate(pos_content['enc_blocks']):
-        tok[b['s0']:b['s1']] = chunks_list[k]
-        tok[b['sl0']]        = HMN_OP_UPDATE
-        tok[b['sl0'] + 1:b['sl1']] = sids
+        tok[b['s0']:b['s1']]   = chunks_list[k]
+        tok[b['sl0']:b['sl1']] = sids
 
     tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
     tag_ids = np.array([i for _, i in tags], dtype=np.int64)
@@ -1686,8 +1744,7 @@ def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int
 
     for rb in pos_content['rec_blocks']:
         if rb['type'] == 'noop':
-            tok[rb['sl0']]            = HMN_OP_NOOP  # placeholder only — real content comes from causal attention
-            tok[rb['sl0'] + 1:rb['sl1']] = sids
+            tok[rb['sl0']:rb['sl1']] = sids  # placeholder only — real content comes from causal attention
             continue
 
         span_s, span_e = rb['span']
@@ -1705,30 +1762,19 @@ def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int
         else:
             warmup_src = decoded_by_span.get(rb['span'], gt_span)[ws:ws + wl]
 
-        if rb['type'] == 'refine':
-            # REAL argmax feedback here (unlike make_batch_tagged's training-time
-            # placeholder) — `_decode_segment` for the PREVIOUS round already ran
-            # the model and wrote its own greedy predictions into
-            # tok[argmax_src_c0:argmax_src_c0+out_len], so this is genuinely
-            # "feed the model its own prior guess," no extra plumbing needed.
-            tok[rb['opf0']] = HMN_OP_FEEDBACK
+        if rb['type'] == 'initial':
+            tok[rb['sl0']:rb['sl1']] = sids
+            if wl > 0:
+                tok[rb['w0']:rb['w1']] = warmup_src
+            _decode_segment(rb)
+        else:  # 'refine'
+            tok[rb['sla0']:rb['sla1']] = sids
             src_c0 = rb['argmax_src_c0']
             tok[rb['am0']:rb['am1']] = tok[src_c0:src_c0 + rb['out_len']]
-            # sl0:sl1 is the feedback VALUES ONLY (state_len wide) — OP_FEEDBACK
-            # already sits at opf0, before am (see chunk_positions_traj).
-            tok[rb['sl0']:rb['sl1']] = sids
-
-        # No pre-filter STATE to fill before decoding — warmup/response attend
-        # directly to whatever hops permits (see docs/HISTORY.md §15).
-        if wl > 0:
-            tok[rb['w0']:rb['w1']] = warmup_src
-        _decode_segment(rb)
-
-        end_key0 = 'sl0' if rb['type'] == 'initial' else 'end_sl0'
-        end_key1 = 'sl1' if rb['type'] == 'initial' else 'end_sl1'
-        if rb[end_key0] is not None:  # non-terminal: end-of-turn STATE, built AFTER warmup+response
-            tok[rb[end_key0]]                = HMN_OP_UPDATE
-            tok[rb[end_key0] + 1:rb[end_key1]] = sids
+            tok[rb['slb0']:rb['slb1']] = sids_feedback_state
+            if wl > 0:
+                tok[rb['w0']:rb['w1']] = warmup_src
+            _decode_segment(rb)
 
         out_len = rb['out_len']
         decoded_by_span[rb['span']] = np.concatenate([
@@ -1779,9 +1825,12 @@ def ar_decode_stitch(model, chunks_arr, state_len: int, state_vocab_size: int,
 
     tok = np.zeros(L, dtype=np.int64)
     for k, b in enumerate(pos_content['enc_blocks']):
-        tok[b['s0']:b['s1']] = chunks_list[k]
-        tok[b['sl0']]        = HMN_OP_UPDATE
-        tok[b['sl0'] + 1:b['sl1']] = sids
+        tok[b['s0']:b['s1']]   = chunks_list[k]
+        tok[b['sl0']:b['sl1']] = sids
+
+    tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
+    tag_ids = np.array([i for _, i in tags], dtype=np.int64)
+    tok[tag_pos] = tag_ids
 
     enc_end  = pos_content['enc_end']
     enc_t    = torch.tensor(tok[:enc_end], dtype=torch.long, device=device)
@@ -1819,20 +1868,18 @@ def ar_decode_stitch(model, chunks_arr, state_len: int, state_vocab_size: int,
             kv_cache  = _cat_kv(kv_cache, last_kv)
             L_cached += 1
 
-    def _sweep_known(seg_start: int, seg_end: int):
-        """Sweep an already-known (not autoregressively generated) token
-        range into the KV cache — used for a non-terminal query's own
-        end-of-turn STATE block (opcode+values, filled directly, not
-        decoded), replacing the old design's "cache the closing tag" step
-        (there's no more closing tag in this fork — see
-        chunk_positions_stitch's docstring for the new layout)."""
-        nonlocal kv_cache, L_cached
-        seg_len = seg_end - seg_start
-        seg_t    = torch.tensor(tok[seg_start:seg_end], dtype=torch.long, device=device)
-        seg_mask = full_mask[seg_start:seg_end, :L_cached + seg_len]
-        _, seg_kv = model(seg_t, seg_mask, past_kv=kv_cache, return_kv=True, offset=L_cached)
-        kv_cache  = _cat_kv(kv_cache, seg_kv)
-        L_cached += seg_len
+        # Cache the `</response>` closing tag at position c1 too (its token
+        # id is already known — filled by the tok[tag_pos]=tag_ids line at
+        # the top of this function, before any decoding starts) — without
+        # this, L_cached stops one short of the next rec_block's own sl0
+        # (which sits right after this tag), and the next segment's
+        # assert seg_start == L_cached fails.
+        tag_pos_ = rb['c1']
+        tag_t    = torch.tensor([tok[tag_pos_]], dtype=torch.long, device=device)
+        tag_mask = full_mask[tag_pos_:tag_pos_+1, :L_cached + 1]
+        _, tag_kv = model(tag_t, tag_mask, past_kv=kv_cache, return_kv=True, offset=L_cached)
+        kv_cache  = _cat_kv(kv_cache, tag_kv)
+        L_cached += 1
 
     turn_match_pcts: list[float] = []
     prev_response: np.ndarray | None = None
@@ -1841,16 +1888,13 @@ def ar_decode_stitch(model, chunks_arr, state_len: int, state_vocab_size: int,
         src0 = rb['src0']
         warmup_src = gt_full[:wl] if prev_response is None else prev_response[-wl:]
 
-        seg_start = L_cached
+        seg_start = rb['sl0']
+        assert seg_start == L_cached, f'segment gap: expected start {L_cached}, got {seg_start}'
+        tok[rb['sl0']:rb['sl1']] = sids
         if wl > 0:
             tok[rb['w0']:rb['w1']] = warmup_src
 
         _decode_segment(seg_start, rb)
-
-        if rb['sl0'] is not None:  # every query but the last (chunk_positions_stitch)
-            tok[rb['sl0']]        = HMN_OP_UPDATE
-            tok[rb['sl0'] + 1:rb['sl1']] = sids
-            _sweep_known(rb['sl0'], rb['sl1'])
 
         rb_gen    = tok[rb['c0']:rb['c1']]
         rb_target = gt_full[src0 + wl:src0 + wl + rb['out_len']]
@@ -2837,13 +2881,8 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     for rb in t_pos_content['rec_blocks']:
                         if not rb['is_clean']:
                             continue
-                        # w0:c1 instead of c0:c1 — NLL now covers the warmup region too,
-                        # not just the response/continuation (this fork's 2nd change, see
-                        # module docstring). w0 always precedes c0 directly (no gap, no
-                        # tag in between in this fork's tag-free layout), so this is a
-                        # straight causal-shift extension of the same log_softmax slicing.
-                        lp  = F.log_softmax(logits[:, rb['w0'] - 1:rb['c1'] - 1], dim=-1)
-                        tgt = tok_t[:, rb['w0']:rb['c1']]
+                        lp  = F.log_softmax(logits[:, rb['c0'] - 1:rb['c1'] - 1], dim=-1)
+                        tgt = tok_t[:, rb['c0']:rb['c1']]
                         nll_per = _positional_ls_nll(lp, tgt, ls_max)
                         nlls.append(nll_per.mean())
                     loss = torch.stack(nlls).mean()
