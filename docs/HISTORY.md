@@ -1346,7 +1346,11 @@ a second query's warmup can see its predecessor's end-of-turn STATE
 tagged design, `V=274`) was archived verbatim to `kvmem/hmn_v4_backup.py`,
 and `kvmem/hmn_notags.py`'s content was promoted to be the new `kvmem/
 hmn.py` (module docstring rewritten for its new role as the primary file;
-`kvmem/hmn_notags.py` no longer exists as a separate file). `kvmem/configs/
+`kvmem/hmn_notags.py` no longer exists as a separate file). `hmn_v4_backup.py`
+and the earlier `hmn_v1-v3_backup.py` diffing snapshots were later deleted
+entirely as part of a cleanup pass (pure diffing artifacts, never imported
+by anything — their content is superseded by the current file plus this
+doc's own narrative). `kvmem/configs/
 hmn_notags_w25.py` and `hmn_notags_locate.py` were updated to invoke
 `kvmem.hmn` directly (no separate module needed) and verified to still
 load cleanly with `V=271`.

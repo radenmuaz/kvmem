@@ -101,9 +101,12 @@ DATA_LO = 0x20   # legacy: data restricted to [0x20, 0xFF]
 #   noop     — pure relay pass-through, nothing new incorporated (rare,
 #              opt-in — e.g. decay_curve-style trajectories; no currently-
 #              implemented trajectory in this fork emits it yet).
-#   feedback — a refine round's post-argmax-feedback STATE (RESERVED —
-#              refine rounds are not yet implemented in this fork; see
-#              docs/HISTORY.md §15's "Status").
+#   feedback — a refine round's post-argmax-feedback STATE, placed BEFORE
+#              the argmax content (`opf0`, in chunk_positions_traj/chunk_
+#              positions_iq_global_rw_tagged's refine-round layout) rather
+#              than after, resolving the boundary ambiguity between
+#              feedback content and the prior round's response — see
+#              docs/HISTORY.md §15.
 HMN_OP_UPDATE   = 256
 HMN_OP_NOOP     = 257
 HMN_OP_FEEDBACK = 258
@@ -485,7 +488,19 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
 
 
 def _dual_positions(pos_content: dict, L: int) -> tuple[np.ndarray, np.ndarray]:
-    """Builds (pos_state, pos_local) position-ID arrays for apply_rope_dual from
+    """DEPRECATED (2026-07-28) — `dual_rope` was one of three attempted
+    fixes for the `batch`/`interleave_delayed` positional shortcut
+    (`kvmem/probe_positional_shortcut.py`); abandoned mid-design in favor
+    of `rope_state_scale` (itself now also deprecated, see
+    `_scaled_state_positions`'s docstring) — see CLAUDE.md's "Positional
+    shortcut" entry and docs/HISTORY.md §12-13. Not wired into any active
+    or archived-for-reuse config. Kept correct (see the origin-tracking/
+    field-name/None-guard fix below) rather than deleted only because
+    deletion of a whole RoPE-clock mechanism wasn't asked for — do not
+    build new work on top of this without re-deriving it for the current
+    opcode/end-of-turn-STATE design first.
+
+    Builds (pos_state, pos_local) position-ID arrays for apply_rope_dual from
     a chunk_positions_traj-built pos_content. pos_state increments by 1 exactly
     at each STATE region's START position and stays frozen until the next
     STATE region begins — so every position between one STATE emission and
@@ -507,29 +522,47 @@ def _dual_positions(pos_content: dict, L: int) -> tuple[np.ndarray, np.ndarray]:
         local_spans.append((cb['s0'], cb['s0'], cb['s1']))
         local_spans.append((cb['s0'], cb['sl0'], cb['sl1']))
 
-    # NOTE: a query's own recall-STATE row (rec_blocks' sl0/sla0/slb0) does NOT
-    # advance state_starts — only ENCODING STATE does. This is the whole point:
-    # every query following the same encoding pass must see the identical
-    # frozen macro value, regardless of query order, or the shortcut measured
-    # by kvmem/probe_positional_shortcut.py just reappears one level up (the
-    # first bug found here: an earlier version of this function DID increment
-    # on rec_blocks' own state row too, and re-created query-order-dependent
-    # macro values — caught by direct numerical check before this was trusted).
+    # NOTE: a query's own recall-STATE row (rec_blocks' end-of-turn sl0/
+    # end_sl0) does NOT advance state_starts — only ENCODING STATE does.
+    # This is the whole point: every query following the same encoding pass
+    # must see the identical frozen macro value, regardless of query order,
+    # or the shortcut measured by kvmem/probe_positional_shortcut.py just
+    # reappears one level up (the first bug found here: an earlier version
+    # of this function DID increment on rec_blocks' own state row too, and
+    # re-created query-order-dependent macro values — caught by direct
+    # numerical check before this was trusted).
+    #
+    # Every rec_block's `origin` is that OP's own `w0` (its turn's actual
+    # first token) — NOT its own `sl0`/`end_sl0`, which under the current
+    # end-of-turn-STATE design sits AFTER warmup/response, not before (this
+    # fn predates that redesign; using sl0 as origin, or leaving it
+    # unguarded against a terminal query's sl0=None, both silently broke —
+    # see docs/HISTORY.md §15). A 'refine' round shares its op's round-0
+    # origin (pos_local continues across refine rounds within one turn,
+    # per this function's own docstring), tracked via op_origin below.
+    op_origin: dict[int, int] = {}
+    for rb in pos_content['rec_blocks']:
+        if rb['type'] == 'initial':
+            op_origin[rb['op_idx']] = rb['w0']
+
     for rb in pos_content['rec_blocks']:
         if rb['type'] == 'noop':
             local_spans.append((rb['sl0'], rb['sl0'], rb['sl1']))
         elif rb['type'] == 'initial':
-            origin = rb['sl0']
-            local_spans.append((origin, rb['sl0'], rb['sl1']))
+            origin = op_origin[rb['op_idx']]
+            if rb['sl0'] is not None:
+                local_spans.append((origin, rb['sl0'], rb['sl1']))
             local_spans.append((origin, rb['w0'], rb['w1']))
             local_spans.append((origin, rb['c0'], rb['c1']))
         else:  # 'refine'
-            origin = rb['sla0']
-            local_spans.append((origin, rb['sla0'], rb['sla1']))
+            origin = op_origin[rb['op_idx']]
+            local_spans.append((origin, rb['opf0'], rb['opf0'] + 1))
             local_spans.append((origin, rb['am0'], rb['am1']))
-            local_spans.append((origin, rb['slb0'], rb['slb1']))
+            local_spans.append((origin, rb['sl0'], rb['sl1']))  # feedback STATE values
             local_spans.append((origin, rb['w0'], rb['w1']))
             local_spans.append((origin, rb['c0'], rb['c1']))
+            if rb['end_sl0'] is not None:
+                local_spans.append((origin, rb['end_sl0'], rb['end_sl1']))
 
     pos_state = np.zeros(L, dtype=np.int64)
     starts_sorted = sorted(state_starts)
@@ -550,7 +583,18 @@ def _dual_positions(pos_content: dict, L: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _scaled_state_positions(pos_content: dict, L: int, state_scale: float) -> np.ndarray:
-    """Single-clock position array (used with plain apply_rope, NOT
+    """DEPRECATED (2026-07-28) — `rope_state_scale`, along with `dual_rope`,
+    was one of three attempted fixes for the `batch`/`interleave_delayed`
+    positional shortcut (`kvmem/probe_positional_shortcut.py`); all three
+    (dual-clock RoPE, this, and `relpos`) either failed outright or were
+    abandoned — see CLAUDE.md's "Positional shortcut" entry and
+    docs/HISTORY.md §12-13. Not wired into any active or archived-for-reuse
+    config. Kept correct (see the field-name/None-guard fix below) rather
+    than deleted only because deletion of a whole RoPE-clock mechanism
+    wasn't asked for — do not build new work on top of this without
+    re-deriving it for the current opcode/end-of-turn-STATE design first.
+
+    Single-clock position array (used with plain apply_rope, NOT
     apply_rope_dual) — every non-STATE token keeps its real, ordinary
     absolute index (identical to plain RoPE, zero special-casing). Every
     STATE-region token gets `(i - s0) + s0 / state_scale`: its position
@@ -580,10 +624,13 @@ def _scaled_state_positions(pos_content: dict, L: int, state_scale: float) -> np
         state_regions.append((cb['sl0'], cb['sl1']))
     for rb in pos_content['rec_blocks']:
         if rb['type'] in ('noop', 'initial'):
+            if rb['sl0'] is not None:  # 'initial' is None for a terminal query — no end-of-turn STATE
+                state_regions.append((rb['sl0'], rb['sl1']))
+        else:  # 'refine' — sl0/sl1 holds the feedback STATE values (always present);
+               # end_sl0/end_sl1 holds the optional end-of-turn STATE (last round only)
             state_regions.append((rb['sl0'], rb['sl1']))
-        else:  # 'refine'
-            state_regions.append((rb['sla0'], rb['sla1']))
-            state_regions.append((rb['slb0'], rb['slb1']))
+            if rb['end_sl0'] is not None:
+                state_regions.append((rb['end_sl0'], rb['end_sl1']))
     for s0, s1 in state_regions:
         pos[s0:s1] = (pos[s0:s1] - s0) + s0 / state_scale
     return pos
@@ -1119,16 +1166,36 @@ def _iter_forward_segments(pos_content: dict) -> list[dict]:
     end of that chunk's own STATE) and one per rec_block (STATE through
     `</response>`). Positions are contiguous by construction (chunk_positions_*
     builds every block from one monotonically increasing offset), so
-    seg_start of entry i+1 always equals seg_end of entry i."""
-    segs = []
-    for b in pos_content['enc_blocks']:
-        segs.append(dict(seg_start=b['s0'] - 1, seg_end=b['sl1'], kind='enc', block=b))
-    for rb in pos_content['rec_blocks']:
-        end = rb['c1'] + 1 if 'c1' in rb else rb['sl1']  # 'noop' blocks have no c0/c1
-        start = rb['sl0'] if rb['type'] != 'refine' else rb['sla0']
-        segs.append(dict(seg_start=start, seg_end=end, kind='rec', block=rb))
-    segs.sort(key=lambda s: s['seg_start'])
-    return segs
+    seg_start of entry i+1 always equals seg_end of entry i.
+
+    BROKEN under the current end-of-turn-STATE design (2026-07-28 review) —
+    disabled below, NOT YET RE-DERIVED. Do not re-enable this without
+    redoing the segment-tiling verification the project's own masking-
+    change rule requires (CLAUDE.md's "Always verify masking changes
+    against the actual attention-mask matrix"). This function's
+    `start = rb['sl0']` assumed STATE sits BEFORE warmup/response (the old
+    pre-filter-register layout, where sl0 < w0 < c0); under the current
+    design a rec_block's STATE (if any) is built AFTER response
+    (`sl0 > c1`), so this is wrong for every 'initial' rec_block, not just
+    'refine' ones: a terminal query has sl0=None (crashes outright —
+    confirmed via direct reproduction), a non-terminal query has
+    sl0 > c1 (silently produces seg_start > seg_end instead of crashing).
+    A from-scratch attempt at fixing just the terminal case (`start =
+    rb['w0'] - 1`, mirroring the enc-block convention) was tried and
+    discarded here too — it doesn't actually satisfy this function's own
+    contiguity invariant (`seg_start of entry i+1 == seg_end of entry i`,
+    checked by `_forward_segmented`'s `assert s0 == L_cached`) without
+    further verification this pass didn't have budget for. Raising
+    unconditionally is the honest state until someone does that
+    verification — see docs/HISTORY.md §15 and CLAUDE.md's
+    `forward_granularity` entries for context."""
+    raise NotImplementedError(
+        "_iter_forward_segments/_forward_segmented (forward_granularity) has not been "
+        "re-derived for the current end-of-turn-STATE design (see this function's own "
+        "docstring) — every rec_block's segment boundaries are wrong under it, not just "
+        "refine/non-terminal ones. Not used by any current or kept-for-future config; "
+        "re-derive and re-verify (direct segment/mask inspection, per CLAUDE.md's masking-"
+        "change rule) before using forward_granularity again.")
 
 
 def _forward_segmented(model: nn.Module, tok_t: torch.Tensor, mask_np: np.ndarray,

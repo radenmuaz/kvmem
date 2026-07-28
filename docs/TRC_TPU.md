@@ -121,6 +121,53 @@ recompile storm.
 Start with fixed-max-`L` padding at small scale; only build real packing
 once/if the model size actually moves to the 10M+ tier.
 
+## `repeat_batch` under sequence packing — global, not per-sample
+
+`repeat_batch` (`kvmem/hmn.py`'s `hp['repeat_batch']`, current CPU/MPS
+mechanism — see CLAUDE.md's `repeat_batch` ablation entry for why it
+exists: it fixes a training-loss plateau by taking N gradient steps on the
+same sampled batch before resampling) is already, necessarily, a **single
+counter shared across the whole `[B, L]` batch**, not something that could
+vary per row: every step processes one `tok_t` tensor from one sampled
+trajectory/DSL entry, so all `B` rows share one shape already, and there's
+only one place a "resample or reuse" decision can live (`_cached_repeat_
+left`/`_cached_batch` in the `weave_mix` path, `_cached_base_np` in the
+`chain_steps`/`traj_mix` paths — all three gate on `(local_step - 1) %
+repeat_batch == 0`). This generalizes cleanly to the block-diagonal packing
+described above: once several DSL entries are concatenated into one packed
+row, that row is still one tensor, one forward/backward per step — so
+`repeat_batch` would still have to be one global counter for the whole
+packed super-batch, not independent per sub-entry packed within it. Any
+future packing implementation should keep this single-counter structure
+rather than trying to give each packed sub-entry its own repeat count.
+
+**Refine ops (`n_refine>0`) do NOT let `repeat_batch` cache the argmax
+feedback — and must not.** `repeat_batch` only caches the raw
+ground-truth bytes (`_cached_base_np`, pre-argmax). Every step, regardless
+of where it falls in the `repeat_batch` window, still runs a **fresh**
+`with torch.no_grad(): logits_1 = model(tok_t, mask_t)` pass to get the
+model's CURRENT argmax before `_fill_argmax_fb` bakes it into the batch —
+because the argmax is a function of the model's current weights, which
+change every step, caching it across `repeat_batch` steps would train
+rounds 1+ on increasingly stale feedback from a model that no longer
+exists by the time step 2..N of the window runs. Net effect: any
+trajectory with `n_refine>0` costs **2 forward passes per step, every
+step**, independent of `repeat_batch` — `repeat_batch` only amortizes the
+CPU-side `make_batch_tagged`/mask-construction cost (the actual host-
+overhead bottleneck flagged in "The core situation" above), never the
+argmax pass itself.
+
+**Real cost under XLA specifically**: that extra no-grad argmax pass is a
+second host↔device round trip per step unless it's fused into the SAME
+compiled step function as the real forward/backward. If the port leaves it
+as a separate Python-level `model(...)` call (today's eager-PyTorch
+structure), any refine-containing entry pays 2x the per-step XLA dispatch
+overhead — directly undermining the "reduce host-side/XLA-call overhead"
+goal this whole doc is organized around. Any TPU port needs to fuse the
+argmax pass and the real pass into one compiled graph (e.g. a single
+`jax.jit`/`torch_xla` step function computing both), not port the current
+two-separate-Python-calls structure as-is.
+
 ## Precision (bf16)
 
 TPU's native fast path, and doubles both memory headroom and MXU
