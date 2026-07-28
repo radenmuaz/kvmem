@@ -53,7 +53,7 @@ hp = dict(
     d=64, n_layers=8, n_heads=4, V=271,
     block_type='single_attn',
     lr_max=1e-4, wd=1e-5,
-    warmup_steps=1000, log_every=500,
+    warmup_steps=1000, log_every=2000,
     rope=False,
     null_kv=True,
     rmsnorm=True,

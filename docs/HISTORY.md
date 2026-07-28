@@ -1135,10 +1135,11 @@ explained as a learning-difficulty issue — the exact-match attention
 algorithm is harder to learn from only 2 bytes of signal — than a
 data-imposed ceiling.
 
-### 15. `kvmem/hmn_notags.py` — the STATE-role ambiguity, opcode tokens, and end-of-turn STATE redesign
+### 15. The STATE-role ambiguity, opcode tokens, and end-of-turn STATE redesign — promoted to `kvmem/hmn.py`
 
-A design conversation (not yet fully implemented as of this writing — see
-"Status" at the end) that started from a real gap in the chat-tag-free
+A design conversation (fully implemented, ported, and promoted to be the
+new `kvmem/hmn.py` — see "Status" at the end) that started from a real gap
+in the chat-tag-free
 fork and ended up redesigning how STATE emissions work generally, in a way
 that also resolves a genuine architectural redundancy present in `hmn.py`
 too, not just the fork.
@@ -1265,33 +1266,105 @@ remains vocab-distinguishable on its own. Deliberately scoped to refine
 only — encode/query commit-boundaries stay marker-free by the trailing-`S`
 discipline, not by adding more opcodes.
 
-**Status**: implemented and verified for round-0 (non-refine) — `kvmem/
-hmn_notags.py`'s `chunk_positions_traj` (asserts `n_refine==0`; `S` now
-claims either a pending `E` or a just-finished `Q`, opcode-prefixed
-`1+state_len`-wide STATE blocks), `chunk_mask_fb_traj` (rewritten around a
-single positive `allowed_state`-based allowlist per op instead of the old
-three-part chunk-blackout/nochain-blackout/bottleneck logic — noticeably
-simpler, not just different), `make_batch_tagged`, and `ar_decode_traj_
-nokv` all updated. Directly verified against ALL FOUR hand-derived
-trajectories above (single-recall, batch, stream, 3-query hops=1-vs-2) via
-a standalone script checking exact block-to-block mask permissions — every
-assertion passed, including the subtle `hops=1`-vs-`hops=2` divergence and
-the stream+`hops=1` structural bottleneck reproducing exactly as predicted
-from first principles. Full training smoke-tested clean through
-`hmn_notags_w25.py`'s 4-stage curriculum (updated to `V=271`: 256 bytes +
-3 opcodes + 12 reserved shared STATE values, replacing the old `V=268`
-per-role-family layout) with no errors, and a longer (3000-step, stage0
-only) run confirmed genuine loss decline (5.545→4.655) — gradients flow
-correctly, no structural bug silently preventing learning.
+**Status**: fully implemented, ported, and PROMOTED. Round-0 (`chunk_
+positions_traj`/`chunk_mask_fb_traj`/`make_batch_tagged`/`ar_decode_traj_
+nokv`) was implemented and verified first (`S` claims either a pending `E`
+or a just-finished `Q`, opcode-prefixed `1+state_len`-wide STATE blocks;
+`chunk_mask_fb_traj` rewritten around a single positive `allowed_state`-
+based allowlist per op instead of the old three-part chunk-blackout/
+nochain-blackout/bottleneck logic), directly verified against ALL FOUR
+hand-derived trajectories above (single-recall, batch, stream, 3-query
+hops=1-vs-2) via a standalone script checking exact block-to-block mask
+permissions — every assertion passed, including the subtle `hops=1`-vs-
+`hops=2` divergence and the stream+`hops=1` structural bottleneck
+reproducing exactly as predicted from first principles.
 
 Refine-round support (the `feedback`-opcode-before-content boundary fix
-worked out just above) is NOT implemented — `n_refine>0` still asserts.
-**The originally-discussed "archive `hmn.py` to `hmn_v4_backup.py`,
-promote `hmn_notags.py` to be the new `hmn.py`" step has NOT happened and
-needs explicit reconfirmation before it does** — `hmn_notags.py` only
-ports the `weave_mix` path; `chunk_positions_hop`/`chunk_positions_iq_
-global_rw_tagged`/`chunk_positions_stitch` (the `chain_steps`/`stitch_mix`
-paths) still reference deleted tag constants and would break immediately,
-and a large fraction of the ~25 configs referencing `kvmem.hmn` use those
-paths, not `weave_mix`. Promoting the fork wholesale right now would take
-all of them down.
+worked out above) was then added: `OP_FEEDBACK` placed before the argmax
+content (`opf0`), a `'refine'`-type rec_block's `sl0/sl1` holds the
+feedback STATE values (exactly `state_len` wide, no opcode prefix — the
+opcode already sits at `opf0`), and a separate `end_sl0/end_sl1` holds the
+optional end-of-turn STATE (only on the last round, if claimed by a
+trailing `'S'`). `_fill_argmax_fb` needed no changes (already field-name
+compatible).
+
+All three remaining position-builder paths were then ported: `chunk_
+positions_hop`/`chunk_mask_fb_hop` (the `chain_steps` path) reimplemented
+as thin wrappers delegating to `chunk_positions_traj`/`chunk_mask_fb_traj`
+(chain_steps is structurally just a batch-style ops list with a trailing
+`'S'` after every step but the last); `chunk_positions_iq_global_rw_
+tagged`/`chunk_mask_fb` (the legacy global-window `traj_mix` path) ported
+as its own dedicated function, since its fixed-size sliding-window
+`out_len` shape genuinely differs from `chunk_positions_traj`'s "through
+the end of span" query handling; `chunk_positions_stitch`/`make_batch_
+stitch`/`ar_decode_stitch` (the `stitch_mix` path) ported as its own
+dedicated function, with `ar_decode_stitch`'s old "cache the closing tag"
+KV-cache step replaced by a general `_sweep_known(seg_start, seg_end)`
+helper (there's no more closing tag to key off since tags are gone). Each
+path was individually smoke-tested (train + eval decode, and argmax
+injection where relevant) before moving to the next.
+
+**Two critical bugs were caught during PRE-PROMOTION verification** (proactively
+checking the named trajectory-pattern constructors before trusting them,
+rather than relying on the earlier ad-hoc DSL-string smoke tests, which had
+always included an explicit trailing `'S'` by hand):
+1. `traj_batch`/`traj_stream`/`traj_interleave_delayed`/`traj_repeat_query`
+   never inserted a trailing `'S'` between consecutive queries. Under the
+   OLD chat-tag design every query automatically got a pre-filter STATE
+   row; under the new design a query's STATE is optional and must be
+   explicitly claimed by a trailing `'S'` — without it, every query in
+   these four patterns became terminal (no end-of-turn STATE at all),
+   silently breaking the relay chain for every config using `batch`/
+   `stream`/`interleave_delayed` (`hmn_weave_mix.py`, `hmn_recall_queue.py`,
+   `hmn_weave_mix_accum_rnn.py`, etc.) had promotion happened before this
+   was caught. Reproduced directly (`AssertionError: op_idx=0 has no
+   end-of-turn STATE ... but a later op is trying to relay from it`).
+   Fixed by joining query strings with `' S '` (inserting `'S'` after every
+   query except the last) in all four constructors.
+2. `_relay_source` mishandled `'noop'`-type blocks: its type check was
+   `('sl0','sl1') if prev_rb['type']=='initial' else ('end_sl0','end_sl1')`
+   — a `'noop'` block (which always stores its relayed STATE in `sl0/sl1`,
+   having no separate always-present feedback-values field to conflict
+   with) incorrectly fell into the `else` branch, raising `KeyError:
+   'end_sl0'` on `traj_decay_curve` (which legitimately produces bare `'S'`
+   noop blocks in its relay chain). Fixed by checking `prev_rb['type'] in
+   ('initial', 'noop')` vs. `'refine'`.
+
+Both fixes re-verified via direct mask-matrix construction across `batch`/
+`stream`/`interleave_delayed`/`repeat_query`/`decay_curve` at `hops ∈
+{-1, 1, 2}` — all build successfully with no crash — AND via a real
+end-to-end training-loop smoke test (`weave_mix` dispatch, `pattern=
+'batch'/'stream'/'interleave_delayed'`, `hops=1`, 6 steps) showing sane
+loss (~5.53-5.57, the random-guess baseline) with no crashes across
+training AND validation/decode. A separate direct mask-permission check
+confirmed the relay itself is load-bearing as intended: under `hops=1`,
+a second query's warmup can see its predecessor's end-of-turn STATE
+(`ALLOW`) but is correctly blocked from every encoding-pass STATE directly
+(`BLOCK`, `BLOCK`).
+
+**The archive+promote step has now happened**: `kvmem/hmn.py` (the old
+tagged design, `V=274`) was archived verbatim to `kvmem/hmn_v4_backup.py`,
+and `kvmem/hmn_notags.py`'s content was promoted to be the new `kvmem/
+hmn.py` (module docstring rewritten for its new role as the primary file;
+`kvmem/hmn_notags.py` no longer exists as a separate file). `kvmem/configs/
+hmn_notags_w25.py` and `hmn_notags_locate.py` were updated to invoke
+`kvmem.hmn` directly (no separate module needed) and verified to still
+load cleanly with `V=271`.
+
+**Caveat not yet resolved**: every config with `_pretrained_ckpt` set
+(`hmn_single_recall_c128`, `hmn_weave_c64*`, `hmn_weave_mix*`, `hmn_
+weave_mix_accum_rnn*`, `hmn_stitch_src1024`, etc. — roughly a dozen
+configs) warm-starts from a checkpoint trained under the OLD tagged
+vocab (`V=274`, tags at IDs 256-261). Loading it into the new opcode
+vocab (`V=271`, opcodes at 256-258) via the existing shape-mismatch-
+tolerant loader (`kvmem/hmn.py`'s `_pretrained_ckpt` handling in `train()`)
+would silently reinterpret old tag-token embeddings as new opcode-token
+embeddings at the SAME IDs — wrong, not just stale, since the loader only
+checks tensor shape, not semantic vocab compatibility. Do not warm-start
+any of those configs from pre-promotion checkpoints without addressing
+this (either retraining the warm-start source from scratch under the new
+vocab, or writing a loader that explicitly skips/re-inits the tag-ID rows
+rather than trusting shape-match alone). Configs that train from scratch
+(`hmn_notags_w25`, `hmn_notags_locate` — no `_pretrained_ckpt` key) are
+unaffected and were used to verify the promotion (see CLAUDE.md's Results
+section for the training-run status).
