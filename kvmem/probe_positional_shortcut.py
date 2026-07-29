@@ -30,7 +30,7 @@ import argparse
 import numpy as np
 import torch
 
-from kvmem.hmn import (_cyclic_state_ids, _dual_positions, _scaled_state_positions,
+from kvmem.hmn import (HMN_OP_UPDATE, _cyclic_state_ids, _dual_positions, _scaled_state_positions,
                        build_model, chunk_positions_traj, chunk_mask_fb_traj, traj_batch)
 
 
@@ -48,11 +48,17 @@ def _load(ckpt_path: str, device: torch.device):
 
 
 @torch.no_grad()
-def run_trial(model, hp, device, rng):
-    chunk_len = 64
+def run_trial(model, hp, device, rng, chunk_len=64, warmup_len=None, anchor=0):
     state_len = hp.get('state_len', 8)
     state_vocab_size = hp.get('state_vocab_size', 2)
-    warmup_len = hp['warmup_len']
+    # hp['warmup_len'] is the stage-level FALLBACK — for a _grid/_grid_shapes-style
+    # config (every weave_mix entry sets its own warmup_len via the DSL's Q(...,wl)
+    # token), the fallback is never actually trained on and may be a combination
+    # (with whatever chunk_len this probe uses) the model never saw. Callers of a
+    # such a checkpoint should pass an explicit warmup_len that WAS trained at this
+    # chunk_len (see --warmup-len).
+    if warmup_len is None:
+        warmup_len = hp['warmup_len']
     # Match whatever positional mechanism + mask permission (`hops`) the checkpoint
     # was actually trained under — running it under plain sequential positions (the
     # old default) or the wrong hops window would test a positional scheme the model
@@ -61,7 +67,15 @@ def run_trial(model, hp, device, rng):
     rope_state_scale = hp.get('rope_state_scale', None)
     hops = hp.get('curriculum', [{}])[0].get('hops', -1)
 
-    ops = traj_batch(2, 1)  # 'E2 Q(0,1) Q(1,2)'
+    # traj_batch(2, 1) always builds Q(0,1)/Q(1,2) with warmup_start=0 (2-tuple spans,
+    # no anchor) — for an anchor-swept checkpoint (`_grid_shapes`-style config), that
+    # locks this probe to whatever the WEAKEST/least-trained anchor happens to be
+    # (empirically anchor=0 at chunk_len=64 in this project — the longest possible
+    # response, not necessarily still a positional shortcut), not a representative
+    # test of the anchor-varying design. Build the same 'E2 Q Q' shape by hand instead,
+    # threading `anchor` through as each Q's 3rd (warmup_start) arg.
+    ops = [('E', 0), ('S', None), ('E', 1), ('S', None),
+           ('Q', (0, 1, anchor)), ('S', None), ('Q', (1, 2, anchor))]
     built = chunk_positions_traj(chunk_len, state_len, warmup_len, ops, n_refine=0,
                                  state_vocab_size=state_vocab_size)
     pos_content, pos_mask, tags = built['pos_content'], built['pos_mask'], built['tags']
@@ -86,7 +100,8 @@ def run_trial(model, hp, device, rng):
     tok = np.zeros(L, dtype=np.int64)
     for k, b in enumerate(pos_content['enc_blocks']):
         tok[b['s0']:b['s1']] = chunks_list[k]
-        tok[b['sl0']:b['sl1']] = sids
+        tok[b['sl0']] = HMN_OP_UPDATE
+        tok[b['sl0'] + 1:b['sl1']] = sids
     tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
     tag_ids = np.array([i for _, i in tags], dtype=np.int64)
     tok[tag_pos] = tag_ids
@@ -106,7 +121,8 @@ def run_trial(model, hp, device, rng):
     wl = warmup_len
 
     # --- baseline: slot 1 given its OWN correct warmup (chunk0), sanity check ---
-    tok[rb0['sl0']:rb0['sl1']] = sids
+    tok[rb0['sl0']] = HMN_OP_UPDATE
+    tok[rb0['sl0'] + 1:rb0['sl1']] = sids
     tok[rb0['w0']:rb0['w1']] = chunk0[:wl]
     for j in range(rb0['out_len']):
         pos = rb0['c0'] + j
@@ -116,7 +132,8 @@ def run_trial(model, hp, device, rng):
 
     # --- swap test: slot 1 (normally recalls chunk0) given chunk1's warmup instead ---
     tok2 = tok.copy()
-    tok2[rb0['sl0']:rb0['sl1']] = sids
+    tok2[rb0['sl0']] = HMN_OP_UPDATE
+    tok2[rb0['sl0'] + 1:rb0['sl1']] = sids
     tok2[rb0['w0']:rb0['w1']] = chunk1[:wl]  # SWAPPED — real chunk1 bytes, in the "recall chunk0" slot
 
     def fwd_at2(pos):
@@ -146,13 +163,24 @@ def main():
     p.add_argument('--device', default='cpu')
     p.add_argument('--n-trials', type=int, default=5)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--chunk-len', type=int, default=64)
+    p.add_argument('--warmup-len', type=int, default=None,
+                   help='overrides hp["warmup_len"] — required for _grid/_grid_shapes-style '
+                        'configs where the stage-level fallback was never actually trained on '
+                        'at this --chunk-len (pass a warmup_len that WAS trained at this length)')
+    p.add_argument('--anchor', type=int, default=0,
+                   help='warmup_start offset into each query span — 0 reproduces the original '
+                        'probe behavior; for an anchor-swept checkpoint, pass a non-zero anchor '
+                        'that was actually trained (see --warmup-len) for a fair test')
     args = p.parse_args()
 
     device = torch.device(args.device)
     model, hp = _load(args.ckpt, device)
     rng = np.random.default_rng(args.seed)
 
-    results = [run_trial(model, hp, device, rng) for _ in range(args.n_trials)]
+    results = [run_trial(model, hp, device, rng, chunk_len=args.chunk_len,
+                         warmup_len=args.warmup_len, anchor=args.anchor)
+              for _ in range(args.n_trials)]
     b = np.mean([r['baseline_match_vs_chunk0'] for r in results])
     s1 = np.mean([r['swap_match_vs_chunk1'] for r in results])
     s0 = np.mean([r['swap_match_vs_chunk0'] for r in results])

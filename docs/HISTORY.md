@@ -1372,3 +1372,174 @@ rather than trusting shape-match alone). Configs that train from scratch
 (`hmn_notags_w25`, `hmn_notags_locate` — no `_pretrained_ckpt` key) are
 unaffected and were used to verify the promotion (see CLAUDE.md's Results
 section for the training-run status).
+
+### 16. Post-promotion config cleanup, RoPE-vs-NoPE head-to-head, anchor-variation attack on the positional shortcut, and mechanistic verification tooling
+
+**Config cleanup.** Once the promotion (§15) stabilized and `hmn_notags_w25`
+started producing real results, the active `kvmem/configs/` directory was
+pruned: 19 completed/superseded configs (`hmn_recall_queue`, `hmn_routing_
+4to1_state`, `hmn_weave_mix*`, all `*_dualrope`/`*_scaledrope`/`*_relpos`
+variants, `hmn_single_recall_c128`/`_repeat4`/`_locate`, the `hmn_squeeze_
+random_n4`/`_sanity_bigmodel_n4`/`_sweetspot_n4` variants, `hmn_weave_c64_
+adaptive`, `hmn_accum_rnn_sanity`) were `git mv`'d into `kvmem/configs/
+archive/` — their numeric results are already preserved in CLAUDE.md/this
+doc and in `logs/`, so archiving the config file itself loses nothing.
+Three configs were explicitly kept in place as future experiment bases per
+request: `hmn_weave_c64.py`, `hmn_stitch_src1024.py`, `hmn_squeeze_markov_
+n4.py`. Separately, the `hmn_v1_backup.py`–`hmn_v4_backup.py` dated
+snapshots (pure diffing artifacts, see CLAUDE.md's docs table) were deleted
+outright.
+
+**A confirmed correctness bug + a deprecation, found during a code review
+of `kvmem/hmn.py`** (requested explicitly as a review, not part of any
+feature work): `_dual_positions` (`dual_rope`) and `_scaled_state_positions`
+(`rope_state_scale`) both still referenced stale `sla0`/`sla1`/`slb0`/
+`slb1` refine-block field names from BEFORE the opcode/end-of-turn-STATE
+redesign — confirmed via direct reproduction to crash (`KeyError: 'sla0'`)
+on any refine trajectory, and further investigation while fixing this
+found a second, more severe latent bug: both functions ALSO crashed (or,
+worse, silently miscomputed) on the ordinary case of a *terminal* query
+(`sl0=None`), because they assumed STATE always precedes warmup/response —
+true under the old pre-filter-STATE layout, false since the end-of-turn-
+STATE redesign. Fixed properly with per-op origin tracking (mirroring the
+`op_first_w0` pattern already used in `chunk_mask_fb_traj`), verified
+across terminal/relay-chain/refine cases. Per user instruction, both
+`dual_rope` and `rope_state_scale` are now marked **deprecated** in their
+own docstrings (all three attempted positional-shortcut fixes — dual_rope,
+rope_state_scale, relpos — either failed or were abandoned, see §12-13) —
+kept correct rather than deleted, but flagged not to build new work on.
+A third finding, `_iter_forward_segments`/`_forward_segmented`
+(`forward_granularity`), turned out to be broken in EVERY case under the
+current design (not just refine) — `start = rb['sl0']` is wrong whether
+`sl0` is `None` (terminal, crashes) or present (non-terminal, `sl0 > c1`
+now, so `seg_start > seg_end` silently). Rather than patch this without
+the segment-tiling verification the project's own masking-change rule
+requires, it now raises `NotImplementedError` immediately — honest
+disabled-state until someone re-derives and re-verifies it properly.
+
+**`hmn_notags_w25` vs `hmn_notags_w25_rope` — a live, step-aligned RoPE-
+vs-NoPE comparison.** `hmn_notags_w25_rope` (identical config to `hmn_
+notags_w25` — same 4-stage curriculum, same anchor-varying single-chunk
+recall — except `rope=True`) was run specifically to answer: does RoPE
+help or hurt under the new opcode/no-tags design, now that NoPE is the
+default. Result, unambiguous: RoPE converges dramatically faster and
+higher than NoPE at every single directly-comparable stage/step, no
+exceptions. Early-stop thresholds (80% val MEAN) that NoPE never reached
+in stages 0/1/3 (manually stopped at 65.3% best in stage3, never
+converged) were cleared by RoPE within a fraction of the steps: stage0
+early-stopped at 91.7% (step 48000, vs NoPE's 59.7% at the same step),
+stage1 at 81.5% (step 36000, vs 53.2%), stage2 at 90.0% (step 72000, vs
+62.3%), and stage3 itself early-stopped at 80.2% (step 288000) — the one
+stage NoPE never converged on at all. One transient dip (stage3, step
+180000: RoPE dropped to 24.9% while NoPE was 62.5% at that step) recovered
+fully by the next eval (79.1%) and was not a sustained regression — plausibly
+adaptive-reweighting noise, not instability. This is a genuinely
+surprising result worth flagging honestly: the earlier `hops=1`
+positional-shortcut investigation (§12-13) was all conducted UNDER RoPE
+(the old tagged design's default), and every fix attempted THERE (dual_rope,
+rope_state_scale, relpos) tried to change the RoPE mechanism itself —
+but this head-to-head suggests RoPE alone (under the NEW opcode/no-tags/
+end-of-turn-STATE design) is a strong convergence aid, not the source of
+the problem it was once blamed for. That reframes the positional-shortcut
+question entirely (see below).
+
+**`hmn_notags_weave_anchor(_rope)` — attacking the positional shortcut via
+anchor variation instead of position-encoding changes.** Given the RoPE
+result above, the natural next question is whether the ORIGINAL `batch`/
+`interleave_delayed` positional-shortcut ceiling (§12, all three RoPE-
+mechanism fixes failed to move it) can instead be fixed by never letting a
+query's warmup land at a single fixed position — the same idea `hmn_
+notags_w25`'s own `_grid` anchor sweep already validated for single-chunk
+recall, generalized to `chunk_positions_traj`'s multi-query `Q(s,e,
+warmup_start,warmup_len)` DSL token. New helper `_grid_shapes` (in both
+`hmn_notags_weave_anchor.py` and its `_rope` sibling) generates, for each
+of `batch`/`stream`/`interleave_delayed`, a sweep across `chunk_len` in
+{8,16,32,64} x several non-zero-biased anchor offsets — built on top of
+`hmn_weave_c64.py`'s two-stage difficulty ramp (`hops=1`, nc=2/wc=1 then
+nc=4/wc=2), the exact shape the original positional-shortcut ceiling was
+measured at. Caught and fixed one real bug in the first draft before it
+shipped: `_e_block` initially emitted bare `E{n}` tokens which silently
+ignore the swept `chunk_len` (only `E(len)` actually sets it via `parse_
+traj_dsl`) — every entry would have trained at the stage-default `chunk_
+len=64` regardless of the intended sweep. Fixed and re-verified (`dsl_
+chunk_len` confirmed to vary correctly across entries) before queuing.
+
+Two variants were built and QUEUE-REORDERED per explicit request (RoPE
+first, since it was clearly winning): `hmn_notags_weave_anchor_rope.py`
+(rope=True, warm-started from `hmn_notags_w25_rope`'s checkpoint) now runs
+BEFORE `hmn_notags_weave_anchor.py` (NoPE, warm-started from `hmn_notags_
+w25`'s checkpoint) — both same-vocab warm-starts, safe under the
+`_pretrained_ckpt` caveat above.
+
+**Positional-shortcut probe — two real bugs found and fixed, plus CLI
+extensions to make it usable against an anchor-swept checkpoint.**
+`kvmem/probe_positional_shortcut.py` predates the opcode redesign and
+crashed immediately (`ValueError: could not broadcast ... shape (8,) into
+shape (9,)`) — it wrote `state_len`-wide STATE blocks where the actual
+layout is `1+state_len` wide (opcode + values). Fixed (write `HMN_OP_
+UPDATE` at `sl0`, values at `sl0+1:sl1`, matching `make_batch_tagged`'s own
+convention). After that fix, the FIRST corrected run still came back with
+a near-zero "baseline" sanity check (0.2-0.4% — the model apparently
+couldn't even recall its own correct warmup), which turned out to be a
+second bug: the probe hardcoded `chunk_len=64` and read `warmup_len` from
+`hp['warmup_len']` — the stage-level FALLBACK, never actually trained on
+for a `_grid_shapes`-style config where every entry sets its own
+`warmup_len` via the DSL. Worse, `traj_batch(2,1)` (used to build the test
+trajectory) always defaults `warmup_start=0`, silently locking the probe
+to the one anchor value the whole anchor-variation design exists to avoid
+over-representing — and empirically the weakest/most-undertrained corner
+at `chunk_len=64` specifically (longest possible response). Added
+`--chunk-len`/`--warmup-len`/`--anchor` CLI overrides and replaced the
+`traj_batch(2,1)` call with an equivalent hand-built `ops` list that
+threads `anchor` through each `Q`'s 3rd argument. With overrides picking
+combinations actually trained (chunk_len 8/16/32, several anchors,
+`stage0_best.pt` of `hmn_notags_weave_anchor_rope`), the probe finally ran
+cleanly: **content-addressed at every converged length** (0-3% match to
+the wrong/"usual" chunk vs. 73-100% match to the correct swapped content —
+no sign of the old shortcut). `chunk_len=64` came back inconclusive
+because baseline recall itself hasn't converged there yet (0.4%) — not
+evidence of anything, just insufficient training so far at that length.
+
+**Mechanistic verification, beyond the purely behavioral swap test.** A
+correct swap-test OUTPUT doesn't by itself prove the network's internal
+computation actually reads the swapped STATE — it could in principle be
+right for an unrelated reason that happens to correlate in this
+construction. Two additions close that gap:
+- `kvmem/hmn.py`: `MHAttention` gained an opt-in diagnostic flag,
+  `capture_attn` (unset/`False` everywhere by default — checked via
+  `getattr(self, 'capture_attn', False)`, so it changes nothing about
+  training/eval/decode unless explicitly set). When enabled it forces the
+  attention module through its ALREADY-EXISTING manual-softmax branch
+  (previously only reachable via `logit_cap`/`attn_temp`) instead of fused
+  SDPA — mathematically identical, just not opaque — and stashes `self.
+  last_attn_probs` (B,H,Lq,Lkv) for inspection after the call.
+- `kvmem/probe_mechanistic_addressing.py` (new): teacher-forces the swap-
+  test continuation with chunk1's TRUE bytes (the content-addressed
+  hypothesis as the target, not whatever the model would freely generate),
+  then checks two independent internal signals: (1) per-layer attention
+  mass from the response rows onto STATE0's columns (the "usual"/wrong
+  slot) vs STATE1's columns (the swapped-in, correct content); (2)
+  gradient saliency at the embedded input (before layer 0, via a forward-
+  pre-hook + `retain_grad()`) — L2 norm and signed input×gradient, backprop
+  from the teacher-forced NLL loss.
+
+Run at two lengths against `hmn_notags_weave_anchor_rope`'s `stage0_
+best.pt` (chunk_len=32/warmup_len=8/anchor=0 and chunk_len=16/warmup_len=4/
+anchor=0), both gave a clean, consistent story: layer 1 concentrates
+85-94% of attention mass onto STATE1 (vs 6-15% onto STATE0); gradient L2
+norm at STATE1 is 2.7-3x that at STATE0, with the input×gradient sign
+flipping as expected (positive at STATE1 — increasing it helps the
+correct-token log-prob — negative at STATE0). Layers 6-7 show ~zero direct
+attention to either STATE region, consistent with layer 1 having already
+pulled the needed value into the residual stream, with later layers
+refining the local prediction rather than re-reading STATE. **This
+mechanistically confirms** the earlier purely-behavioral result — the
+network's internal computation genuinely traces back to the swapped
+content, not a coincidental output match.
+
+**Status as of this writing**: `hmn_notags_weave_anchor_rope` is training
+(stage1, the harder nc=4/wc=2 shape); `chunk_len=64`'s recall needs to
+improve further (currently ~10% mid-stage1, well below a useful testing
+threshold) before the probe (behavioral + mechanistic) can be re-run at
+that length to close the one open question. `hmn_notags_weave_anchor`
+(NoPE) is queued behind it.

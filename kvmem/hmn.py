@@ -2077,7 +2077,14 @@ class MHAttention(nn.Module):
         # Logit soft-cap or learned temperature: bypass SDPA, compute manually.
         # Chunked attention: compute in row-chunks (chunk_attn=0 = full SDPA).
         chunk = getattr(self, 'chunk_attn', 0)
-        if self.logit_cap > 0 or self.attn_temp:
+        # capture_attn: diagnostic-only opt-in (set externally, e.g. `attn.capture_attn
+        # = True` — not a constructor arg, never touched by training/normal decode),
+        # forces the manual softmax branch below (mathematically identical to SDPA,
+        # just not fused) so `self.last_attn_probs` (B,H,Lq,Lkv) is available after
+        # the call for mechanistic analysis (see kvmem/probe_mechanistic_addressing.py).
+        # Default False everywhere → zero behavior change for training/eval/decode.
+        capture_attn = getattr(self, 'capture_attn', False)
+        if self.logit_cap > 0 or self.attn_temp or capture_attn:
             scale = 1.0 / math.sqrt(dh)
             if self.attn_temp:
                 # per-head multiplicative scale: exp(log_temp) / sqrt(d_head)
@@ -2086,7 +2093,10 @@ class MHAttention(nn.Module):
             if self.logit_cap > 0:
                 scores = torch.tanh(scores / self.logit_cap) * self.logit_cap
             scores = scores + mask.unsqueeze(0).unsqueeze(0)
-            out = torch.softmax(scores, dim=-1) @ V
+            probs = torch.softmax(scores, dim=-1)
+            if capture_attn:
+                self.last_attn_probs = probs.detach()
+            out = probs @ V
         elif chunk > 0 and L > chunk:
             m = mask.unsqueeze(0).unsqueeze(0)           # (1,1,L_q,L_kv)
             parts = []
