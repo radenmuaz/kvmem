@@ -1537,9 +1537,94 @@ mechanistically confirms** the earlier purely-behavioral result — the
 network's internal computation genuinely traces back to the swapped
 content, not a coincidental output match.
 
-**Status as of this writing**: `hmn_notags_weave_anchor_rope` is training
-(stage1, the harder nc=4/wc=2 shape); `chunk_len=64`'s recall needs to
-improve further (currently ~10% mid-stage1, well below a useful testing
-threshold) before the probe (behavioral + mechanistic) can be re-run at
-that length to close the one open question. `hmn_notags_weave_anchor`
-(NoPE) is queued behind it.
+**Status**: `hmn_notags_weave_anchor_rope` finished (stage1 best=20.9%
+overall MEAN). Per-`chunk_len` trend across the whole stage showed cl8/16/
+32 all still climbing (16→22%, 18→26%, 17→23%) — undertrained, not
+capacity-limited — while cl64 stayed flat the entire stage (10.3%→12.4%,
+no trend at all), a genuine plateau distinct from "just slower," similar
+in shape to `hmn_weave_mix_accum_rnn`'s pre-`repeat_batch` plateau. LR had
+fully annealed by the end, so this run couldn't resolve it further; the
+cl64 mechanistic-probe question (does content-addressing hold at that
+length) remains open, not because it failed but because recall itself
+never got good enough there to test meaningfully. `hmn_notags_weave_anchor`
+(NoPE) is now running in its place.
+
+### 17. Refine-round redesign: uniform `[STATE][w][content]` primitive, within-op bottleneck relay, and exposure-bias training on `am`
+
+A further redesign of the refine mechanism (§15/§16's opcode-based refine
+was implemented but never exercised by any trained config), worked through
+via the same hand-derived-trajectory-then-verify discipline as every prior
+masking change. Motivation: make every round — round-0 and every refine
+round alike — reduce to ONE repeating unit, `[STATE if any] -> w ->
+content`, instead of three visually different shapes (encode's `[src]
+[STATE]`, round-0's bare `[w][r]`, and the old refine round's `[OPF][am]
+[STATE][w][r]` with content split awkwardly around the STATE block).
+
+**New refine round shape**: `[wa][OP_FEEDBACK][am][feedback-STATE][w][c]
+[commit-STATE?]` — two `[w][content]` units back to back. `wa`/`am` is a
+self-correct half: `am` is the PREVIOUS round's own argmax fed back as
+context (unchanged mechanism), `wa` is the warmup re-presented BEFORE it
+(previously argmax came first, warmup second — reordered so every unit in
+the whole trajectory starts with warmup, matching round-0's own shape).
+`w`/`c` is the answer half: warmup re-presented again, then the real,
+fully-supervised response, generated under the now-refined feedback-STATE.
+
+**Three concrete changes, each verified independently**:
+1. **Post-response commit-STATE is now MANDATORY between rounds**, not just
+   claimed-by-trailing-`'S'` for external relay. Round-0 → refine-round-1
+   and refine-round-i → refine-round-i+1 each go through an `UPDATE`-opcode
+   commit unconditionally (`sl0/sl1`, unified field name — the old
+   `end_sl0/end_sl1` is gone entirely, since a refine round's mid-round
+   feedback values now live in a separate `fsl0/fsl1` field, freeing
+   `sl0/sl1` for the same post-response-commit role every rec_block type
+   uses). Only the LAST round of an op keeps the old optional/claimed
+   behavior (nothing to commit to if nothing downstream relays from it).
+2. **Within-op round transitions are now masked EXACTLY like a between-op
+   relay hop** — round i+1 sees ONLY `allowed_state` (unchanged external
+   relay) plus round i's `sl0/sl1` commit-STATE, not free raw lookback into
+   round i's own `wa`/`am`/`w`/`c` bytes (the old rule was `own =
+   allowed_state | c >= op_first_w0[op_idx]`, unrestricted lookback across
+   the WHOLE op's history). Verified via direct mask-matrix inspection: a
+   round's self-correct-half row correctly `ALLOW`s the immediately
+   preceding round's commit-STATE while `BLOCK`ing that round's own raw
+   `wa`/`am`/`w`/`c` content and the round before THAT entirely, while
+   same-round content (e.g. the response row seeing its own round's
+   `wa`/`am`/feedback-STATE) stays `ALLOW`ed, and external relay/encoding-
+   pass access (`hops`, `allowed_state`) is unaffected.
+3. **`am` (the argmax feedback) is now NLL-scored too** — an exposure-bias-
+   training addition: the model must predict correctly even from a context
+   built from its own possibly-wrong prior guess, not just from clean
+   ground-truth contexts. Critically, the loss TARGET at `am0:am1` is NOT
+   `am`'s own token content (which holds the argmax/placeholder value, not
+   ground truth, once training-time argmax injection is wired in) — it's
+   `gt_c0:gt_c0+out_len` (round-0's own response start, a new field, never
+   touched by argmax-overwrite, the same ground truth every round's own
+   `c0:c1` already targets). Scoring `am` against itself would just reward
+   self-consistency with its own mistakes; scoring against `gt_c0` rewards
+   getting the actual right answer regardless of what context it's sitting
+   in — the actual point of exposure-bias training.
+
+Touched `chunk_positions_traj` (construction), `chunk_mask_fb_traj`
+(masking — `_relay_source` simplified now that `sl0/sl1` is uniform,
+new `prev_state_for_round` bookkeeping for the within-op relay),
+`make_batch_tagged` (fills `wa0:wa1`/`fsl0:fsl1`, same placeholder-argmax
+caveat as before — this function has no forward pass to draw a real
+argmax from), `ar_decode_traj_nokv` (decode-time argmax is real, as
+before — just re-presents `wa` before it now), and the `weave_mix` training
+loop's loss computation (new `wa`/`am` NLL terms). A real bug was caught
+and fixed during this pass: the `'S'`-claim logic in `chunk_positions_traj`
+still branched on rec_block type to choose `end_sl0`/`end_sl1` for refine
+blocks — a field that no longer exists post-unification — silently
+creating a stray dict key instead of claiming `sl0`/`sl1`, which would have
+left every claimed refine relay permanently `None` (external ops could
+never actually relay from a refine op). Caught immediately by testing the
+claim path directly (not assumed working), fixed by unifying the claim
+target to always be `sl0`/`sl1`.
+
+**Verified, not run in real training**: direct mask-matrix inspection (as
+above) plus real `train()` smoke tests — single-op multi-round refine,
+a between-op relay where BOTH ops have refine rounds, and the full
+enhanced loss computation including the new `wa`/`am` terms — all ran
+cleanly with no crashes. No config sets `n_refine>0` yet, so nothing live
+was disrupted; this redesign is implemented and verified but not yet
+exercised by an actual training run.

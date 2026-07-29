@@ -287,16 +287,42 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
                                 Every chunk in the span must already be
                                 encoded (causal requirement, asserted below).
 
-    n_refine>0: each refine round is `[OP_FEEDBACK][argmax feedback, out_len
-    raw bytes][feedback STATE values][re-presented warmup][new response]` —
-    see docs/HISTORY.md §15's refine-trajectory + boundary-fix derivation
-    for why OP_FEEDBACK precedes the argmax content specifically (argmax
-    feedback and the previous round's response are both raw byte-range
-    tokens with no other structural cue marking the boundary between them).
-    A refine round's `sl0/sl1` are ALWAYS its feedback STATE values (not
-    optional) — a separate `end_sl0/end_sl1` holds the OPTIONAL end-of-turn
-    STATE, claimable by a trailing 'S' only on the last round emitted for
-    this op (same terminal-op-omission rule as round-0-only queries).
+    n_refine>0 (REDESIGNED again, docs/HISTORY.md §16/§17): every round —
+    round-0 AND every refine round — reduces to the SAME repeating unit,
+    `[STATE if any] -> w -> content`, with a refine round consisting of
+    TWO such units back to back: a self-correct half `[wa][OP_FEEDBACK][am]`
+    (am = previous round's own argmax, fed back as context, NLL-scored
+    against the SAME ground-truth continuation as every `c0:c1` — exposure-
+    bias training: predict correctly even while sitting in a context built
+    from your own possibly-wrong prior guess) then `[feedback STATE
+    values]`, then an answer half `[w][c]` (re-presented warmup, then the
+    real, fully-supervised response) using the now-refined feedback STATE.
+    OP_FEEDBACK precedes `am` specifically because `wa` and `am` are both
+    raw byte-range regions with no other structural cue marking the
+    boundary (the STATE->w boundary elsewhere never needs this, since
+    STATE IDs are already vocab-distinguishable from raw bytes).
+
+    Every round's OWN `w0:c1` (the answer half) is followed by a
+    POST-RESPONSE commit STATE — `sl0/sl1`, opcode=update — that is now
+    MANDATORY whenever a subsequent round exists for this op (round-0 ->
+    refine-round-1, refine-round-i -> refine-round-i+1), not just when an
+    external op relays from it. Only the LAST round emitted for an op
+    keeps the old OPTIONAL/claimed-by-trailing-'S' behavior (nothing
+    downstream needs it for a terminal op). This unifies what used to be
+    a separate `end_sl0/end_sl1` field on 'refine' blocks — every
+    rec_block, 'initial' or 'refine', now uses the SAME `sl0/sl1` for
+    "this round's post-response commit," full stop; a refine round's
+    mid-round feedback-STATE values instead live in `fsl0/fsl1` (distinct
+    field, since a round can have both a mid-round feedback commit AND an
+    end-of-round one).
+
+    A within-op round transition (round i's `sl0/sl1` -> round i+1's
+    `wa`/first content) is masked EXACTLY like a between-op relay hop
+    (see chunk_mask_fb_traj) — round i+1 does NOT get raw lookback into
+    round i's own w/am/c bytes, only through this STATE bottleneck. This
+    replaces the old "own = allowed_state | everything since op_first_w0"
+    rule, which gave every refine round free raw access to the whole op's
+    history.
 
     Relay: same single-hop STATE-to-STATE attention permission as
     chunk_positions_hop (see chunk_mask_fb_traj), grouped by op_idx instead of
@@ -357,22 +383,27 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
                 pending_chunk_idx = None
             elif pending_query_i is not None:
                 # Claims the just-finished 'Q' (or its last refine round) — its
-                # END-OF-TURN STATE, built from whatever the relay/hops window
-                # made available to its warmup+response PLUS its own warmup+
-                # response content (see docs/HISTORY.md §15). Needed only when a
-                # LATER op will relay from it — a terminal query has no trailing
-                # 'S' and simply never gets one (the double-state-redundancy
-                # fix). 'initial' type stores this in sl0/sl1 (never otherwise
-                # used, since round-0-only queries have no feedback values);
-                # 'refine' type stores it in end_sl0/end_sl1 (sl0/sl1 on a
-                # refine block always holds that round's feedback STATE values).
+                # POST-RESPONSE commit STATE, built from whatever the relay/hops
+                # window made available to its warmup+response PLUS its own
+                # warmup+response content (see docs/HISTORY.md §16/§17). Needed
+                # only when a LATER op will relay from it — a terminal query has
+                # no trailing 'S' and simply never gets one (the double-state-
+                # redundancy fix). ALWAYS stored in sl0/sl1 now, for both
+                # 'initial' and 'refine' types — a refine round's MID-round
+                # feedback-STATE values live in the separate `fsl0/fsl1` field,
+                # so `sl0/sl1` is free for this same post-response-commit role
+                # on every rec_block type uniformly (no more separate
+                # `end_sl0/end_sl1`). Only reachable here for the round where
+                # sl0 is still None (the last round of the op — every earlier
+                # round already got a MANDATORY internal sl0/sl1, see the
+                # 'refine' round-construction loop above).
+                assert rec_blocks_c[pending_query_i]['sl0'] is None, \
+                    'pending_query_i should only ever point at a round whose sl0 is still unset'
                 sl0, sl1 = _emit_state_block(HMN_OP_UPDATE)
-                claimed_type = rec_blocks_c[pending_query_i]['type']
-                key0, key1 = ('sl0', 'sl1') if claimed_type == 'initial' else ('end_sl0', 'end_sl1')
-                rec_blocks_c[pending_query_i][key0] = sl0
-                rec_blocks_c[pending_query_i][key1] = sl1
-                rec_blocks_m[pending_query_i][key0] = sl0
-                rec_blocks_m[pending_query_i][key1] = sl1
+                rec_blocks_c[pending_query_i]['sl0'] = sl0
+                rec_blocks_c[pending_query_i]['sl1'] = sl1
+                rec_blocks_m[pending_query_i]['sl0'] = sl0
+                rec_blocks_m[pending_query_i]['sl1'] = sl1
                 pending_query_i = None
             else:
                 # Bare 'S' — no immediately-preceding unclaimed 'E' or 'Q' —
@@ -422,48 +453,70 @@ def chunk_positions_traj(chunk_len: int, state_len: int, warmup_len: int,
                             # rather than always byte 0, with no new batch-filling code needed.
                             # warmup_x_dist stays 'fixed' (rng.integers(x,x+1) always returns x).
                             warmup_train_range=(warmup_start, warmup_start), warmup_x_dist='fixed')
+            # sl0/sl1 (post-response commit-state) is now MANDATORY whenever
+            # refine rounds follow (round0 -> refine-round-1 is an internal
+            # transition needing a STATE bottleneck regardless of whether any
+            # EXTERNAL op relays from this one) — else the old optional/
+            # claimed-by-trailing-'S' behavior, unchanged.
+            if n_refine > 0:
+                sl0, sl1 = _emit_state_block(HMN_OP_UPDATE)
+            else:
+                sl0 = sl1 = None
             rec_blocks_c.append(dict(type='initial', span=(span_s, span_e), span_len=span_len,
                                      out_len=out_len, is_clean=(n_refine == 0), op_idx=op_idx,
                                      w0=w0, w1=w1, c0=c0, c1=c1,
-                                     sl0=None, sl1=None,  # filled in IF a trailing 'S' claims this
-                                                          # Q AND n_refine==0 (no refine rounds follow)
+                                     sl0=sl0, sl1=sl1,
                                      **rw_extra))
             rec_blocks_m.append(dict(type='initial', span=(span_s, span_e), op_idx=op_idx,
-                                     w0=w0, w1=w1, c0=c0, c1=c1, sl0=None, sl1=None))
+                                     w0=w0, w1=w1, c0=c0, c1=c1, sl0=sl0, sl1=sl1))
             pending_query_i = len(rec_blocks_c) - 1
 
-            # Refine rounds (docs/HISTORY.md §15's refine-trajectory + boundary-fix
-            # derivation): each round is [OP_FEEDBACK][argmax feedback, out_len raw
-            # bytes][feedback STATE values][re-presented warmup][new response]. OP_F
-            # precedes the argmax content specifically because argmax feedback and
-            # the previous round's response are BOTH raw byte-range tokens with
-            # nothing else marking the boundary between them (unlike E->STATE or
-            # STATE->warmup, which are already vocab-distinguishable) — see the
-            # "boundary problem" discussion in docs/HISTORY.md §15. The feedback
-            # STATE values themselves need no separate marker (raw-byte->STATE-ID
-            # is already vocab-distinguishable). `sl0/sl1` here are ALWAYS the
-            # feedback values (not optional, unlike 'initial' type) — a genuinely
-            # separate `end_sl0/end_sl1` holds the optional end-of-turn STATE,
-            # claimable by a trailing 'S' only on the LAST round emitted.
+            # Refine rounds — REDESIGNED (docs/HISTORY.md §16/§17): every round
+            # is now [wa][OP_FEEDBACK][am][feedback-STATE][w][c][sl0/sl1?] — two
+            # `[w][content]` units back to back. `wa`/`am` is the self-correct
+            # half: `am` is the PREVIOUS round's own argmax fed back as context,
+            # NLL-scored against `gt_c0` (round-0's response start — the SAME
+            # ground truth every round's own `c0:c1` uses, since `am0:am1` gets
+            # overwritten with the argmax guess and is no longer literal ground
+            # truth) — exposure-bias training: predict correctly even from a
+            # context built from your own possibly-wrong prior guess. `w`/`c` is
+            # the answer half: re-presented warmup, then the real response,
+            # using the just-refined feedback-STATE. OP_FEEDBACK precedes `am`
+            # because `wa`/`am` are both raw byte-range regions with nothing
+            # else marking the boundary (STATE->w never needs this — STATE IDs
+            # are already vocab-distinguishable from raw bytes). `sl0/sl1`
+            # (post-response commit) is MANDATORY whenever another round
+            # follows (round i -> round i+1 goes through this STATE bottleneck,
+            # no raw lookback into round i's own bytes — see chunk_mask_fb_
+            # traj) and OPTIONAL/claimed-by-trailing-'S' only on the LAST round.
+            gt_c0 = c0  # round-0's response start — canonical ground-truth
+                       # source for every later round's am0:am1
             prev_c0 = c0
-            for _ in range(n_refine):
+            for round_i in range(n_refine):
+                wa0 = offset; wa1 = wa0 + warmup_len; offset = wa1
                 opf0 = offset; offset += 1
                 am0 = offset; am1 = am0 + out_len; offset = am1
-                sl0 = offset; sl1 = sl0 + state_len; offset = sl1
+                fsl0 = offset; fsl1 = fsl0 + state_len; offset = fsl1
                 rw0 = offset; rw1 = rw0 + warmup_len; offset = rw1
                 rc0 = offset; rc1 = rc0 + out_len; offset = rc1
+                is_last_round = (round_i == n_refine - 1)
+                if not is_last_round:
+                    sl0, sl1 = _emit_state_block(HMN_OP_UPDATE)
+                else:
+                    sl0 = sl1 = None  # optional — filled in IF a trailing 'S' claims THIS round
                 rec_blocks_c.append(dict(type='refine', span=(span_s, span_e), span_len=span_len,
                                          out_len=out_len, is_clean=True, op_idx=op_idx,
-                                         opf0=opf0, am0=am0, am1=am1, sl0=sl0, sl1=sl1,
+                                         wa0=wa0, wa1=wa1, opf0=opf0, am0=am0, am1=am1,
+                                         fsl0=fsl0, fsl1=fsl1,
                                          w0=rw0, w1=rw1, c0=rc0, c1=rc1,
-                                         argmax_src_c0=prev_c0,
-                                         end_sl0=None, end_sl1=None,  # filled in IF a trailing
-                                                                      # 'S' claims THIS round
+                                         sl0=sl0, sl1=sl1,
+                                         argmax_src_c0=prev_c0, gt_c0=gt_c0,
                                          **rw_extra))
                 rec_blocks_m.append(dict(type='refine', span=(span_s, span_e), op_idx=op_idx,
-                                         opf0=opf0, am0=am0, am1=am1, sl0=sl0, sl1=sl1,
+                                         wa0=wa0, wa1=wa1, opf0=opf0, am0=am0, am1=am1,
+                                         fsl0=fsl0, fsl1=fsl1,
                                          w0=rw0, w1=rw1, c0=rc0, c1=rc1,
-                                         end_sl0=None, end_sl1=None))
+                                         sl0=sl0, sl1=sl1))
                 prev_c0 = rc0
                 pending_query_i = len(rec_blocks_c) - 1
 
@@ -757,25 +810,36 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
         is_any_enc_state |= (c >= b['sl0']) & (c < b['sl1'])
 
     last_rb_of_op: dict[int, int] = {}
-    op_first_w0: dict[int, int] = {}  # each op's FIRST (round-0) w0 — see 'refine' handling below
     for i_rb, rb in enumerate(rec_blocks):
         last_rb_of_op[rb['op_idx']] = i_rb  # last write wins -> last rec_block per relay-producing op
-        if rb['type'] == 'initial':
-            op_first_w0[rb['op_idx']] = rb['w0']
 
+    # Every rec_block type (initial/noop/refine) now uses sl0/sl1 uniformly for
+    # its own post-response commit STATE (docs/HISTORY.md §16/§17 — a refine
+    # round's MID-round feedback-STATE lives in the separate fsl0/fsl1 field,
+    # freeing sl0/sl1 for this same role on every type).
     def _relay_source(prev_rb: dict) -> tuple[int, int]:
-        # 'noop' type always has a real STATE in sl0/sl1 (never optional — a
-        # bare relay hop always produces one). 'initial' type stores its
-        # (optional) end-of-turn STATE in sl0/sl1 too (never otherwise used
-        # by that type). 'refine' type's sl0/sl1 always holds that round's
-        # feedback STATE values, so its end-of-turn STATE (if any) lives in
-        # the separate end_sl0/end_sl1 fields instead.
-        key0, key1 = ('sl0', 'sl1') if prev_rb['type'] in ('initial', 'noop') else ('end_sl0', 'end_sl1')
-        assert prev_rb[key0] is not None, (
-            f"op_idx={prev_rb['op_idx']} has no end-of-turn STATE (terminal — no trailing "
-            f"'S' claimed it) but a later op is trying to relay from it. Fix the operations "
-            f"list: add an 'S' right after this op if anything downstream needs to relay from it.")
-        return prev_rb[key0], prev_rb[key1]
+        assert prev_rb['sl0'] is not None, (
+            f"op_idx={prev_rb['op_idx']} has no post-response commit STATE (terminal — no "
+            f"trailing 'S' claimed it) but a later op is trying to relay from it. Fix the "
+            f"operations list: add an 'S' right after this op if anything downstream needs "
+            f"to relay from it.")
+        return prev_rb['sl0'], prev_rb['sl1']
+
+    # Within-op round-to-round relay (docs/HISTORY.md §16/§17): round i+1 of a
+    # refine sequence relays from round i's sl0/sl1 EXACTLY like a between-op
+    # relay hop, not free raw lookback into round i's own w/am/c bytes. Built
+    # once, in rec_blocks order (rounds of one op are always contiguous by
+    # construction — chunk_positions_traj emits all of one op's rounds inline
+    # before moving to the next operations-list entry).
+    prev_state_for_round: dict[int, tuple[int, int]] = {}  # rec_block index -> preceding round's (sl0, sl1)
+    _last_round_state: dict[int, tuple[int, int]] = {}     # op_idx -> most recently seen round's (sl0, sl1)
+    for i_rb, rb in enumerate(rec_blocks):
+        if rb['type'] == 'refine':
+            assert rb['op_idx'] in _last_round_state, \
+                f'refine round at rec_block {i_rb} has no preceding round in the same op — construction bug'
+            prev_state_for_round[i_rb] = _last_round_state[rb['op_idx']]
+        if rb['type'] in ('initial', 'refine') and rb['sl0'] is not None:
+            _last_round_state[rb['op_idx']] = (rb['sl0'], rb['sl1'])
 
     def _relay_ranges(op_idx: int) -> list[tuple[int, int]]:
         back_range = range(1, op_idx + 1) if hops == -1 else range(1, hops + 1)
@@ -842,19 +906,24 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
                       (c >= rb['c0']) & (c < rb['c1']))
             blocked |= sl_row[:, None] & ~own_end[None, :]
 
-    # 'refine' type: no nochain-blackout needed WITHIN one op's own rounds
-    # (they're all internal elaboration of the SAME op, not a boundary
-    # between different ops — see docs/HISTORY.md §15) — every row here is
-    # simply allowed to see allowed_state PLUS everything this op has done
-    # so far (from its round-0 w0 onward; causal already caps at the row's
-    # own position, so this can never leak into a DIFFERENT op's content,
-    # since no other op's positions fall inside [op_start, r] for r within
-    # this op's own span).
-    for rb in rec_blocks:
+    # 'refine' type — REDESIGNED (docs/HISTORY.md §16/§17): round i+1 relays
+    # from round i's post-response commit STATE exactly like a between-op
+    # relay hop (prev_state_for_round, built above) — NOT free raw lookback
+    # into round i's own wa/am/fsl/w/c bytes. `own` = allowed_state (external
+    # relay, unchanged) | the ONE preceding round's sl0:sl1 | this round's own
+    # accumulated content from its own start (wa0) onward. Causal masking
+    # already prevents this from ever leaking into a LATER round or a
+    # different op (no other op's/round's positions fall inside
+    # [wa0, r] for r within this round's own span).
+    for i_rb, rb in enumerate(rec_blocks):
         if rb['type'] != 'refine':
             continue
         allowed_state = _allowed_state(rb['op_idx'])
-        own = allowed_state | (c >= op_first_w0[rb['op_idx']])
+        prev_lo, prev_hi = prev_state_for_round[i_rb]
+        own = allowed_state | ((c >= prev_lo) & (c < prev_hi)) | (c >= rb['wa0'])
+
+        wa_row = (r >= rb['wa0']) & (r < rb['wa1'])
+        blocked |= wa_row[:, None] & ~own[None, :]
 
         # OP_FEEDBACK + argmax content treated as one contiguous block for
         # masking purposes (see the boundary-fix rationale in the module's
@@ -862,8 +931,8 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
         am_row = (r >= rb['opf0']) & (r < rb['am1'])
         blocked |= am_row[:, None] & ~own[None, :]
 
-        sl_row = (r >= rb['sl0']) & (r < rb['sl1'])  # feedback STATE values
-        blocked |= sl_row[:, None] & ~own[None, :]
+        fsl_row = (r >= rb['fsl0']) & (r < rb['fsl1'])  # mid-round feedback STATE values
+        blocked |= fsl_row[:, None] & ~own[None, :]
 
         if rb['w0'] < rb['w1']:
             wm_row = (r >= rb['w0']) & (r < rb['w1'])
@@ -871,9 +940,9 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
         out_row = (r >= rb['c0']) & (r < rb['c1'])
         blocked |= out_row[:, None] & ~own[None, :]
 
-        if rb['end_sl0'] is not None:  # optional end-of-turn STATE (last round only)
-            end_row = (r >= rb['end_sl0']) & (r < rb['end_sl1'])
-            blocked |= end_row[:, None] & ~own[None, :]
+        if rb['sl0'] is not None:  # optional post-response commit (mandatory unless the LAST round)
+            sl_row = (r >= rb['sl0']) & (r < rb['sl1'])
+            blocked |= sl_row[:, None] & ~own[None, :]
 
     visible = causal & ~blocked
     return np.where(visible, 0.0, -1e9).astype(np.float32)
@@ -1360,22 +1429,29 @@ def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
                 tok[:, rb['sl0']] = HMN_OP_UPDATE
                 tok[:, rb['sl0'] + 1:rb['sl1']] = sids
 
-        else:  # 'refine' — see this function's docstring re: placeholder (not real) argmax feedback
+        else:  # 'refine' — REDESIGNED (docs/HISTORY.md §16/§17): [wa][OP_FEEDBACK]
+               # [am][feedback-STATE][w][c][sl0/sl1?]. `am0:am1` is filled with a
+               # ground-truth PLACEHOLDER here (this function has no forward pass
+               # to draw a real argmax from — real argmax injection only exists
+               # in the chain_steps/iq_global training loops' _fill_argmax_fb
+               # call, not yet wired into weave_mix; NOT a faithful exposure-bias
+               # training signal until that's done — same pre-existing caveat
+               # this function always had, just restated for the new field names).
             x_min, x_max = rb['warmup_train_range']
             rw_xs = np.array([int(rng.integers(x_min, x_max + 1)) for _ in range(B)])
             tok[:, rb['opf0']] = HMN_OP_FEEDBACK
             for b_idx in range(B):
                 X = rw_xs[b_idx]
+                tok[b_idx, rb['wa0']:rb['wa1']] = gt[b_idx, X:X + wl]
                 tok[b_idx, rb['am0']:rb['am1']] = gt[b_idx, X + wl:X + wl + rb['out_len']]  # placeholder
                 tok[b_idx, rb['w0']:rb['w1']]   = gt[b_idx, X:X + wl]
                 tok[b_idx, rb['c0']:rb['c1']]   = gt[b_idx, X + wl:X + wl + rb['out_len']]
-            # sl0:sl1 is the feedback VALUES ONLY (state_len wide, no opcode slot of
-            # its own — OP_FEEDBACK already sits at opf0, before am; see
-            # chunk_positions_traj's refine layout).
-            tok[:, rb['sl0']:rb['sl1']] = sids
-            if rb['end_sl0'] is not None:  # last round, non-terminal: end-of-turn STATE
-                tok[:, rb['end_sl0']] = HMN_OP_UPDATE
-                tok[:, rb['end_sl0'] + 1:rb['end_sl1']] = sids
+            # fsl0:fsl1 is the mid-round feedback VALUES ONLY (state_len wide, no
+            # opcode slot of its own — OP_FEEDBACK already sits at opf0, before am).
+            tok[:, rb['fsl0']:rb['fsl1']] = sids
+            if rb['sl0'] is not None:  # post-response commit STATE (mandatory unless the LAST round)
+                tok[:, rb['sl0']] = HMN_OP_UPDATE
+                tok[:, rb['sl0'] + 1:rb['sl1']] = sids
 
     tag_pos = np.array([p for p, _ in tags], dtype=np.int64)
     tag_ids = np.array([i for _, i in tags], dtype=np.int64)
@@ -1773,29 +1849,31 @@ def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int
             warmup_src = decoded_by_span.get(rb['span'], gt_span)[ws:ws + wl]
 
         if rb['type'] == 'refine':
-            # REAL argmax feedback here (unlike make_batch_tagged's training-time
-            # placeholder) — `_decode_segment` for the PREVIOUS round already ran
-            # the model and wrote its own greedy predictions into
-            # tok[argmax_src_c0:argmax_src_c0+out_len], so this is genuinely
-            # "feed the model its own prior guess," no extra plumbing needed.
+            # Self-correct half — REAL argmax feedback here (unlike make_batch_
+            # tagged's training-time placeholder): `_decode_segment` for the
+            # PREVIOUS round already ran the model and wrote its own greedy
+            # predictions into tok[argmax_src_c0:argmax_src_c0+out_len], so this
+            # is genuinely "feed the model its own prior guess," no extra
+            # plumbing needed. `wa` is the SAME warmup content re-presented
+            # before it (docs/HISTORY.md §16/§17).
+            if wl > 0:
+                tok[rb['wa0']:rb['wa1']] = warmup_src
             tok[rb['opf0']] = HMN_OP_FEEDBACK
             src_c0 = rb['argmax_src_c0']
             tok[rb['am0']:rb['am1']] = tok[src_c0:src_c0 + rb['out_len']]
-            # sl0:sl1 is the feedback VALUES ONLY (state_len wide) — OP_FEEDBACK
-            # already sits at opf0, before am (see chunk_positions_traj).
-            tok[rb['sl0']:rb['sl1']] = sids
+            # fsl0:fsl1 is the mid-round feedback VALUES ONLY (state_len wide) —
+            # OP_FEEDBACK already sits at opf0, before am.
+            tok[rb['fsl0']:rb['fsl1']] = sids
 
-        # No pre-filter STATE to fill before decoding — warmup/response attend
-        # directly to whatever hops permits (see docs/HISTORY.md §15).
+        # Answer half — warmup/response attend directly to whatever hops
+        # permits (see docs/HISTORY.md §15), no pre-filter STATE needed.
         if wl > 0:
             tok[rb['w0']:rb['w1']] = warmup_src
         _decode_segment(rb)
 
-        end_key0 = 'sl0' if rb['type'] == 'initial' else 'end_sl0'
-        end_key1 = 'sl1' if rb['type'] == 'initial' else 'end_sl1'
-        if rb[end_key0] is not None:  # non-terminal: end-of-turn STATE, built AFTER warmup+response
-            tok[rb[end_key0]]                = HMN_OP_UPDATE
-            tok[rb[end_key0] + 1:rb[end_key1]] = sids
+        if rb['sl0'] is not None:  # post-response commit STATE (mandatory unless the LAST round)
+            tok[rb['sl0']]            = HMN_OP_UPDATE
+            tok[rb['sl0'] + 1:rb['sl1']] = sids
 
         out_len = rb['out_len']
         decoded_by_span[rb['span']] = np.concatenate([
@@ -2923,6 +3001,25 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         tgt = tok_t[:, rb['w0']:rb['c1']]
                         nll_per = _positional_ls_nll(lp, tgt, ls_max)
                         nlls.append(nll_per.mean())
+
+                        if rb['type'] == 'refine':
+                            # Self-correct half (wa/am) — ALSO NLL-scored, exposure-bias
+                            # training (docs/HISTORY.md §16/§17): predict correctly even
+                            # from a context built from your own possibly-wrong prior
+                            # guess. `wa`'s target is literal (tok_t itself — never
+                            # overwritten), but `am0:am1` in tok_t holds an argmax/
+                            # placeholder value, NOT ground truth — its target is
+                            # `gt_c0:gt_c0+out_len` instead (round-0's own response,
+                            # never touched by argmax-overwrite, the SAME ground truth
+                            # every round's own c0:c1 uses).
+                            lp_wa  = F.log_softmax(logits[:, rb['wa0'] - 1:rb['wa1'] - 1], dim=-1)
+                            tgt_wa = tok_t[:, rb['wa0']:rb['wa1']]
+                            nlls.append(_positional_ls_nll(lp_wa, tgt_wa, ls_max).mean())
+
+                            out_len = rb['am1'] - rb['am0']
+                            lp_am  = F.log_softmax(logits[:, rb['opf0']:rb['am1'] - 1], dim=-1)
+                            tgt_am = tok_t[:, rb['gt_c0']:rb['gt_c0'] + out_len]
+                            nlls.append(_positional_ls_nll(lp_am, tgt_am, ls_max).mean())
                     loss = torch.stack(nlls).mean()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -2976,8 +3073,21 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         _log(f'  val/weave/{traj["pattern"]:<20} match={m_:.1f}%  ema_loss={_ema_disp}')
                     vmean = sum(val_means) / len(val_means)
                     _log(f'  val/weave/MEAN               match={vmean:.1f}%')
+
+                    # Per-chunk_len (src size) mean — groups this eval's trajectories by
+                    # traj['chunk_len'] regardless of pattern/anchor, so a sweep like
+                    # `_grid_shapes`'s (chunk_len x anchor x shape) can be read at a glance
+                    # without externally parsing the per-trajectory lines above.
+                    by_cl: dict[int, list[float]] = {}
+                    for t in trajectories:
+                        by_cl.setdefault(t['chunk_len'], []).append(t['last_match'])
+                    for cl in sorted(by_cl):
+                        cl_mean = sum(by_cl[cl]) / len(by_cl[cl])
+                        _log(f'  val/weave/by_chunk_len/{cl:<4}  match={cl_mean:.1f}%  (n={len(by_cl[cl])})')
+
                     _jlog(dict(step=global_step, stage=stage_i, eval_mean=round(vmean, 2),
-                               traj_match=[round(t['last_match'], 2) for t in trajectories]))
+                               traj_match=[round(t['last_match'], 2) for t in trajectories],
+                               by_chunk_len={cl: round(sum(v)/len(v), 2) for cl, v in by_cl.items()}))
                     _eval_count += 1
 
                     if adaptive:
