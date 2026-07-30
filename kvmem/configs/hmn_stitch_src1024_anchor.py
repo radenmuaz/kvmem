@@ -73,10 +73,12 @@ def _grid_stitch(chunk_len, n_chunks, window_chunks, warmup_lens, n_anchors,
 hp = dict(
     d=64, n_layers=8, n_heads=4, V=271,
     block_type='single_attn',
-    lr_max=1.5e-4, lr_min=1e-6, wd=0.001,
-    warmup_steps=500, log_every=1000,
+    # Optim settings copied from hmn_notags_weave_anchor_rope.py (its own
+    # architecture/warm-start lineage), not this file's earlier ad hoc values.
+    lr_max=1e-4, lr_min=1e-6, wd=0.0001,
+    warmup_steps=5000, log_every=1000,
     lr_schedule='cosine_restarts',
-    cosine_T0=40000, cosine_T_mult=1,
+    cosine_T0=150000, cosine_T_mult=1,  # matches the longest stage's own n_steps (see hmn_weave_c64.py's own rationale)
     rope=True, null_kv=True,
     rmsnorm=True,
     name='hmn_stitch_src1024_anchor', seed=51,
@@ -88,37 +90,48 @@ hp = dict(
     wrong_token_weight=0.0,
     val_n_seqs=3,
 
+    adaptive=True,
+    adapt_signal='val_match',
+    adapt_temp=1.0,
+    adapt_ema_alpha=0.5,
+    adapt_floor=0.05,
+
+    # n_steps 10x'd from the original draft; eval_every scaled proportionally.
+    # rb_token: B4 for stage0 (shortest L), B8 for stage1/stage2 (harder,
+    # longer L) — mirrors hmn_notags_weave_anchor_rope.py's own escalating-
+    # with-difficulty repeat_batch pattern (its B8/B16 pair), using the two
+    # values requested here instead.
     curriculum=[
-        dict(n_chunks=4, chunk_len=64, B=6, n_steps=10000, eval_every=2000,
+        dict(n_chunks=4, chunk_len=64, B=6, n_steps=100000, eval_every=20000, early_stop_mean=80.0,
              weave_mix=(
                  _grid_stitch(64, n_chunks=2, window_chunks=2, warmup_lens=[32],
-                              n_anchors=2, min_recall_len=8, rb_token='B6')
+                              n_anchors=2, min_recall_len=8, rb_token='B4')
                  + _grid_stitch(64, n_chunks=4, window_chunks=2, warmup_lens=[32],
-                                n_anchors=3, min_recall_len=8, rb_token='B6')
+                                n_anchors=3, min_recall_len=8, rb_token='B4')
                  + _grid_stitch(64, n_chunks=4, window_chunks=4, warmup_lens=[64],
-                                n_anchors=2, min_recall_len=8, rb_token='B6')
+                                n_anchors=2, min_recall_len=8, rb_token='B4')
              )),
-        dict(n_chunks=8, chunk_len=64, B=6, n_steps=15000, eval_every=3000,
+        dict(n_chunks=8, chunk_len=64, B=6, n_steps=150000, eval_every=30000, early_stop_mean=80.0,
              weave_mix=(
                  _grid_stitch(64, n_chunks=2, window_chunks=2, warmup_lens=[32],
-                              n_anchors=2, min_recall_len=8, rb_token='B6')
+                              n_anchors=2, min_recall_len=8, rb_token='B8')
                  + _grid_stitch(64, n_chunks=4, window_chunks=4, warmup_lens=[64],
-                                n_anchors=2, min_recall_len=8, rb_token='B6')
+                                n_anchors=2, min_recall_len=8, rb_token='B8')
                  + _grid_stitch(64, n_chunks=8, window_chunks=4, warmup_lens=[64],
-                                n_anchors=3, min_recall_len=8, rb_token='B6')
+                                n_anchors=3, min_recall_len=8, rb_token='B8')
                  + _grid_stitch(64, n_chunks=8, window_chunks=8, warmup_lens=[96, 128],
-                                n_anchors=2, min_recall_len=8, rb_token='B6')
+                                n_anchors=2, min_recall_len=8, rb_token='B8')
              )),
-        dict(n_chunks=16, chunk_len=64, B=6, n_steps=15000, eval_every=3000,
+        dict(n_chunks=16, chunk_len=64, B=6, n_steps=150000, eval_every=30000, early_stop_mean=80.0,
              weave_mix=(
                  _grid_stitch(64, n_chunks=4, window_chunks=4, warmup_lens=[64],
-                              n_anchors=2, min_recall_len=8, rb_token='B6')
+                              n_anchors=2, min_recall_len=8, rb_token='B8')
                  + _grid_stitch(64, n_chunks=8, window_chunks=8, warmup_lens=[96, 128],
-                                n_anchors=2, min_recall_len=8, rb_token='B6')
+                                n_anchors=2, min_recall_len=8, rb_token='B8')
                  + _grid_stitch(64, n_chunks=16, window_chunks=8, warmup_lens=[128],
-                                n_anchors=3, min_recall_len=8, rb_token='B6')
+                                n_anchors=3, min_recall_len=8, rb_token='B8')
                  + _grid_stitch(64, n_chunks=16, window_chunks=16, warmup_lens=[128, 192],
-                                n_anchors=2, min_recall_len=8, rb_token='B6')
+                                n_anchors=2, min_recall_len=8, rb_token='B8')
              )),
     ],
 )
