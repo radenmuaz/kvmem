@@ -1,12 +1,26 @@
 # TRC / TPU setup estimate
 
-Not yet implemented — this is a planning estimate for if/when TPU Research
-Cloud (TRC) access is used for this project, written before any actual
-porting work started. Nothing in `kvmem/` currently runs on TPU; the model
-is pure eager PyTorch (`kvmem/hmn.py`/`kvmem/hmn_notags.py`), and every
-number below assumes that porting work happens first (see "Porting
-prerequisite" at the end — this is the actual blocker, not batch size or
-model size).
+**Update (2026-07-30): the port described as a prerequisite below has now
+been done**, driven by a real scale-up experiment (`kvmem/configs/
+hmn_tpu_recall1024_flat.py` — 1024-byte perfect recall from any source
+index, 1.12M params, `d=128/n_layers=16/n_heads=8`; see CLAUDE.md's
+scale-up entry and `kvmem/gate_check.py` for the verification gates run
+against it). `kvmem/hmn.py`'s `train()` now accepts `--device tpu`
+end-to-end: length bucketing (`hp['bucket_lengths']`, `_bucket_ceilings`/
+`_pad_mask_to`/`_pad_tok_to`), per-bucket batch sizing (`token_budget`/
+`attn_sq_budget`), `torch_xla.sync()` + bf16 autocast + host-sync-throttled
+loss logging, a CPU eval replica (autoregressive decode never ported to
+XLA — see "Sequence packing" below, now corrected, and "Other levers"),
+and a vectorized (no more per-row Python loop) `make_batch_tagged`. All
+opt-in via `hp['bucket_lengths']`/`device_str='tpu'` — every existing
+CPU/MPS config is untouched. The rest of this doc is kept as the original
+pre-port estimate PLUS corrections/lessons learned marked inline — read
+the "Update" callouts, not the surrounding prose, for what's now known
+rather than estimated.
+
+Original framing (pre-port, kept for context): a planning estimate for
+if/when TPU Research Cloud (TRC) access is used for this project, written
+before any actual porting work started.
 
 Grounded in `hmn_locate_nope_curriculum_dense.py` specifically (current
 architecture: `d=64, n_layers=8, n_heads=4`, single_attn, 165,568 params;
@@ -30,17 +44,30 @@ mask/batch construction (`make_batch_tagged`, `chunk_mask_fb_traj`), all of
 which currently runs eagerly on CPU before each step. Batch size and model
 size decisions only matter once that's addressed.
 
-## TRC's actual tiers — working assumption: v5e / v5p / v6e
+## TRC's actual tiers — CONFIRMED: `tpu1` is v5e, single chip
 
-**Still unconfirmed which exact generation TRC grants** — their public
-pages don't publish a fixed tier list (quota is "as listed in the
-[applicant's] activation email," per-applicant, not a published default).
-Per explicit instruction, this doc now assumes the grant is one of
-v5e/v5p/v6e (Trillium) — Google Cloud's current GA generations — rather
-than the old (2022-2023-era, now likely stale) v2/v3/v4 default. **The
-authoritative source is still your own TRC activation email or
-`trc-support@google.com`** — treat everything below as the estimate to
-redo once that's in hand, not a confirmed grant.
+**Update (2026-07-30): confirmed, not assumed.** `gcloud compute tpus
+tpu-vm describe tpu1 --zone=europe-west4-b` reports `acceleratorType:
+v5litepod-1`, `runtimeVersion: v2-alpha-tpuv5-lite`. This is **one v5e
+chip** (`torch_xla.runtime.global_runtime_device_count()` returns `1`,
+`xm.get_xla_supported_devices()` returns `['xla:0']`), NOT a `-8` slice —
+the ×8 multi-chip table further down (batch size, "replicate the model,
+shard the batch") does not apply to this VM at all; there is nothing to
+shard across. Host: 24 vCPU, 47GB RAM, 77GB free disk. If a `-8` grant is
+obtained later, revisit that table; until then, every number in this doc
+should be read as PER-CHIP with no multiplication.
+
+The tier-uncertainty framing below (v5e vs v5p vs v6e) is now moot for
+`tpu1` specifically — kept for reference in case a different/larger grant
+is obtained later:
+
+**Still unconfirmed for any OTHER grant** — TRC's public pages don't
+publish a fixed tier list (quota is "as listed in the [applicant's]
+activation email," per-applicant, not a published default). Per explicit
+instruction, this doc assumes v5e/v5p/v6e (Trillium) — Google Cloud's
+current GA generations — rather than the old (2022-2023-era, now likely
+stale) v2/v3/v4 default. **The authoritative source is still your own TRC
+activation email or `trc-support@google.com`.**
 
 Specs confirmed live (WebSearch/WebFetch, 2026-07-28, cross-checked against
 `docs.cloud.google.com/tpu/docs/v6e`):
@@ -100,26 +127,63 @@ steps/sec at a GIVEN batch size, not a larger one.
 
 ## Sequence packing
 
+**Update (2026-07-30): the block-diagonal packing recommendation below was
+WRONG, and has been reversed** — see "Correction" immediately below. The
+original text is kept struck-through-in-spirit (not deleted, so the
+reasoning error is on record) followed by the actual implemented approach.
+
 Every stage's dense mix has different `L` per entry (stage3: 36 to 150),
 each currently trained one-at-a-time via weighted random trajectory
 sampling. XLA compiles per unique shape, so naively this triggers a
 recompile storm.
 
-**How much this matters scales WITH model size**:
-- At the current 165K/`d=64` scale, padding every entry up to one fixed
+~~**How much this matters scales WITH model size**:~~
+~~- At the current 165K/`d=64` scale, padding every entry up to one fixed
   max-`L` per stage (simplest option — pad + mask, one XLA compile per
   stage, 4 total for this config) wastes some FLOPs on padding, but the
-  model is so cheap that the waste is irrelevant.
-- At the 10M/50M tier, each token costs real FLOPs, so naive padding starts
+  model is so cheap that the waste is irrelevant.~~
+~~- At the 10M/50M tier, each token costs real FLOPs, so naive padding starts
   leaving real throughput on the table. True block-diagonal packing
   (concatenate several entries into one padded row, block-diagonal
   attention mask preventing cross-entry attention — mechanically
   straightforward since `chunk_mask_fb_traj` already produces a per-entry
   additive mask that composes onto a block-diagonal super-mask) becomes
-  worth the added engineering effort at that scale.
+  worth the added engineering effort at that scale.~~
 
-Start with fixed-max-`L` padding at small scale; only build real packing
-once/if the model size actually moves to the 10M+ tier.
+~~Start with fixed-max-`L` padding at small scale; only build real packing
+once/if the model size actually moves to the 10M+ tier.~~
+
+**Correction: block-diagonal packing is wrong for this codebase at ANY
+model size, not just small ones.** Attention here is dense `O(L^2)` with an
+arbitrary `[L,L]` additive mask (`chunk_mask_fb_traj`'s output — not a
+causal-only pattern a flash-attention kernel could exploit for free).
+Concatenating `K` mix entries into one packed row of length `K*L` costs
+`K^2` attention work where `K` separate batch rows cost `K*(attention work
+for one entry)` — packing is a net FLOP *loss*, not a saving, regardless of
+model size. It only pays off with a block-sparse/varlen attention kernel
+that skips the cross-entry blocks entirely, and `torch_xla`'s available
+flash-attention-style kernels do not accept an arbitrary dense additive
+bias, so that route is closed for this project's masking scheme without a
+custom kernel (out of scope).
+
+**What's actually implemented (verified working, `kvmem/hmn.py`)**: bucket
++ pad + widen the batch axis, exactly as the original small-scale option
+above described, but as the ONLY approach (not a small-scale stopgap) —
+`hp['bucket_lengths']=True` groups a weave_mix's distinct `L` values into
+`<=hp['max_shape_buckets']` ceiling shapes (`_bucket_ceilings`, a weighted
+k-segment DP minimizing `sum(ceiling^2 * weight)` — squared because
+attention cost scales with `L^2`, so this is the FLOP-correct objective),
+pads every trajectory's mask/tokens up to its assigned ceiling ONCE at
+stage setup (`_pad_mask_to`/`_pad_tok_to`, not per-step), and derives a
+per-bucket batch size from TWO memory ceilings (`token_budget`, `B ~ 1/Lb`,
+and `attn_sq_budget`, `B ~ 1/Lb^2` — see "Other levers" below for why the
+second one turned out to be load-bearing, not optional). Verified: for
+`hmn_tpu_recall1024_flat.py`'s 16-entry, 8-distinct-length mix, this
+produces exactly 8 buckets with 0% padding waste (every distinct L already
+gets its own bucket at `max_shape_buckets=8`) — bucketing only pads/wastes
+FLOPs once a mix has MORE distinct lengths than the bucket budget allows,
+and even then only rounds up to the nearest observed length among the
+survivors, never to an arbitrary power of 2.
 
 ## `repeat_batch` under sequence packing — global, not per-sample
 
@@ -180,12 +244,71 @@ runs, rather than assuming a speed win is free.
 
 ## Other levers
 
-- **Gradient checkpointing**: worth it at the 50M/`n_layers=12` tier if
+- **Gradient checkpointing**: ~~worth it at the 50M/`n_layers=12` tier if
   pushing batch size toward the top of its range; not worth it at 1M/10M,
-  where activation memory isn't the binding constraint.
+  where activation memory isn't the binding constraint.~~ **Correction
+  (2026-07-30): WRONG — this significantly underweighted `L`.** The
+  original claim implicitly assumed activation memory is dominated by the
+  `B*L*d` term (linear in L), true for the short sequences (`L<=150`) this
+  doc was originally scoped around. It is NOT true once `L` grows into the
+  thousands (exactly the `hmn_tpu_recall1024_flat.py` regime, `L` up to
+  2128): the `O(B*H*L^2)` attention-score-matrix term, retained per layer
+  for backward, dominates instead and grows QUADRATICALLY with `L`.
+  Measured directly on `tpu1`: at `d=128/n_layers=16` (1.12M params — the
+  "small" end of this doc's own size ladder) with `B=64, L=1232`,
+  training WITHOUT `grad_checkpoint` hit a hard HBM OOM — `RuntimeError:
+  ... RESOURCE_EXHAUSTED: ... Used 52.85G of 15.75G hbm. Exceeded hbm
+  capacity by 37.10G` — and the requested amount matches
+  `B*H*L^2*n_layers*4bytes` almost exactly (`64*8*1232^2*16*4 ≈ 52.8G`),
+  confirming the mechanism: without checkpointing, ALL 16 layers'
+  attention matrices were being retained simultaneously for backward.
+  Setting `grad_checkpoint='block'` (`HMNModel`'s existing model-depth
+  checkpointing — checkpoints each `SingleAttnBlock`, so backward
+  recomputes one layer's activations at a time instead of retaining all of
+  them) is the fix, and made this exact case trainable. **Revised
+  guidance: gradient checkpointing is worth it whenever `L` is large
+  relative to `d` — a function of sequence length, not model/param size —
+  and should be treated as load-bearing (verify via a real forward+backward
+  step before trusting a batch size), not merely a batch-size-maximizing
+  nice-to-have, for any config with `L` in the thousands regardless of how
+  small the model itself is.**
+  - **A second, real gotcha surfaced by this**: `torch.utils.checkpoint.
+    checkpoint`'s default non-reentrant path (`use_reentrant=False`, this
+    project's default) calls `_get_device_module(device_type)` ->
+    `getattr(torch, device_type)` to save/restore per-device RNG state —
+    this works for `'cuda'`/`'mps'`/`'cpu'` (real submodules of `torch`)
+    but raises `AttributeError: module 'torch' has no attribute 'xla'` for
+    XLA tensors, since `torch_xla` does not register itself under `torch.
+    xla`. Fix: `torch_xla.utils.checkpoint.checkpoint` is torch_xla's own
+    checkpoint implementation (reentrant-based, never calls that lookup) —
+    `kvmem/hmn.py`'s `_ckpt` wrapper now dispatches to it when any argument
+    is an XLA tensor, falling back to the original `torch.utils.checkpoint`
+    call (`use_reentrant=False`, byte-for-byte unchanged) everywhere else.
+    Any future torch_xla port that uses `torch.utils.checkpoint` directly
+    (rather than through a dispatch wrapper) will hit this.
 - **Parallelism**: data-parallel only, at every size considered here (even
   50M params is far too small to need model/tensor parallelism across 8
-  cores) — replicate the model, shard the batch.
+  cores) — replicate the model, shard the batch. Moot for `tpu1` itself
+  (single chip, see the tier section above) but still the right guidance
+  for a `-8` grant.
+- **Mixing CPU and XLA `.backward()` calls in one process**: a real bug hit
+  while building the verification gates (`kvmem/gate_check.py`) — running a
+  CPU `train()` call followed by a TPU `train()` call in the SAME Python
+  process crashes the SECOND (TPU) call with `RuntimeError: 0 <=
+  device.index() && device.index() < ... device_ready_queues_.size()
+  INTERNAL ASSERT FAILED`. Root cause: PyTorch's autograd Engine singleton
+  sizes its `device_ready_queues_` when first used (at the first
+  `.backward()` call); if that first call is a plain CPU backward, the
+  engine never learns about the XLA device registered afterward. Not
+  specific to this codebase — any script comparing CPU and TPU training in
+  one process will hit this. Fix: one device per process (`gate_check.py`'s
+  `gate3_cpu`/`gate3_tpu`/`gate3_compare` are three separate `python3 -m`
+  invocations for exactly this reason, compared only via their logged
+  output on disk, never in-process).
+
+## TPU VM access confirmed (2026-07-30)
+
+`gcloud compute tpus tpu-vm ssh tpu1 --zone=europe-west4-b` logs in successfully (host `t1v-n-d023ff26-w-0`, user `muaz`, Python 3.10.12). `torch_xla` is already installed on the VM and detects the TPU (`libtpu.so and TPU device found, setting PJRT_DEVICE=TPU`) — so the environment itself is ready. This does not change the porting-prerequisite conclusion below: `kvmem/hmn.py` is still eager PyTorch with Python-level trajectory sampling/NumPy mask construction on the hot path, so none of this doc's batch-size/model-size estimates are exercisable yet. Slice topology (chip count) not yet checked.
 
 ## Porting prerequisite (the actual blocker)
 

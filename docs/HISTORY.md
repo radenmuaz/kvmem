@@ -1628,3 +1628,279 @@ enhanced loss computation including the new `wa`/`am` terms — all ran
 cleanly with no crashes. No config sets `n_refine>0` yet, so nothing live
 was disrupted; this redesign is implemented and verified but not yet
 exercised by an actual training run.
+
+### 18. Brainstorm: generalizing `hop`/relay from a linear chain to arbitrary STATE connectivity graphs (queued, not designed or built)
+
+**Motivating question**: the current relay (`hops`, `chunk_mask_fb_hop`/
+`chunk_mask_fb_traj`, the `chain_steps`/`weave_mix` op schedules) is always
+either fully unbounded routing (`hops=-1`) or a bounded *linear* lookback
+window (`hops=N`, last N chain steps/ops). For domains with large but
+regularly-structured inputs (audio, images) — where the natural
+segmentation is parallel/strided chunks rather than one sequential
+stream — what other STATE-to-STATE connectivity patterns are worth
+building, and does the existing `allowed_state`-allowlist-per-op
+abstraction (§15) already generalize to them for free?
+
+Candidate patterns, roughly in order of how much new masking machinery
+each would need beyond what §15 already built:
+
+1. **Strided/overlapping encoding chunks.** Current `n_chunks` encoding is
+   parallel-chunk with hard, non-overlapping boundaries. Overlapping
+   stride (like a conv stride < kernel width) would let adjacent STATEs
+   share some receptive field. Motivated by an existing empirical pattern
+   in the `stitch`/anchor results (§16-17's own "Results" entries in
+   `CLAUDE.md`): recall is consistently weakest right at chunk/window
+   boundaries, which a hard partition may itself be causing.
+
+2. **Hierarchical tree aggregation.** Pair STATEs bottom-up
+   (`state_A + state_B -> state_AB`, then `state_AB + state_CD ->
+   state_ABCD`, log-depth) instead of one linear `chain_steps` schedule.
+   This is a binary relay tree in place of `hops=N` linear lookback —
+   log-depth relay path instead of linear, which matters because the
+   existing `decay_curve` recovery-probe result (`CLAUDE.md` "Results")
+   already shows recovery degrading with hop distance under the current
+   linear chain.
+
+3. **Dilated/skip hops (WaveNet-style).** Give relay level *l* a stride of
+   `2^l` — chain step *t* at level *l* connects to *t - 2^l* — for an
+   exponentially growing receptive field at fixed per-step hop cost. Since
+   `hops` is already a mask-controlled width parameter (not a separate
+   flag, per the `hops` semantics entry in `CLAUDE.md`), this generalizes
+   it from "how many preceding chain steps" to "which offsets" — a
+   different `allowed_state` selection function, not new mask machinery.
+
+4. **2D/grid (axial) hops for images.** Encode in row-major chunk order,
+   add a second relay channel along the column axis — a cell's local
+   update reads both its row-STATE and column-STATE predecessors. Two
+   independent linear/dilated chains crossing at each node, avoiding full
+   2D all-pairs routing.
+
+5. **Ring/cyclic relay.** For periodic structure (looping audio, tiled
+   textures): the last chain step relays back to chain step 0, closing the
+   loop, so a second pass lets late STATEs correct early ones — the same
+   role a refine round plays within one op (§17), but across chunks.
+
+6. **Asymmetric per-level STATE capacity.** In a tree hierarchy (#2),
+   leaf STATEs could stay small (local detail) while aggregated
+   higher-level STATEs get a larger `state_len` (global summary needs more
+   capacity than one local chunk) — capacity that scales with hierarchy
+   level, not uniform across all STATEs as today.
+
+7. **Routing at the top, bounded chain at the bottom.** Combine
+   `hops=-1` (unbounded routing, cheap when there are few coarse
+   top-level STATEs) with bounded `hops=N` linear or dilated relay lower
+   in the hierarchy (many fine-grained STATEs, where all-pairs routing
+   would be expensive) — mirrors compressive-transformer-style
+   coarse-distant/fine-recent memory asymmetry.
+
+**Implementation read**: the `allowed_state` positive-allowlist-per-op
+abstraction from §15 is already node-local rather than assuming a linear
+schedule, so #2/#3/#7 above look like they reduce to "a different function
+computing `allowed_state` per op" rather than new mask-matrix machinery —
+unverified, no mask-matrix inspection or trajectory constructor
+(`traj_tree`/`traj_dilated`/etc., alongside the existing
+`traj_batch`/`traj_stream`/`traj_interleave_delayed`) has been written or
+checked yet. Nothing in this section has been designed in code, run, or
+verified against the actual mask matrix — pure brainstorm, next step if
+pursued is picking one pattern and hand-verifying its mask before writing
+any trajectory-construction code (per this file's own "always verify
+masking changes against the actual attention-mask matrix" rule).
+
+#### 18a. Follow-on: frozen-weight offline aggregation (build memory once, query many test inputs) — same seven patterns, different framing
+
+A distinct extension of the above: instead of `allowed_state` connectivity
+mattering only *during* training (per-batch, synthetic random bytes), what
+does each pattern look like as an **offline index-build step** — run the
+already-trained, frozen model forward once over a real dataset to produce
+one persistent aggregate memory, then serve arbitrary test-time queries
+against it with no further gradient updates? Closer to how a retrieval /
+vector-index system is built and served than to anything currently
+exercised in this codebase (every mask/`hops` path so far has only ever
+run on synthetic per-batch sequences of a few chunks, never a genuine
+offline aggregation pass over real data).
+
+**Cross-cutting caveat, applies to all seven below**: the connectivity
+pattern used to build the frozen index has to be one the model was
+actually *trained* under — the existing `weave_mix`/`repeat_query`
+generalization-gap result (`CLAUDE.md`, "Chain-memory recovery probe" and
+the `weave_mix` "Recovery probe re-run" entries) already shows recall
+degrades badly on untrained trajectory shapes even when the relay
+mechanics are otherwise identical. So "aggregate a dataset" isn't just an
+inference-time algorithm choice layered on top of a frozen model — it
+constrains what training curriculum has to look like first.
+
+1. **Strided/overlapping chunks -> flat STATE bank.** Frozen encoder runs
+   once over the whole dataset (chunk by chunk, overlap included),
+   producing one STATE per chunk with no reduction — the bank itself IS
+   the index, sized linearly in dataset length. Querying reuses `solo`'s
+   existing unbounded-routing (`hops=-1`) attention, just pointed at real
+   content instead of a 1-4 chunk synthetic batch. Needs zero new
+   training, but isn't a "single final state" (it's a database, not a
+   summary) and costs O(dataset size) attention per query — the problem
+   the other six patterns exist to avoid.
+
+2. **Hierarchical tree aggregation -> single root STATE.** Recursively
+   apply the same frozen pairwise-merge op bottom-up until one root
+   remains — a genuine fixed-size, length-independent summary
+   (log-depth build). Gap: usefully querying it means *descending* the
+   tree (compare query to root, pick a child, recurse), a B-tree/HNSW-
+   style routing decision the model has never been trained to make —
+   training so far only ever builds the tree upward, never searches it
+   downward. Not a free consequence of the merge mechanism.
+
+3. **Dilated/skip hops -> multi-resolution skip-list, not one state.**
+   Precompute a STATE pyramid at stride 1/2/4/8… once, offline. The top
+   (coarsest) level is a compressed global summary, and any query reaches
+   any point via O(log n) hops through the skip-list rather than O(n) —
+   trades the tree's clean single-root property for guaranteed O(log n)
+   reachability from ANY entry point, not just root-down.
+
+4. **2D/grid (axial) hops -> row-STATEs x column-STATEs -> one image
+   STATE.** Two-stage reduction: merge each row to a row-summary, each
+   column to a column-summary, then merge those into one global image
+   STATE — a genuine coarse whole-image gist. Querying a specific region
+   (not just "does X appear anywhere") needs the row/column summaries
+   kept as an intermediate index, not just the final merge — same
+   B-tree-style routing gap as #2, but as two independent 1D searches
+   instead of one tree descent.
+
+5. **Ring/cyclic relay -> converged loop-state.** Run the ring pass once
+   (or a few wraps until the STATE stops changing) — the final state
+   after closure is a stationary summary, robust to which point in the
+   loop encoding started from. Fits genuinely periodic data (looped
+   audio, tiled texture) where "aggregate the dataset" means "capture its
+   steady-state statistics," not exact per-offset retrieval — not useful
+   if the test query wants a specific local recall.
+
+6. **Asymmetric per-level capacity -> what makes the summary a real
+   compression, not just a bottleneck.** Decides whether #2/#4's root
+   STATE is a meaningful summary or an information bottleneck that
+   discards everything. Ties directly to the `squeeze` sweet-spot sizing
+   discipline already in `CLAUDE.md` ("Results" — `hmn_squeeze_sweetspot_n4`):
+   size the root smaller than raw dataset content but still bigger than
+   the dataset's true Shannon entropy, or "aggregate to one final state"
+   either can't lossily-but-usefully compress at all (too small, below
+   the entropy floor) or isn't testing compression at all (too large,
+   could just memorize).
+
+7. **Routing-top / bounded-chain-bottom -> the realistic production
+   design.** Few coarse top-level STATEs get full `hops=-1` routing
+   (cheap, small N), each covering a bounded-`hops` linear or dilated
+   chain of many fine-grained leaf STATEs underneath. Building the index
+   is one two-tier forward pass, done once; querying attends the cheap
+   top level first to find the relevant coarse region, then only that
+   region's bounded chain needs deeper traversal. Scales to "large but
+   structured input" without #1's O(n) query cost or #2/#4's untrained-
+   routing-decision requirement — the top level's cheap full attention
+   IS the routing decision, learned the same way `solo`'s routing
+   already works, not a new mechanism to invent.
+
+**Status**: discussion only, nothing here designed in code, run, or
+mask-verified. Same next step as §18 itself: pick one pattern and
+hand-verify its mask/attention behavior on a real (not synthetic) forward
+pass before writing any offline-index-build code.
+
+#### 18b. Correction to 18a: the actual existing pattern is sequential recurrent digestion of many input-output pairs, not a static index build
+
+18a framed "aggregate a dataset, then query" as building a passive index
+(a bank, a tree, a pyramid) via whatever forward pass is convenient. That
+undersells what this project's own `hop`/`accum_rnn` mechanism (`hops=1`,
+the `state_t = f(state_{t-1}, query_t)` recurrence — see the `hops`
+semantics entry and "`accum_rnn` masking fix" in `CLAUDE.md`) already
+targets: given a STREAM of many input-output pairs (e.g. 1000s of
+`(x_i, y_i)` examples), the frozen model recurrently folds each pair into
+one running STATE — `state_i = f(state_{i-1}, x_i, y_i)` — continuing
+through the last pair, and only THEN is a novel test input queried against
+the final accumulated `state_1000`. This is closer to in-context / meta-
+learning (fit a task implicitly via forward-pass state accumulation, no
+gradient updates after the initial training that taught the update rule
+itself) than to a passive retrieval index — closer to fast-weight
+programmers / test-time-training-via-state (Schmidhuber; Sun et al.,
+"Learning to (Learn at Test Time)") than to a vector DB. Re-examining the
+same seven patterns against THIS framing specifically:
+
+1. **Strided/overlapping -> overlapping example windows, not byte
+   chunks.** The unit being aggregated is now a whole `(x_i, y_i)` pair,
+   not a fixed-width byte span. "Overlap" here means each recurrent update
+   sees a sliding window of a few recent pairs at once rather than exactly
+   one, softening the effect of any single pair's ordering/framing —
+   directly relevant to the plateau seen in `hmn_weave_mix_accum_rnn`
+   (`CLAUDE.md`), which improved once `repeat_batch` gave the model
+   effectively more exposure per gradient step.
+
+2. **Hierarchical tree aggregation -> the real fix for 1000-step decay.**
+   Instead of one linear chain of 1000 sequential recurrent updates
+   (`hops=1` applied 1000 times — the failure mode `decay_curve` already
+   demonstrates at a handful of hops, let alone a thousand), group
+   examples into batches of e.g. 32, recurrently fold each batch into a
+   local sub-state (short chain, cheap to keep faithful), then merge
+   sub-states hierarchically — O(log 1000) accumulation depth to the final
+   state instead of O(1000). This is very plausibly *the* structural fix
+   for the specific problem 18a's #2 only described abstractly.
+
+3. **Dilated/skip hops -> shorter gradient AND inference paths at
+   training time.** Training a 1000-pair recurrence end-to-end through a
+   flat chain means 1000 sequential dependencies to backprop through —
+   the vanishing-signal problem RNNs have always had, distinct from (but
+   related to) the inference-time decay `decay_curve` measured. Dilated
+   connections (state_i sees state_{i-1}, state_{i-2}, state_{i-4}, …)
+   shorten both the training-time credit-assignment path and the
+   inference-time reach-back path with the same mechanism.
+
+4. **Axial/grid hops -> two-key structured accumulation.** If the 1000
+   pairs have two independent groupings that matter (e.g. examples share
+   a "domain" axis and a "task" axis), maintain two recurrent streams —
+   one accumulating within-domain, one within-task — and periodically
+   cross-merge. Final state is conditioned on both axes instead of purely
+   sequential order, useful if the test query cares about a domain/task
+   combination rather than "the most recent thing seen."
+
+5. **Ring/cyclic -> order-invariance via multiple passes.** A single
+   forward accumulation is inherently order-sensitive — pair 999 has a
+   short path to the final state, pair 1 has a 1000-hop path (again,
+   `decay_curve`'s exact failure shape). If the 1000 pairs are meant to be
+   treated as a SET (order shouldn't matter — e.g. a training set for
+   meta-learning, not a temporal stream), running multiple loops over the
+   same 1000 pairs, feeding the final state back in as the starting state
+   of the next loop, pushes toward an order-robust fixed point — same
+   spirit as a Deep Equilibrium Model, unverified whether the current
+   architecture's recurrence is even a contraction (converges) at all.
+
+6. **Asymmetric capacity -> the actual generalization question.** This is
+   the crux of whether "query a novel test input against the final
+   state" can work at all: it only makes sense if the 1000 `(x_i, y_i)`
+   pairs share an underlying, exploitable regularity (a "task" or rule)
+   that the final state can capture in less space than literally
+   memorizing all 1000 pairs — otherwise the final state either (a) can't
+   fit everything (too small, per-pair information is lost, degrading
+   toward `decay_curve`'s behavior) or (b) doesn't need to compress at all
+   (huge state, no generalization pressure, no reason to expect it
+   answers novel test inputs rather than just the training pairs). Same
+   sizing discipline as the `squeeze` sweet-spot track in `CLAUDE.md`, but
+   the entropy being measured is now "the task's true complexity," not a
+   byte-level compressibility measure — and unlike `squeeze`'s synthetic
+   generators, nothing currently defines what a calibrated
+   `(x_i, y_i)`-pair task generator with tunable true complexity would
+   even look like for this setting.
+
+7. **Routing-top / bounded-chain-bottom -> hierarchical accumulation
+   PLUS a cheap final routing read.** Combines #2's fix with a query-time
+   mechanism: build local group-summaries via bounded recurrent chains
+   (parallelizable across groups, unlike one strict 1000-step sequential
+   pass), merge those into a small number of top-level summaries via full
+   `hops=-1` attention, and let the test query attend that cheap top
+   layer directly rather than re-walking the whole chain. This is the
+   most complete answer to "recurrently update until the last input, then
+   query" at 1000s-of-examples scale — sequential-only where it's cheap
+   (within a group), full-attention-routed where sequential would be
+   ruinously deep.
+
+**Status**: still discussion only. The one existing empirical data point
+most relevant to whether ANY of this works before building it is
+`decay_curve` (`CLAUDE.md`, "Chain-memory recovery probe" /
+`hmn_weave_mix` entries) — recovery already drops sharply within single-
+digit hop counts under the current flat-chain `hop` mechanism. Building
+1000-pair recurrent digestion on top of the unmodified flat chain (#1
+alone) would almost certainly reproduce that decay at far larger scale;
+the hierarchical/dilated/routed variants (#2/#3/#7) exist specifically to
+address that, not as independent embellishments.

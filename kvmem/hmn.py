@@ -64,7 +64,72 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as _ckpt
+import torch.utils.checkpoint as _torch_checkpoint_mod
+
+try:
+    import torch_xla
+    # torch.utils.checkpoint's reentrant path (CheckpointFunction.forward/backward)
+    # calls torch.random.fork_rng(..., device_type='xla', enabled=...) UNCONDITIONALLY
+    # doing `getattr(torch, 'xla', None)` BEFORE it even checks `enabled` — so it
+    # raises `RuntimeError: torch has no module of 'xla'` regardless of
+    # preserve_rng_state, unless something is registered at torch.xla first. This is
+    # exactly what torch._register_device_module exists for; torch_xla 2.6.1 doesn't
+    # do it itself (confirmed: hasattr(torch, 'xla') is False after `import torch_xla`
+    # alone). Registering the torch_xla module itself as the target is sufficient —
+    # with preserve_rng_state=False (see _ckpt below) nothing beyond the initial
+    # `is None` guard in fork_rng ever touches it.
+    if not hasattr(torch, 'xla'):
+        torch._register_device_module('xla', torch_xla)
+except ImportError:
+    torch_xla = None
+
+
+def _ckpt(fn, *args, use_reentrant=False, **kwargs):
+    """Device-aware gradient-checkpoint dispatch (all call sites below pass tensor
+    args positionally, so device is inferred from them).
+
+    Two real, sequentially-discovered XLA incompatibilities in `torch.utils.
+    checkpoint`, both hit directly on tpu1 (see CLAUDE.md's TPU port entry /
+    kvmem/gate_check.py):
+
+    1. The NON-reentrant path (`use_reentrant=False`, this project's default
+       everywhere off-XLA) calls `_get_device_module(device_type)` ->
+       `getattr(torch, device_type)` to save/restore per-device RNG state —
+       `AttributeError: module 'torch' has no attribute 'xla'`.
+    2. torch_xla ships its own `torch_xla.utils.checkpoint.checkpoint()`
+       (reentrant-based) specifically to route around (1) — but it does NOT
+       re-enter the surrounding `torch.autocast` context during backward's
+       recompute the way stock PyTorch's reentrant `CheckpointFunction` does.
+       Confirmed by direct A/B on tpu1: `hmn_tpu_sanity_w25.py` trained to
+       loss=NaN from the very first logged step using `torch_xla.utils.
+       checkpoint.checkpoint` + bf16 autocast; the SAME config with
+       `grad_checkpoint=False` (no checkpointing at all) trained cleanly
+       (loss 5.33->5.39, finite, over 600 steps) — isolating the interaction
+       specifically, since bf16 autocast alone (verified via local CPU repro,
+       both with and without `torch.utils.checkpoint`) never produced NaN.
+
+    Fix: use stock PyTorch's REENTRANT path (`use_reentrant=True`, `preserve_
+    rng_state=False`) for XLA tensors instead of torch_xla's own implementation.
+    `CheckpointFunction.backward` explicitly reapplies `torch.amp.autocast
+    (device_type=ctx.device_type, **ctx.device_autocast_kwargs)` around the
+    recomputed forward — the exact handling torch_xla's version appears to
+    lack. `preserve_rng_state=False` is safe here (no dropout/stochastic ops
+    inside any checkpointed block in this architecture) and is REQUIRED to
+    avoid (1) — forward()'s `_get_device_module` call is gated behind `if
+    preserve_rng_state:`. `fork_rng` inside backward() still needs `torch.xla`
+    registered as a module (any non-None object; with `enabled=False` nothing
+    beyond an initial `is None` check ever touches it) — see the
+    `torch._register_device_module` call above.
+
+    CPU/MPS behavior (`use_reentrant=False`, the prior unconditional default)
+    is completely unchanged — this dispatch only affects XLA tensors."""
+    is_xla = any(isinstance(a, torch.Tensor) and a.device.type == 'xla' for a in args)
+    if is_xla:
+        return _torch_checkpoint_mod.checkpoint(fn, *args, use_reentrant=True,
+                                                 preserve_rng_state=False, **kwargs)
+    return _torch_checkpoint_mod.checkpoint(fn, *args, use_reentrant=use_reentrant, **kwargs)
+
+
 from tqdm import tqdm
 
 from kvmem.structured_data import generate_structured_chunks
@@ -1362,6 +1427,109 @@ def _forward_segmented(model: nn.Module, tok_t: torch.Tensor, mask_np: np.ndarra
     return torch.stack(nlls).mean()
 
 
+# ---------------------------------------------------------------------------
+# Length bucketing (TPU/XLA support) — see docs/TRC_TPU.md and CLAUDE.md's
+# scale-up experiment entry. XLA compiles one graph per distinct input shape,
+# so a weave_mix with many distinct sequence lengths L (one per anchor/warmup
+# combination) triggers a recompile storm. `_bucket_ceilings` groups the
+# distinct L values observed across a mix into at most `max_buckets` ceiling
+# values (each drawn from the observed lengths themselves, not rounded to a
+# power of 2 — rounding up would waste attention FLOPs, which scale as L^2,
+# for a length just past a boundary); `_pad_mask_to`/`_pad_tok_to` then pad
+# each trajectory's mask/tokens up to its assigned ceiling once, at stage
+# setup, not per-step. Entirely opt-in (`hp['bucket_lengths']`, default
+# False) — every existing MPS/CPU config is unaffected; when the number of
+# distinct L values in a mix is already <= max_buckets (true of every config
+# on disk today), the ceilings equal the L values themselves and no padding
+# happens at all, so enabling the flag is harmless even off-TPU.
+# ---------------------------------------------------------------------------
+
+def _bucket_ceilings(lengths: list[int], weights: list[float], max_buckets: int) -> list[int]:
+    """Partitions the sorted distinct `lengths` into <= `max_buckets` contiguous
+    groups, minimizing sum over groups of `ceiling^2 * group_weight` (squared,
+    since attention cost scales with L^2, not linearly) — a standard weighted
+    k-segment DP. Returns the sorted list of chosen ceilings (each an actual
+    value from `lengths`); every input length is <= some returned ceiling."""
+    from collections import defaultdict
+    import itertools
+    agg: dict[int, float] = defaultdict(float)
+    for L, w in zip(lengths, weights):
+        agg[L] += w
+    Ls = sorted(agg)
+    n = len(Ls)
+    if n <= max_buckets:
+        return Ls
+    W = [agg[L] for L in Ls]
+    prefix = [0.0] + list(itertools.accumulate(W))
+
+    def _cost(i: int, j: int) -> float:  # cost of bucketing Ls[i..j] (inclusive) into one group
+        return float(Ls[j]) ** 2 * (prefix[j + 1] - prefix[i])
+
+    INF = float('inf')
+    dp = [[INF] * (n + 1) for _ in range(max_buckets + 1)]
+    choice: list[list[int | None]] = [[None] * (n + 1) for _ in range(max_buckets + 1)]
+    dp[0][0] = 0.0
+    for k in range(1, max_buckets + 1):
+        for i in range(1, n + 1):
+            for j in range(i):
+                c = dp[k - 1][j] + _cost(j, i - 1)
+                if c < dp[k][i]:
+                    dp[k][i] = c
+                    choice[k][i] = j
+    best_k = min(range(1, max_buckets + 1), key=lambda k: dp[k][n])
+    ceilings = []
+    i, k = n, best_k
+    while i > 0:
+        j = choice[k][i]
+        assert j is not None
+        ceilings.append(Ls[i - 1])
+        i, k = j, k - 1
+    ceilings.reverse()
+    return ceilings
+
+
+def _assign_bucket(L: int, ceilings: list[int]) -> int:
+    """Smallest ceiling >= L (`ceilings` must be sorted and cover every L used)."""
+    import bisect
+    idx = bisect.bisect_left(ceilings, L)
+    assert idx < len(ceilings), f'L={L} exceeds every bucket ceiling {ceilings}'
+    return ceilings[idx]
+
+
+def _pad_mask_to(mask_np: np.ndarray, Lb: int) -> np.ndarray:
+    """Pads an [L,L] additive attention-bias mask to [Lb,Lb]. Every new column
+    (real rows attending into padding) AND every new row (padding rows
+    themselves) is fully blocked (-1e9). Safe against NaN softmax rows because
+    `null_kv=True` is mandatory in this project (MHAttention.forward appends
+    an always-attend null KV column after this mask is applied, independent
+    of L) — a fully-blocked padding row still has that one open column."""
+    L = mask_np.shape[0]
+    assert mask_np.shape == (L, L) and Lb >= L
+    if Lb == L:
+        return mask_np
+    out = np.full((Lb, Lb), -1e9, dtype=mask_np.dtype)
+    out[:L, :L] = mask_np
+    return out
+
+
+def _pad_tok_to(tok_np: np.ndarray, Lb: int) -> np.ndarray:
+    """Pads a [B,L] token batch to [B,Lb] with zeros. Safe because every
+    rec_block slice used by the loss lies inside the real L (pos_content is
+    never touched by bucketing), so padding positions never enter the NLL."""
+    B, L = tok_np.shape
+    assert Lb >= L
+    if Lb == L:
+        return tok_np
+    out = np.zeros((B, Lb), dtype=tok_np.dtype)
+    out[:, :L] = tok_np
+    return out
+
+
+def _pow2_floor(x: float) -> int:
+    x = max(1, int(x))
+    return 1 << (x.bit_length() - 1)
+
+
 def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len: int,
                       state_len: int, state_vocab_size: int, pos_content: dict,
                       tags: list[tuple[int, int]],
@@ -1411,6 +1579,13 @@ def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
         span_s, span_e = rb['span']
         gt = np.concatenate([segs[:, i, :] for i in range(span_s, span_e)], axis=1)
 
+        # Both branches below replace a `for b_idx in range(B): tok[b_idx, a:b] =
+        # gt[b_idx, X:X+n]` loop with one `np.take_along_axis` gather — X varies
+        # per row (that's the whole point, a different warmup anchor per batch
+        # row), so this is a per-row-offset slice, not expressible as a single
+        # numpy basic-indexing slice; take_along_axis is the vectorized
+        # equivalent. Gate 2 (kvmem/CLAUDE.md's TPU scale-up entry) verifies
+        # this is byte-identical to the old per-row loop for a fixed seed.
         if rb['type'] == 'initial':
             x_min, x_max = rb['warmup_train_range']
             _xdist = rb.get('warmup_x_dist', 'uniform')
@@ -1420,10 +1595,10 @@ def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
                 rw_xs = np.clip(np.round(x_min + (x_max - x_min) * rng.beta(0.5, 2.0, size=B)).astype(int), x_min, x_max)
             else:
                 rw_xs = np.array([int(rng.integers(x_min, x_max + 1)) for _ in range(B)])
-            for b_idx in range(B):
-                X = rw_xs[b_idx]
-                tok[b_idx, rb['w0']:rb['w1']] = gt[b_idx, X:X + wl]
-                tok[b_idx, rb['c0']:rb['c1']] = gt[b_idx, X + wl:X + wl + rb['out_len']]
+            idx_w = rw_xs[:, None] + np.arange(wl)
+            idx_c = rw_xs[:, None] + wl + np.arange(rb['out_len'])
+            tok[:, rb['w0']:rb['w1']] = np.take_along_axis(gt, idx_w, axis=1)
+            tok[:, rb['c0']:rb['c1']] = np.take_along_axis(gt, idx_c, axis=1)
 
             if rb['sl0'] is not None:  # non-terminal: end-of-turn STATE, claimed by a trailing 'S'
                 tok[:, rb['sl0']] = HMN_OP_UPDATE
@@ -1440,12 +1615,14 @@ def make_batch_tagged(rng: np.random.Generator, B: int, n_chunks: int, chunk_len
             x_min, x_max = rb['warmup_train_range']
             rw_xs = np.array([int(rng.integers(x_min, x_max + 1)) for _ in range(B)])
             tok[:, rb['opf0']] = HMN_OP_FEEDBACK
-            for b_idx in range(B):
-                X = rw_xs[b_idx]
-                tok[b_idx, rb['wa0']:rb['wa1']] = gt[b_idx, X:X + wl]
-                tok[b_idx, rb['am0']:rb['am1']] = gt[b_idx, X + wl:X + wl + rb['out_len']]  # placeholder
-                tok[b_idx, rb['w0']:rb['w1']]   = gt[b_idx, X:X + wl]
-                tok[b_idx, rb['c0']:rb['c1']]   = gt[b_idx, X + wl:X + wl + rb['out_len']]
+            idx_w = rw_xs[:, None] + np.arange(wl)
+            idx_c = rw_xs[:, None] + wl + np.arange(rb['out_len'])
+            gathered_w = np.take_along_axis(gt, idx_w, axis=1)
+            gathered_c = np.take_along_axis(gt, idx_c, axis=1)
+            tok[:, rb['wa0']:rb['wa1']] = gathered_w
+            tok[:, rb['am0']:rb['am1']] = gathered_c  # placeholder
+            tok[:, rb['w0']:rb['w1']]   = gathered_w
+            tok[:, rb['c0']:rb['c1']]   = gathered_c
             # fsl0:fsl1 is the mid-round feedback VALUES ONLY (state_len wide, no
             # opcode slot of its own — OP_FEEDBACK already sits at opf0, before am).
             tok[:, rb['fsl0']:rb['fsl1']] = sids
@@ -2083,10 +2260,18 @@ class MHAttention(nn.Module):
                  rope: bool = False, freqs: torch.Tensor | None = None,
                  null_kv: bool = False, qk_norm: bool = False,
                  logit_cap: float = 0.0, attn_temp: bool = False):
-        """null_kv=True: append a learnable (null_k, null_v) pair to the KV
-        sequence before softmax — a "blank slot" to attend to when no real
-        token is relevant, soft gating without hard masking. null_k inits to
-        zero (Q·null_k=0 initially) but is learned."""
+        """null_kv=True: append a (null_k, null_v) pair to the KV sequence
+        before softmax — a "blank slot" to attend to when no real token is
+        relevant, soft gating without hard masking. CAVEAT (found 2026-07-30
+        while writing kvmem/hmn_jax.py, a JAX/Flax port — see CLAUDE.md's TPU
+        port entry): despite this docstring's original claim, `forward`
+        below constructs the null pair as a fresh `torch.zeros(...)` every
+        call, never wrapped in `nn.Parameter` — it is NOT actually learnable,
+        never receives gradients, and is permanently zero in every trained
+        checkpoint on record. Left as-is (not changed to genuinely learnable)
+        since fixing this would alter trained-model behavior and no
+        checkpoint has ever exercised a learned null slot; flagged here so
+        the discrepancy isn't silently reintroduced or assumed away."""
         super().__init__()
         self.n_heads = n_heads
         self.d_head  = d // n_heads
@@ -2684,7 +2869,17 @@ def make_test_sequences(seg_len: int) -> dict[str, list[int]]:
 # =============================================================================
 
 def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
-    device = torch.device(device_str)
+    # 'tpu' is not a torch.device string — torch_xla.device() resolves the actual
+    # xla:N device. Everything else (cpu/mps/cuda) goes through torch.device()
+    # unchanged. device_is_tpu gates every TPU-specific behavior below: the hot-
+    # path host-sync avoidance (see loss_f/traj bookkeeping in the weave_mix loop),
+    # torch_xla.sync() after opt.step(), and bf16 autocast.
+    device_is_tpu = device_str in ('tpu', 'xla')
+    if device_is_tpu:
+        import torch_xla
+        device = torch_xla.device()
+    else:
+        device = torch.device(device_str)
     rng    = np.random.default_rng(hp.get('seed', 42))
     torch.manual_seed(hp.get('seed', 42))
 
@@ -2704,6 +2899,13 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     n_heads=hp['n_heads'], d_ff=hp.get('d_ff', 0),
                     block_type=hp.get('block_type', 'single_attn'),
                     rope=hp.get('rope', True), yarn=hp.get('yarn', True),
+                    # L_train/L_max previously silently dropped here (never read from hp,
+                    # so build_model always fell back to its own 512/4096 defaults even
+                    # when a config explicitly set them) — forwarded now, using build_
+                    # model's own fallback formula so any EXISTING config that never sets
+                    # these keys computes the identical default it always did.
+                    L_train=hp.get('L_train', hp.get('seg_len', 512)),
+                    L_max=hp.get('L_max', hp.get('seg_len', 512) * 8),
                     null_kv=hp.get('null_kv', True), compile=hp.get('compile', False),
                     rmsnorm=hp.get('rmsnorm', False),
                     grad_checkpoint=hp.get('grad_checkpoint', False),
@@ -2712,6 +2914,25 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     n_params = sum(p.numel() for p in model.parameters())
     _log(f'Model: {n_params:,} params  device={device}  V={hp_model["V"]}  '
          f'block_type={hp_model["block_type"]}  (kvmem/hmn.py consolidated draft)')
+
+    # CPU eval replica (TPU only) — ar_decode_traj_nokv/ar_decode_iq_global_rw_tagged/
+    # ar_decode_stitch are all token-at-a-time Python decode loops over a GROWING
+    # sequence (new shape every step) — on XLA that is a full recompile per generated
+    # byte. Rather than port autoregressive decode to XLA, copy weights to a CPU replica
+    # at each eval boundary and run the existing eval code completely unchanged there —
+    # a 1-2M-param model decodes fast enough on 24 vCPUs that this is not worth avoiding.
+    eval_model = build_model(hp_model, torch.device('cpu')) if device_is_tpu else None
+
+    def _synced_eval_model():
+        """Returns the model to run eval decode on, plus the device to build eval
+        tensors on. Off TPU this is just (model, device) — zero behavior change.
+        On TPU, copies the live (possibly still-on-device, not yet synced) weights
+        into the CPU replica first."""
+        if not device_is_tpu:
+            return model, device
+        eval_model.load_state_dict({k: v.detach().to('cpu') for k, v in model.state_dict().items()})
+        eval_model.eval()
+        return eval_model, torch.device('cpu')
 
     if hp.get('_pretrained_ckpt'):
         ckpt = torch.load(hp['_pretrained_ckpt'], map_location=device)
@@ -2756,6 +2977,12 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     curriculum = hp.get('curriculum', [])
     assert curriculum
     log_every  = hp.get('log_every', 500)
+    # Host-sync throttle for the weave_mix loop's per-step loss materialization (see
+    # its own comment at the call site) — default 1 (sync every step, prior behavior,
+    # exact) off TPU; defaults to log_every on TPU so a device sync only happens as
+    # often as logging already needs one, not on every single step.
+    sync_every = hp.get('sync_every', log_every if device_is_tpu else 1)
+    assert sync_every >= 1
 
     global_step = 0
     t_start = time.time()
@@ -2859,7 +3086,6 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 pos_content, pos_mask, tags, L = (built['pos_content'], built['pos_mask'],
                                                   built['tags'], built['L'])
                 mask_np = chunk_mask_fb_traj(pos_mask, hops=hops)
-                mask_t  = torch.tensor(mask_np, dtype=torch.float32, device=device)
                 pos_state_t = pos_local_t = scaled_pos_t = None
                 if dual_rope:
                     ps, pl = _dual_positions(pos_content, L)
@@ -2870,13 +3096,53 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     scaled_pos_t = torch.tensor(sp, dtype=torch.float32, device=device)
                 trajectories.append(dict(weight=wcfg['weight'], pattern=pname, n_chunks=w_n_chunks,
                                          chunk_len=w_chunk_len,
-                                         pos_content=pos_content, mask_np=mask_np, mask_t=mask_t,
+                                         pos_content=pos_content, mask_np=mask_np, mask_t=None,
                                          tags=tags, L=L, repeat_batch=w_repeat_batch,
                                          pos_state_t=pos_state_t, pos_local_t=pos_local_t,
                                          scaled_pos_t=scaled_pos_t,
-                                         base_weight=wcfg['weight'], ema_loss=None, last_match=None))
+                                         base_weight=wcfg['weight'], ema_loss=None, last_match=None,
+                                         last_loss_t=None, ema_loss_t=None))
             traj_weights = np.array([t['weight'] for t in trajectories], dtype=np.float64)
             traj_weights = traj_weights / traj_weights.sum()
+
+            # Length bucketing (see _bucket_ceilings/_pad_mask_to above) — opt-in via
+            # hp['bucket_lengths'] (default False, every existing config unaffected).
+            # When on, every trajectory's mask_t/Lb/B are derived here, once, at stage
+            # setup; the training loop below pads each sampled batch to traj['Lb'] and
+            # samples traj['B'] rows instead of the stage-level B.
+            bucket_lengths = hp.get('bucket_lengths', False)
+            if bucket_lengths:
+                max_shape_buckets = hp.get('max_shape_buckets', 8)
+                # token_budget scales B linearly with 1/Lb — a reasonable proxy when
+                # per-step memory is dominated by the B*L*d activation/KV footprint
+                # (true for small models / short L). attn_sq_budget instead scales B
+                # with 1/Lb^2, matching the O(B*H*L^2) attention-score-matrix term
+                # that dominates once L gets large relative to d — the term that
+                # actually caused a real 52.85G/15.75G HBM OOM on tpu1 (gate 5, see
+                # CLAUDE.md's scale-up entry) at token_budget-derived B values before
+                # this fix. When both are given, B is the MINIMUM of the two (never
+                # the max) — each is a genuine ceiling from a different memory term.
+                token_budget = hp.get('token_budget', None)
+                attn_sq_budget = hp.get('attn_sq_budget', None)  # units: B * Lb^2
+                ceilings = _bucket_ceilings([t['L'] for t in trajectories],
+                                            [t['weight'] for t in trajectories],
+                                            max_shape_buckets)
+                for t in trajectories:
+                    Lb = _assign_bucket(t['L'], ceilings)
+                    t['Lb'] = Lb
+                    t['mask_np'] = _pad_mask_to(t['mask_np'], Lb)
+                    b_cap = B
+                    if token_budget is not None:
+                        b_cap = min(b_cap, _pow2_floor(token_budget / Lb))
+                    if attn_sq_budget is not None:
+                        b_cap = min(b_cap, _pow2_floor(attn_sq_budget / (Lb * Lb)))
+                    t['B'] = max(1, b_cap)
+            else:
+                for t in trajectories:
+                    t['Lb'] = t['L']
+                    t['B'] = B
+            for t in trajectories:
+                t['mask_t'] = torch.tensor(t['mask_np'], dtype=torch.float32, device=device)
 
             def _log_weave_mix(tag=''):
                 # One entry per line (not a single-line tuple-list repr) — with dense
@@ -2884,11 +3150,21 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 # the old one-liner wrapped into an unreadable wall of text.
                 name_w = max(len(t['pattern']) for t in trajectories)
                 lines = [f'    {w:5.2f}  {t["pattern"]:<{name_w}}  repeat_batch={t["repeat_batch"]}'
+                         f'  L={t["L"]}->Lb={t["Lb"]}  B={t["B"]}'
                          for t, w in zip(trajectories, traj_weights)]
                 _log(f'\n[stage {stage_i}] weave_mix{tag}  '
                      f'chunk_len={chunk_len} state={state_len} wl={warmup_len} '
                      f'hops={hops}  B={B}  steps={n_steps}')
                 _log('\n'.join(lines))
+                if bucket_lengths:
+                    from collections import Counter
+                    cnt = Counter(t['Lb'] for t in trajectories)
+                    waste = [f'    Lb={Lb:5d}  n_entries={n}  '
+                            f'mean_real_L={np.mean([t["L"] for t in trajectories if t["Lb"] == Lb]):.1f}  '
+                            f'waste={100*(1 - np.mean([t["L"] for t in trajectories if t["Lb"] == Lb])/Lb):.1f}%'
+                            for Lb, n in sorted(cnt.items())]
+                    _log(f'  buckets ({len(cnt)}/{max_shape_buckets}):')
+                    _log('\n'.join(waste))
             _log_weave_mix()
 
             def _temp_softmax_rescale(diffs):
@@ -2965,9 +3241,11 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 if _cached_batch is None or _cached_repeat_left <= 0:
                     traj = trajectories[rng.choice(len(trajectories), p=traj_weights)]
                     t_pos_content, t_mask_t, t_tags = traj['pos_content'], traj['mask_t'], traj['tags']
-                    tok_np = make_batch_tagged(rng, B, traj['n_chunks'], traj['chunk_len'], state_len, state_vocab_size,
+                    tok_np = make_batch_tagged(rng, traj['B'], traj['n_chunks'], traj['chunk_len'], state_len, state_vocab_size,
                                                t_pos_content, t_tags, data_kind=data_kind,
                                                data_target_bits=data_target_bits)
+                    if bucket_lengths and traj['Lb'] != traj['L']:
+                        tok_np = _pad_tok_to(tok_np, traj['Lb'])
                     tok_t = torch.tensor(tok_np, device=device, dtype=torch.long)
                     _cached_batch = (traj, t_pos_content, t_mask_t, t_tags, tok_t)
                     _cached_repeat_left = traj['repeat_batch']
@@ -2975,81 +3253,111 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     traj, t_pos_content, t_mask_t, t_tags, tok_t = _cached_batch
                 _cached_repeat_left -= 1
 
-                if forward_granularity is not None:
-                    assert not dual_rope and not rope_state_scale, \
-                        'dual_rope/rope_state_scale + forward_granularity not yet supported together'
-                    loss = _forward_segmented(model, tok_t, traj['mask_np'], t_pos_content,
-                                              device, ls_max, forward_granularity,
-                                              segment_checkpoint=segment_checkpoint)
-                else:
-                    if dual_rope:
-                        logits = model(tok_t, t_mask_t, pos_state=traj['pos_state_t'], pos_local=traj['pos_local_t'])
-                    elif rope_state_scale:
-                        logits = model(tok_t, t_mask_t, offset=traj['scaled_pos_t'])
+                # bf16 autocast: TPU only (native fast path there). CPU/MPS behavior
+                # is byte-for-byte unchanged (autocast disabled => no-op context).
+                # `hp['no_autocast']` (default False): diagnostic escape hatch for bug 5
+                # (CLAUDE.md's TPU port entry — real-padding + bf16 + XLA NaN, isolated
+                # down to a single padded bucket, ruled out grad_checkpoint/batch-size/
+                # multi-bucket-compile as causes) — forces fp32 on TPU to test whether
+                # XLA's autocast lacks CPU/CUDA's policy of keeping softmax/log_softmax
+                # in fp32 for numerical stability.
+                _autocast_on = device_is_tpu and not hp.get('no_autocast', False)
+                with torch.autocast(device_type='xla', dtype=torch.bfloat16, enabled=_autocast_on):
+                    if forward_granularity is not None:
+                        assert not dual_rope and not rope_state_scale, \
+                            'dual_rope/rope_state_scale + forward_granularity not yet supported together'
+                        loss = _forward_segmented(model, tok_t, traj['mask_np'], t_pos_content,
+                                                  device, ls_max, forward_granularity,
+                                                  segment_checkpoint=segment_checkpoint)
                     else:
-                        logits = model(tok_t, t_mask_t)
-                    nlls = []
-                    for rb in t_pos_content['rec_blocks']:
-                        if not rb['is_clean']:
-                            continue
-                        # w0:c1 instead of c0:c1 — NLL now covers the warmup region too,
-                        # not just the response/continuation (this fork's 2nd change, see
-                        # module docstring). w0 always precedes c0 directly (no gap, no
-                        # tag in between in this fork's tag-free layout), so this is a
-                        # straight causal-shift extension of the same log_softmax slicing.
-                        lp  = F.log_softmax(logits[:, rb['w0'] - 1:rb['c1'] - 1], dim=-1)
-                        tgt = tok_t[:, rb['w0']:rb['c1']]
-                        nll_per = _positional_ls_nll(lp, tgt, ls_max)
-                        nlls.append(nll_per.mean())
+                        if dual_rope:
+                            logits = model(tok_t, t_mask_t, pos_state=traj['pos_state_t'], pos_local=traj['pos_local_t'])
+                        elif rope_state_scale:
+                            logits = model(tok_t, t_mask_t, offset=traj['scaled_pos_t'])
+                        else:
+                            logits = model(tok_t, t_mask_t)
+                        nlls = []
+                        for rb in t_pos_content['rec_blocks']:
+                            if not rb['is_clean']:
+                                continue
+                            # w0:c1 instead of c0:c1 — NLL now covers the warmup region too,
+                            # not just the response/continuation (this fork's 2nd change, see
+                            # module docstring). w0 always precedes c0 directly (no gap, no
+                            # tag in between in this fork's tag-free layout), so this is a
+                            # straight causal-shift extension of the same log_softmax slicing.
+                            lp  = F.log_softmax(logits[:, rb['w0'] - 1:rb['c1'] - 1], dim=-1)
+                            tgt = tok_t[:, rb['w0']:rb['c1']]
+                            nll_per = _positional_ls_nll(lp, tgt, ls_max)
+                            nlls.append(nll_per.mean())
 
-                        if rb['type'] == 'refine':
-                            # Self-correct half (wa/am) — ALSO NLL-scored, exposure-bias
-                            # training (docs/HISTORY.md §16/§17): predict correctly even
-                            # from a context built from your own possibly-wrong prior
-                            # guess. `wa`'s target is literal (tok_t itself — never
-                            # overwritten), but `am0:am1` in tok_t holds an argmax/
-                            # placeholder value, NOT ground truth — its target is
-                            # `gt_c0:gt_c0+out_len` instead (round-0's own response,
-                            # never touched by argmax-overwrite, the SAME ground truth
-                            # every round's own c0:c1 uses).
-                            lp_wa  = F.log_softmax(logits[:, rb['wa0'] - 1:rb['wa1'] - 1], dim=-1)
-                            tgt_wa = tok_t[:, rb['wa0']:rb['wa1']]
-                            nlls.append(_positional_ls_nll(lp_wa, tgt_wa, ls_max).mean())
+                            if rb['type'] == 'refine':
+                                # Self-correct half (wa/am) — ALSO NLL-scored, exposure-bias
+                                # training (docs/HISTORY.md §16/§17): predict correctly even
+                                # from a context built from your own possibly-wrong prior
+                                # guess. `wa`'s target is literal (tok_t itself — never
+                                # overwritten), but `am0:am1` in tok_t holds an argmax/
+                                # placeholder value, NOT ground truth — its target is
+                                # `gt_c0:gt_c0+out_len` instead (round-0's own response,
+                                # never touched by argmax-overwrite, the SAME ground truth
+                                # every round's own c0:c1 uses).
+                                lp_wa  = F.log_softmax(logits[:, rb['wa0'] - 1:rb['wa1'] - 1], dim=-1)
+                                tgt_wa = tok_t[:, rb['wa0']:rb['wa1']]
+                                nlls.append(_positional_ls_nll(lp_wa, tgt_wa, ls_max).mean())
 
-                            out_len = rb['am1'] - rb['am0']
-                            lp_am  = F.log_softmax(logits[:, rb['opf0']:rb['am1'] - 1], dim=-1)
-                            tgt_am = tok_t[:, rb['gt_c0']:rb['gt_c0'] + out_len]
-                            nlls.append(_positional_ls_nll(lp_am, tgt_am, ls_max).mean())
-                    loss = torch.stack(nlls).mean()
+                                out_len = rb['am1'] - rb['am0']
+                                lp_am  = F.log_softmax(logits[:, rb['opf0']:rb['am1'] - 1], dim=-1)
+                                tgt_am = tok_t[:, rb['gt_c0']:rb['gt_c0'] + out_len]
+                                nlls.append(_positional_ls_nll(lp_am, tgt_am, ls_max).mean())
+                        loss = torch.stack(nlls).mean()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
+                if device_is_tpu:
+                    # torch_xla 2.6 API: materializes the graph accumulated since the
+                    # last sync. Deliberately NOT called every step for any OTHER reason
+                    # (see the sync-throttling below) — this is the one mandatory sync,
+                    # optimizer state must actually advance before the next step reads it.
+                    torch_xla.sync()
 
-                loss_f = float(loss.detach())
-                # Per-trajectory loss — RAW, from whatever single batch was last
-                # sampled for that entry (no smoothing) — lets you watch each DSL
-                # entry's own loss directly (e.g. spot a rehearsal entry regressing/
-                # being forgotten as later stages/entries dominate sampling), not
-                # just the aggregate loss which only ever reflects whichever entry
-                # was sampled this exact step.
-                traj['last_loss'] = loss_f
-                traj['ema_loss'] = loss_f if traj['ema_loss'] is None else (
-                    adapt_ema_alpha * traj['ema_loss'] + (1 - adapt_ema_alpha) * loss_f)
-                _traj_loss_str = '[' + ','.join(f'{t["last_loss"]:.2f}' if t.get('last_loss') is not None else 'NA'
-                                                for t in trajectories) + ']'
-                pbar.set_postfix(loss=f'{loss_f:.3f}', lr=f'{lr:.1e}', traj_loss=_traj_loss_str, refresh=False)
-                if local_step % log_every == 0:
-                    _jlog(dict(step=global_step, loss=round(loss_f, 5), lr=lr,
-                               traj_loss=[round(t['last_loss'], 4) if t.get('last_loss') is not None else None
-                                         for t in trajectories]))
-                    print(str(pbar), file=log_file, flush=True)
+                # Per-trajectory loss bookkeeping. On TPU, materializing a device tensor
+                # to a python float (float()/.item()) forces a host<->device round trip
+                # that serializes the pipeline if done every step — see docs/TRC_TPU.md's
+                # "repeat_batch under sequence packing" section for the same class of
+                # problem in the argmax-feedback path. Keep the EMA update as pure
+                # on-device tensor arithmetic every step (no sync); only materialize to
+                # python (for the tqdm postfix / jsonl log / traj_loss string) at throttled
+                # sync points. On CPU/MPS, sync_every=1 (default) reproduces the exact
+                # prior every-step behavior.
+                loss_d = loss.detach()
+                traj['last_loss_t'] = loss_d
+                traj['ema_loss_t'] = loss_d if traj['ema_loss_t'] is None else (
+                    traj['ema_loss_t'] * adapt_ema_alpha + loss_d * (1 - adapt_ema_alpha))
+                is_eval_step = (local_step % stage_eval_every == 0 or local_step == n_steps)
+                do_sync = (local_step % sync_every == 0) or (local_step % log_every == 0) or is_eval_step
+                if do_sync:
+                    loss_f = float(loss_d)
+                    for t in trajectories:
+                        if t['last_loss_t'] is not None:
+                            t['last_loss'] = float(t['last_loss_t'])
+                            t['ema_loss']  = float(t['ema_loss_t'])
+                    _traj_loss_str = '[' + ','.join(f'{t["last_loss"]:.2f}' if t.get('last_loss') is not None else 'NA'
+                                                    for t in trajectories) + ']'
+                    pbar.set_postfix(loss=f'{loss_f:.3f}', lr=f'{lr:.1e}', traj_loss=_traj_loss_str, refresh=False)
+                    if local_step % log_every == 0:
+                        _jlog(dict(step=global_step, loss=round(loss_f, 5), lr=lr,
+                                   traj_loss=[round(t['last_loss'], 4) if t.get('last_loss') is not None else None
+                                             for t in trajectories]))
+                        print(str(pbar), file=log_file, flush=True)
+                    last_loss_f = loss_f  # do_sync always fires when is_eval_step does
+                                          # (see do_sync's own definition above), so this
+                                          # is always set by the time the eval block below reads it
 
-                if local_step % stage_eval_every == 0 or local_step == n_steps:
+                if is_eval_step:
                     model.eval()
                     elapsed = time.time() - t_start
                     h, m = divmod(int(elapsed), 3600); m, s = divmod(m, 60)
                     _log(f'\n--- stage={stage_i} step={local_step}/{n_steps}'
-                         f'  g={global_step}  loss={loss_f:.4f}  {h:02d}:{m:02d}:{s:02d} ---')
+                         f'  g={global_step}  loss={last_loss_f:.4f}  {h:02d}:{m:02d}:{s:02d} ---')
 
                     val_means = []
                     for traj in trajectories:
@@ -3058,12 +3366,17 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                         if val_n_seqs is not None:
                             val_seqs = dict(list(val_seqs.items())[:val_n_seqs])
                         pcts = []
+                        decode_model, decode_device = _synced_eval_model()
                         for sname, seq_bytes in val_seqs.items():
                             chunks_list = [seq_bytes[k * traj['chunk_len']:(k + 1) * traj['chunk_len']]
                                           for k in range(traj['n_chunks'])]
-                            r = ar_decode_traj_nokv(model, np.array(chunks_list), state_len,
+                            # traj['mask_np'] may be bucket-padded (see _bucket_ceilings above) —
+                            # ar_decode_traj_nokv builds/grows its own mask from pos_content
+                            # internally and never reads this argument's shape against L, so
+                            # padding here is inert; passed through unchanged regardless.
+                            r = ar_decode_traj_nokv(decode_model, np.array(chunks_list), state_len,
                                                     state_vocab_size, traj['mask_np'],
-                                                    traj['pos_content'], traj['tags'], device,
+                                                    traj['pos_content'], traj['tags'], decode_device,
                                                     dual_rope=dual_rope, rope_state_scale=rope_state_scale)
                             pcts.append(r['match_pct'])
                         m_ = sum(pcts) / len(pcts)

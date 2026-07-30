@@ -124,6 +124,309 @@ Fast-weight language model — HashMemNet (HMN). **Current focus: `kvmem/hmn.py`
 
 ---
 
+## TPU port (2026-07-30) — status: infra confirmed working, first real training run not yet completed
+
+**Context**: a scale-up experiment (target: 1024-byte perfect recall from a warmup anchored at
+any source index, `d=128/n_layers=16/n_heads=8`, ~1.12M params — see
+`/Users/muaz/.claude/plans/dazzling-waddling-widget.md` for the full plan) needed far more
+throughput than MPS/CPU could give, motivating the actual TPU port `docs/TRC_TPU.md` had
+previously only estimated. `docs/TRC_TPU.md` now has the up-to-date, corrected version of
+everything below (tier confirmation, the packing-recommendation reversal, grad_checkpoint
+correction) — this entry is the CLAUDE.md-level summary of what's confirmed working and what
+broke, for quick reference.
+
+**Access**: `gcloud compute tpus tpu-vm ssh tpu1 --zone=europe-west4-b` — confirmed `tpu1` is
+`v5litepod-1`, ONE v5e chip (not a `-8` slice), `torch 2.6.0`/`torch_xla 2.6.1` preinstalled.
+SSH is flaky/slow to connect (sometimes several retries, occasionally outright fails) WHILE the
+TPU process is mid-XLA-compile and pegging most of the host's 24 vCPUs — this is contention, not
+a real connectivity problem; retry rather than assume the VM is down. **Use tmux for anything
+that must survive a dropped SSH session** — every run in this project's TPU work goes through a
+persistent tmux session (`tmux new-session -d -s kvmem_gate`, `tmux send-keys ... Enter`, `tmux
+capture-pane -t kvmem_gate -p` to read output) rather than a bare `--command`, specifically
+because a long-running training job must not die when a flaky SSH connection drops.
+
+**Fix for the flakiness itself, for one-off status-check commands (separate from the tmux point
+above, which is about the training job surviving a drop)**: each `gcloud compute tpus tpu-vm ssh
+--command=...` invocation is a brand-new SSH handshake + gcloud auth/IAM/IAP round-trip from
+scratch, which collides badly with the host being CPU-starved during a compile — this is why
+repeated status-check calls fail far more often than the one persistent tmux session does. Get
+the real `ssh` invocation gcloud would run via `gcloud compute tpus tpu-vm ssh tpu1
+--zone=europe-west4-b --dry-run` (prints something like `/usr/bin/ssh -t -i
+~/.ssh/google_compute_engine -o HostKeyAlias=... muaz@<external-ip>`), then open ONE multiplexed
+master connection directly with plain `ssh` and reuse it for every subsequent command instead of
+going through `gcloud`'s wrapper each time:
+```
+ssh -o ControlMaster=auto -o ControlPersist=1h -o ControlPath=/tmp/tpu1_ssh/cm \
+    -o CheckHostIP=no -o HashKnownHosts=no -o HostKeyAlias=<from dry-run> -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/google_compute_known_hosts \
+    -i ~/.ssh/google_compute_engine muaz@<external-ip> "echo CONNECTED"
+# every later command reuses the same authenticated socket, no new handshake:
+ssh -o ControlPath=/tmp/tpu1_ssh/cm muaz@<external-ip> "ps aux | grep hmn"
+```
+Verified this resolves the repeated-connection-failure pattern in practice. `ssh -O check -o
+ControlPath=... <host>` confirms the master is still alive if a later command behaves oddly.
+**One sharp edge hit directly**: a command that kills a large, actively-compiling process on the
+remote end (e.g. `pkill -9` against the training PID) can itself return a spurious immediate
+`exit 255` on the multiplexed channel even though the master session survives and the kill
+actually landed — don't read that as "the connection is broken," re-check with a plain command
+(`ps aux`) on the same socket before concluding anything failed.
+
+**Monitoring**: `~/.local/bin/tpu-info` (already installed) shows chip/PID/HBM-usage/duty-cycle —
+useful for confirming which process holds the device and current HBM usage. **Caveat found
+directly**: running it under `watch` in a second tmux session (`tmux new-session -d -s
+tpu_monitor`) appears to STALL/freeze (stale timestamps, no refresh) while the training process
+is mid-compile — contention between `tpu-info`'s own metrics query and the busy compile. Don't
+trust its wall-clock freshness during a compile; use `ps aux`'s CPU-time field on the training
+PID instead (climbing steadily = genuinely still working, not hung) as the reliable liveness
+signal during that phase.
+
+**Porting work landed in `kvmem/hmn.py`** (`train()`, opt-in via `hp['bucket_lengths']`/
+`device_str='tpu'` — every existing CPU/MPS config unaffected): length bucketing + padding
+(`_bucket_ceilings`/`_pad_mask_to`/`_pad_tok_to`, a weighted k-segment DP minimizing `L^2`-weighted
+cost, since attention cost scales with `L^2` not `L`), per-bucket batch sizing from TWO memory
+ceilings (`token_budget` for the `B*L` term, `attn_sq_budget` for the `B*L^2` attention-matrix
+term — see the grad_checkpoint finding below for why the second one is load-bearing, not
+optional), `torch_xla.sync()` + bf16 autocast, host-sync-throttled loss/logging (avoids a device
+round-trip every step), a CPU eval replica (`_synced_eval_model()` — autoregressive decode is a
+token-at-a-time Python loop over a growing shape, a recompile-per-token disaster on XLA, so eval
+copies weights to a CPU copy of the model instead of porting decode), and a vectorized (no more
+per-`b_idx` Python loop) `make_batch_tagged`. Verification harness: `kvmem/gate_check.py`
+(gates 3/4/5 — CPU/TPU loss-curve parity, bf16-vs-fp32 byte-exact match, real-config end-to-end
+smoke test), run as `python3 -m kvmem.gate_check <gate3_cpu|gate3_tpu|gate3_compare|gate4|gate5>`.
+
+**Four real bugs found and fixed, plus a fifth still open (see below), all confirmed on `tpu1`
+directly (not theoretical)**:
+1. **Mixing a CPU `.backward()` call and a TPU `.backward()` call in the SAME Python process
+   crashes the second one** — `RuntimeError: 0 <= device.index() && device.index() <
+   ... device_ready_queues_.size() INTERNAL ASSERT FAILED`. PyTorch's autograd Engine singleton
+   sizes `device_ready_queues_` when first used; if that first use is a CPU backward, it never
+   learns about XLA registered afterward. Not specific to this codebase. **Fix: one device per
+   process** — `gate_check.py`'s `gate3_cpu`/`gate3_tpu` are separate `python3 -m` invocations,
+   compared only via their logged output on disk, never in-process.
+2. **`torch.utils.checkpoint.checkpoint`'s default (`use_reentrant=False`) path is incompatible
+   with XLA tensors** — `AttributeError: module 'torch' has no attribute 'xla'`, because it calls
+   `getattr(torch, device_type)` to save/restore per-device RNG state, and `torch_xla` doesn't
+   register itself under `torch.xla`.
+3. **Gradient checkpointing is NOT optional at long `L`, regardless of how small the model is** —
+   without checkpointing, training the ~1.12M-param model at `B=64, L=1232` hit a hard HBM OOM:
+   `Used 52.85G of 15.75G hbm`. The requested amount matches `B*H*L^2*n_layers*4bytes`
+   (`64*8*1232^2*16*4 ≈ 52.8G`) almost exactly — every layer's `O(B*H*L^2)` attention-score matrix
+   was being retained simultaneously for backward. Recomputing one layer's activations at a time
+   instead fixes it. The lesson generalizes: whether checkpointing matters is a function of `L`
+   (quadratic term) vs. model size (linear term), NOT primarily a function of param count the way
+   `docs/TRC_TPU.md`'s original (now-corrected) guidance assumed.
+4. **`torch_xla.utils.checkpoint.checkpoint` (the initial fix for bug 2) silently breaks under bf16
+   autocast — trains "successfully" all the way to `loss=NaN` from the very first logged step,
+   never crashing.** It doesn't reapply the surrounding `torch.autocast` context during backward's
+   recompute the way stock PyTorch's reentrant `CheckpointFunction` does. Found by direct A/B on
+   `hmn_tpu_sanity_w25.py`: `grad_checkpoint='block'` (via `torch_xla.utils.checkpoint`) → NaN from
+   step 1; `grad_checkpoint=False` (no checkpointing at all, same everything else) → loss
+   5.33→5.39, finite, over 600 steps. A local CPU repro of the same architecture under forced bf16
+   autocast — both with and without `torch.utils.checkpoint` — never produced NaN either, ruling
+   out autocast or checkpointing individually and isolating the interaction specifically to
+   torch_xla's implementation. **Real fix** (`kvmem/hmn.py`'s `_ckpt`): for XLA tensors, use stock
+   PyTorch's REENTRANT path instead — `torch.utils.checkpoint.checkpoint(fn, *args,
+   use_reentrant=True, preserve_rng_state=False)`. `CheckpointFunction.backward` explicitly
+   reapplies `torch.amp.autocast(device_type=ctx.device_type, **ctx.device_autocast_kwargs)`
+   around the recomputed forward — the handling torch_xla's version lacks. `preserve_rng_state=
+   False` is required too: it's what gates the `_get_device_module`/`getattr(torch, 'xla')` call
+   from bug 2 (safe here — no dropout/stochastic ops in any checkpointed block). One more wrinkle:
+   even with `preserve_rng_state=False`, `torch.random.fork_rng` (called unconditionally inside
+   `CheckpointFunction.backward`, before it checks its own `enabled` flag) still does `getattr(
+   torch, 'xla', None)` and raises if that's `None` — fixed by `torch._register_device_module(
+   'xla', torch_xla)` once at import time (any non-None object satisfies it; with `enabled=False`
+   nothing downstream actually touches it). Verified: re-running `hmn_tpu_sanity_w25.py` with
+   `grad_checkpoint='block'` restored and this fix in place reproduced the SAME finite loss values
+   (5.33→5.39) as the no-checkpoint run, at the same speed (~3.4-4 it/s) — checkpointing is now
+   free at this scale, not just avoided.
+
+**A fifth issue, still OPEN and NOT root-caused despite extensive ablation** (2026-07-30):
+bug 4's fix resolved `hmn_tpu_sanity_w25.py`'s stage 0 (`chunk_len=8`, finite loss 5.33→5.39,
+`best=3.1%` match, clean eval) — but **stage 1 (`chunk_len=16`) hit `loss=NaN` again, from step 1**.
+A long sequence of single-variable ablations followed, each built as a genuine positive/negative
+pair on `tpu1` directly (never reproduced on CPU under any settings, including forced bf16
+autocast and the exact reentrant-checkpoint code path) — **every one of the following was
+individually ruled out as the sole cause**:
+- **Real padding** (a bucket mixing different real `L` under one ceiling) — a config with a
+  single bucket genuinely forced to pad (`max_shape_buckets=1`, 3 entries with real `L=19/20/21`
+  merged into one `Lb=21`) NaN'd; the exact same 3 entries with `max_shape_buckets=3` (each gets
+  its own exact bucket, verified `waste=0.0%` on every bucket) **also NaN'd** — padding is not
+  necessary for the failure.
+- **`grad_checkpoint='block'`** — set to `False` on an otherwise-identical config: still NaN'd.
+- **bf16 autocast** — added `hp['no_autocast']` (forces fp32 via `torch.autocast(...,
+  enabled=False)`, `kvmem/hmn.py`'s weave_mix forward) and reran: **still NaN'd even in fp32**.
+  This alone rules out precision as the cause, contradicting the working hypothesis at the time.
+- **`rope`/`state_vocab_size`** — swapping `rope=False, state_vocab_size=1` (the scale-up
+  target's settings) for `rope=True, state_vocab_size=2` (every historically-proven-working
+  config's settings) on the same shape: still NaN'd.
+- **Batch size** — `B=4096` (the value used throughout `hmn_tpu_sanity_w25.py`) vs `B=64` on the
+  ORIGINAL known-good 6-entry stage-0 weave_mix (unmodified from the config that trained cleanly
+  earlier): `B=4096` finite and declining (confirmed twice, including a fresh re-run late in the
+  investigation confirming the environment itself had not degraded from repeated `pkill -9`s),
+  **`B=64` NaN'd from step 4** — the one result that looked like a real, single-variable
+  correlation.
+
+**Why even the batch-size result is not trustworthy as a root cause**: changing `B` changes how
+many values `rng.integers`/`rng.beta` draws per batch-construction call in `make_batch_tagged`,
+which shifts the ENTIRE subsequent NumPy RNG stream from the very first batch onward — `B=4096`
+and `B=64` runs are not "the same data, fewer rows," they diverge into completely different
+random draws immediately. Every ablation above has this same confound: each config edit was
+also, unavoidably, a different RNG stream. **Net honest conclusion**: this looks like a rare,
+data-dependent numerical edge case specific to real XLA/TPU execution (bf16 OR fp32 — precision
+doesn't gate it) that no single hyperparameter reliably triggers or avoids — some specific random
+batch draws hit it, others don't, across every setting tried. The next step that would actually
+localize this (not yet done) is forward hooks checking each block's output for NaN/inf at a FIXED
+seed, to find exactly which layer and which row first goes non-finite, rather than continued
+hyperparameter-level ablation. **`tpu1` was shut down at the end of this investigation — no
+further TPU work has happened since.** `kvmem/configs/hmn_tpu_sanity_w25_ablate*.py` (three
+variants: `_ablate`, `_ablate_2`, `_ablate_3`) and `kvmem/configs/hmn_tpu_recall1024_flat.py`
+are all still `rope=False`/`state_vocab_size=1`-based and untouched since. **Do not re-attempt
+Run A until this is resolved** — its own buckets will mix real lengths, hitting the identical
+open failure mode.
+
+**JAX/Flax NNX port, and the finding that actually answers bug 5** (`kvmem/hmn_jax.py`,
+2026-07-30): `torch_xla` is one bridge among several onto XLA; JAX is XLA's own first-party
+frontend, built independently — a genuinely different data point on whether bug 5 is a
+`torch_xla`-bridge-layer bug or something XLA itself does with this exact computation.
+**Single file, fully self-contained** (no import of `kvmem.hmn`, no `torch` at all) —
+`chunk_positions_traj`/`chunk_mask_fb_traj`/`parse_traj_dsl`/`make_batch_tagged` are copied
+byte-for-byte (pure NumPy/Python, no torch involved in any of them) rather than imported, so the
+file has zero PyTorch dependency. Scope: only `block_type='single_attn'` with `rope`+`yarn`/
+`null_kv`/`rmsnorm` — `hmn_notags_w25_rope.py`'s exact feature set. `build_model(hp, rngs) ->
+HMNModel` mirrors `kvmem.hmn.build_model`'s own signature; `train_jax(hp)` is a genuine (if
+scope-limited — no refine rounds, no padding/bucketing, no label smoothing, no decode-eval)
+optimization loop: weighted trajectory sampling, real gradient steps via
+`nnx.value_and_grad`/`optax.adamw`, teacher-forced NLL loss only.
+
+**One real bug caught while porting, not yet flagged elsewhere in this codebase**:
+`kvmem.hmn.MHAttention`'s own docstring claims `null_kv`'s null K/V pair is "learnable," but the
+actual `forward()` code constructs it as a fresh `torch.zeros(...)` every call, never wrapped in
+`nn.Parameter` — it can never receive gradients and is permanently zero, contradicting the
+docstring (now corrected in `kvmem/hmn.py`'s own docstring, behavior left unchanged since no
+checkpoint has ever exercised a learned null slot). Caught by a 1024-param mismatch (166,400 vs
+165,376) between the JAX port (which initially matched the docstring) and the real PyTorch model,
+found by comparing param counts directly, not by inspection.
+
+**Two flax-API version mismatches hit and fixed, both real portability bugs, not TPU-specific**:
+newer flax (verified 0.12.8) requires wrapping a plain Python list of submodules in `nnx.List`
+(a bare list now raises `ValueError: ... Static attributes should not contain data values`);
+older flax (0.10.7 — the newest installable on a TPU VM still shipping Python 3.10, since
+flax>=0.11 requires Python 3.11+, both verified directly) predates `nnx.List` entirely and just
+accepts a bare list. `nnx.Optimizer.update`'s signature also changed — newer takes `(model,
+grads)` positionally, older takes just `(grads)` with the model reference stored at `__init__`.
+Both detected at runtime (`hasattr(nnx, 'List')`, `'model' in inspect.signature(...).parameters`)
+rather than pinned to one version — **first attempt at the second one used a parameter-COUNT
+check instead of a name check, which was wrong** (`**kwargs` inflates both signatures' arg count
+equally, so count alone doesn't discriminate) and produced the exact same crash again on
+`tpu2` — fixed by checking for the `'model'` parameter name specifically.
+
+**`kvmem/setup_tpu_jax.sh`**: one-shot install script for a fresh TPU VM (`pip install
+'jax[tpu]' -f <libtpu index> flax optax tpu-info`, no flax version pin — pinning one broke the
+install outright on `tpu2`'s Python 3.10 instead of degrading gracefully) plus a self-check that
+`jax.devices()` actually returns a TPU device. Verified on `tpu2` (`v6e-1`, Trillium,
+`europe-west4-a`, a fresh VM with zero ML packages preinstalled — 44 vCPU/172GB host, notably
+larger than `tpu1`'s 24/47) from a cold start.
+
+**The actual finding**: with `kvmem/hmn_jax.py` running cleanly on `tpu2` (real gradient steps,
+finite loss, both stage 0 no-padding and general training confirmed), `torch_xla` was ALSO
+installed on `tpu2` (`pip install torch~=2.6.0 torch_xla[tpu]~=2.6.0`, same versions as `tpu1`)
+and `hmn_tpu_sanity_w25_ablate_2.py` — the exact config that reliably produced bug 5's NaN on
+`tpu1`/v5e (genuine padding via `max_shape_buckets=1` forcing 3 different real lengths into one
+`Lb=21` bucket, `rope=False`, `state_vocab_size=1`, `grad_checkpoint='block'`, bf16 autocast) —
+was run unchanged on `tpu2`/v6e. **It completed all 100 steps with ZERO non-finite loss values**
+(`[stage 0] done.`, final losses in the 5.2-5.5 range throughout, vs. instant `loss=nan` from
+step 1 on every v5e attempt). **This is strong evidence bug 5 is specific to the v5e chip
+generation (or its particular libtpu/PJRT build), not a generic torch_xla bug, not this
+architecture's masking/padding logic, and not any of the hyperparameters ablated earlier** (all
+of which were tested on v5e only). Not yet fully conclusive — only one config variant has been
+re-tested on v6e so far (not, e.g., `hmn_tpu_recall1024_flat.py`'s much longer `L`), and "clean
+for 100 steps" is not as strong as the multi-thousand-step confirmation bug 5 itself needed to
+surface reliably — but this is the first actionable lead after a full day of inconclusive
+same-hardware ablation.
+
+**A sixth, DIFFERENT bug found immediately after, on the SAME chip (`tpu2`/v6e) — `rope=True` +
+bf16 autocast NaNs; fp32 fixes it cleanly.** Once `hmn_tpu_sanity_w25.py` (NoPE, `state_vocab_
+size=1`, `lr_max` corrected to `1e-4` — see below) was training on `tpu2` with real, healthy
+progress (match 21.7% at step 5000, loss monotonically declining past step 10000), a clone with
+only `rope=True` changed (`hmn_tpu_sanity_w25_rope.py`, everything else identical: same `lr_max`,
+`grad_checkpoint='block'`, bf16 autocast, `B=16`, no padding — every bucket `waste=0.0%`) hit
+`loss=nan` on ALL 6 trajectories from step 1. Setting `hp['no_autocast']=True` (forces fp32,
+the same escape hatch built for bug 5) on that exact config fixed it immediately — loss finite
+and declining smoothly (4.627→2.981 over 4400 steps, no NaN anywhere). **This is mechanistically
+distinct from bug 5**: bug 5 turned out to be a v5e-hardware/libtpu issue independent of
+precision (fp32 didn't fix it there, and it disappeared on v6e regardless of precision); this one
+is a genuine bf16-precision issue specific to RoPE (`rope=True`) that reproduces even on v6e
+where bug 5 doesn't — plausible mechanism is accumulated phase/rotation error in bf16's ~8-bit
+mantissa compounding across the `sin`/`cos` position-angle computation
+(`kvmem.hmn.apply_rope`), a classically bf16-sensitive operation, unrelated to chip generation.
+**Not yet deeply isolated beyond the fp32 fix** (didn't test whether `grad_checkpoint`/batch size
+matter here the way they were ruled out for bug 5) — fp32 is a working, if unoptimized,
+workaround; any future `rope=True` TPU run should set `no_autocast=True` until this gets a
+proper mechanistic fix (e.g. computing `apply_rope`'s `cos`/`sin` in fp32 even under an
+otherwise-bf16 autocast region, a much narrower and cheaper fix than disabling autocast
+entirely).
+
+**`lr_max` also needed correcting for `hmn_tpu_sanity_w25.py`'s real convergence attempt**:
+carried over unexamined from Run A's large-batch √-scaled value (`6e-4`), it produced a fast
+initial drop (loss 4.5→2.5 by step 1000) followed by plateau/oscillation (2.2-2.9 for the next
+4000 steps, match=2.3% at step 5000) instead of continued convergence. Reverting to
+`hmn_notags_w25.py`'s original `1e-4` (the value that config actually converged under, per
+CLAUDE.md's own chunk_len-ladder results) fixed it — smooth monotonic loss decline, match=21.7%
+at the same step-5000 checkpoint (vs. 2.3% at the wrong LR), continuing to decline past step
+10000 (match wobbled 21.7%→17.4%, plausibly eval noise from the tiny `val_n_seqs=3` sample —
+loss kept improving monotonically through that same window, and CLAUDE.md's own `weave_c64`
+entry documents an identical wobble-not-degradation pattern elsewhere).
+
+**Bug 6 turned out to be much bigger than the fp32 fix suggested — a SEVENTH issue, length-
+dependent, isolated down to "XLA-compilation-specific" and still OPEN.** Once the fp32 fix looked
+clean at sanity scale (`hmn_tpu_sanity_w25_rope.py`: match=50.1% at step 5000, more than double
+NoPE's 21.7% at the same step — confirming RoPE's known advantage holds once precision is
+handled), the natural next step was re-testing Run A's real config with `rope=True`. A direct
+clone (`hmn_tpu_recall1024_flat_rope.py` — `rope=True, yarn=True, no_autocast=True,
+L_train=2200, L_max=8192`, otherwise identical to `hmn_tpu_recall1024_flat.py` including the
+OOM-driven `max_shape_buckets=4`/`attn_sq_budget=31_000_000` fix) hit **`loss=nan` across every
+single entry** in its own 30-step gate-5-style smoke test — at Run A's real scale (`L=1232-2128`),
+`no_autocast=True` did NOT fix it, unlike at sanity scale. A systematic single-variable ablation
+followed, same pattern as bug 5's own investigation:
+- **`yarn=False`** (removes YaRN's interpolation ramp entirely, plain unscaled RoPE frequencies)
+  — still NaN, every entry. Rules out the YaRN ramp formula.
+- **`grad_checkpoint=False`** (plus `attn_sq_budget` cut ~16x to `2_000_000` to compensate for no
+  longer checkpointing) — still NaN, every entry. Rules out checkpointing.
+- **Direct on-device component test**: ran `kvmem.hmn.apply_rope` and raw `torch.sin`/`torch.cos`
+  directly on a real TPU tensor at the exact failing scale (`pos` up to 2127, the freq=1 channel
+  — angle up to ~2127 radians) — **all finite, no NaN**. Rules out RoPE's own trig computation as
+  the mechanism, even at this position magnitude.
+- **CPU reproduction, the decisive test**: ran the EXACT same config (`rope=True`, `L` up to 2128,
+  real data pipeline, `B=2`, 10 steps) via `device_str='cpu'` (eager PyTorch, no XLA at all) —
+  **loss finite throughout** (5.56-5.59, zero NaN). The identical architecture, identical `L`,
+  identical RoPE math trains cleanly off-XLA.
+
+**Net conclusion**: this is real, reproducible, and isolated to XLA's COMPILED graph specifically
+— not RoPE's math (fine in isolation on-device AND in the full CPU pipeline), not YaRN, not
+checkpointing, not batch size, not raw position magnitude. Something about how XLA fuses/schedules
+the full multi-layer RoPE+attention+backward graph together at this `L` produces non-finite
+values that don't appear when the same operations run eagerly (CPU) or in isolation (on-device
+component test). This is a different flavor of "XLA does something CPU/component-testing can't
+catch" than bug 5 (which was v5e-hardware-specific and disappeared on a different chip) — this
+one persists on the SAME chip (`tpu2`/v6e) that bug 5's own config trained cleanly on, so it is
+specifically about `rope=True` at long `L` in the compiled graph, not chip generation. **Still
+OPEN** — not yet isolated further (candidates not yet tested: Q/K magnitude immediately after
+rotation, pre-softmax attention scores, bisecting `L` between the clean sanity scale ~170 and the
+failing Run A scale ~1232 to find a threshold). **Given this, `hmn_tpu_recall1024_flat.py`
+(`rope=False`, the ORIGINAL Run A config) is the safer path for actually getting a training run
+going** — it has no known issue at its own scale, whereas every `rope=True` variant at this scale
+has failed. `hmn_tpu_recall1024_flat_rope.py`/`_noyarn.py`/`_noyarn_nockpt.py` (all three) are
+left in the repo as the ablation record, not as runnable configs until this is resolved.
+
+**Separately, still queued**: (1) `hmn_tpu_sanity_w25_fp32.py` — does fp32 also change NoPE's own
+convergence trajectory (the bf16 NoPE run's match wobble), unrelated to the RoPE-at-scale issue
+above. (2) `hmn_tpu_sanity_w25_vocab4.py` — the `state_vocab_size` 1→4 ablation. (3) Re-verify
+`hmn_tpu_recall1024_flat.py`'s own `max_shape_buckets=4`/`attn_sq_budget=31_000_000` OOM fix via
+gate 5 — found necessary but never re-run to confirm it actually resolves the OOM at NoPE's own
+(untested-since-the-fix) scale.
+
+---
+
 ## Key Principles
 
 - `null_kv=True` always — 1.5–2× faster, better bpb

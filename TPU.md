@@ -1,16 +1,49 @@
 ```
-export PROJECT_ID=raden-trc                   
-export TPU_NAME=tpu1                   
-export ZONE=europe-west4-b   
-export ACCELERATOR_TYPE=v5litepod-1
-export RUNTIME_VERSION=v2-alpha-tpuv5-lite
+gcloud compute tpus tpu-vm ssh tpu2 --zone=europe-west4-a
+gcloud compute tpus tpu-vm ssh tpu1 --zone=us-central1-a
+```
 
-gcloud compute tpus tpu-vm create $TPU_NAME \
- --accelerator-type=$ACCELERATOR_TYPE \
- --version=$RUNTIME_VERSION \
- --zone=$ZONE \
- --project=$PROJECT_ID
-gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE
+```
+gcloud compute tpus queued-resources create res1 \
+    --node-id tpu1 \
+    --project raden-trc \
+    --zone us-central1-a \
+    --accelerator-type v5litepod-1 \
+    --runtime-version v2-alpha-tpuv5-lite \
+    --spot
+
+gcloud compute tpus queued-resources create res2 \
+    --node-id tpu2 \
+    --project raden-trc \
+    --zone europe-west4-a \
+    --accelerator-type v6e-1 \
+    --runtime-version v2-alpha-tpuv6e \
+    --spot
+
+gcloud compute tpus queued-resources create res3 \
+    --node-id tpu3 \
+    --project raden-trc \
+    --zone us-central2-b \
+    --accelerator-type v4-1 \
+    --runtime-version tpu-ubuntu2204-base
+
+gcloud compute tpus queued-resources list --project raden-trc --zone us-central1-a
+
+gcloud compute tpus queued-resources list --project raden-trc --zone europe-west4-a
+
+gcloud compute tpus queued-resources describe res1 \
+    --project raden-trc \
+    --zone us-central1-a
+
+gcloud compute tpus queued-resources delete res1 \
+    --project raden-trc \
+    --zone us-central1-a \
+    --force \
+    --async
+
+until gcloud compute tpus tpu-vm describe tpu1 --zone=us-central1-a >/dev/null 2>&1; do echo "$(date): TPU not ready yet, retrying in 15s..."; sleep 15; done && echo "$(date): TPU is ready, connecting..." && gcloud compute tpus tpu-vm ssh tpu2 --zone=us-central1-a
+
+until gcloud compute tpus tpu-vm describe tpu2 --zone=europe-west4-a >/dev/null 2>&1; do echo "$(date): TPU not ready yet, retrying in 15s..."; sleep 15; done && echo "$(date): TPU is ready, connecting..." && gcloud compute tpus tpu-vm ssh tpu2 --zone=europe-west4-a
 ```
 
 ```
@@ -21,7 +54,6 @@ chmod 600 ~/.ssh/id_ed25519
 chmod 644 ~/.ssh/id_ed25519.pub
 ssh -o StrictHostKeyChecking=accept-new -T git@github.com
 
-gcloud compute tpus tpu-vm ssh tpu1 --zone=europe-west4-b
 git clone (https://github.com/radenmuaz/kvmem)
 cd kvmem
 # work
