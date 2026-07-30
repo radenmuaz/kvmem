@@ -401,29 +401,75 @@ followed, same pattern as bug 5's own investigation:
   **loss finite throughout** (5.56-5.59, zero NaN). The identical architecture, identical `L`,
   identical RoPE math trains cleanly off-XLA.
 
-**Net conclusion**: this is real, reproducible, and isolated to XLA's COMPILED graph specifically
-— not RoPE's math (fine in isolation on-device AND in the full CPU pipeline), not YaRN, not
-checkpointing, not batch size, not raw position magnitude. Something about how XLA fuses/schedules
-the full multi-layer RoPE+attention+backward graph together at this `L` produces non-finite
-values that don't appear when the same operations run eagerly (CPU) or in isolation (on-device
-component test). This is a different flavor of "XLA does something CPU/component-testing can't
-catch" than bug 5 (which was v5e-hardware-specific and disappeared on a different chip) — this
-one persists on the SAME chip (`tpu2`/v6e) that bug 5's own config trained cleanly on, so it is
-specifically about `rope=True` at long `L` in the compiled graph, not chip generation. **Still
-OPEN** — not yet isolated further (candidates not yet tested: Q/K magnitude immediately after
-rotation, pre-softmax attention scores, bisecting `L` between the clean sanity scale ~170 and the
-failing Run A scale ~1232 to find a threshold). **Given this, `hmn_tpu_recall1024_flat.py`
-(`rope=False`, the ORIGINAL Run A config) is the safer path for actually getting a training run
-going** — it has no known issue at its own scale, whereas every `rope=True` variant at this scale
-has failed. `hmn_tpu_recall1024_flat_rope.py`/`_noyarn.py`/`_noyarn_nockpt.py` (all three) are
-left in the repo as the ablation record, not as runnable configs until this is resolved.
+**Net conclusion (2026-07-30, at the time)**: real, reproducible, isolated to XLA's COMPILED
+graph specifically — not RoPE's math (fine in isolation on-device AND in the full CPU pipeline),
+not YaRN, not checkpointing, not batch size, not raw position magnitude. This was a different
+flavor of "XLA does something CPU/component-testing can't catch" than bug 5 — it persisted on the
+SAME chip (`tpu2`/v6e) that bug 5's own config trained cleanly on, so it was specifically about
+`rope=True` at long `L` in torch_xla's compiled graph, not chip generation.
 
-**Separately, still queued**: (1) `hmn_tpu_sanity_w25_fp32.py` — does fp32 also change NoPE's own
-convergence trajectory (the bf16 NoPE run's match wobble), unrelated to the RoPE-at-scale issue
-above. (2) `hmn_tpu_sanity_w25_vocab4.py` — the `state_vocab_size` 1→4 ablation. (3) Re-verify
-`hmn_tpu_recall1024_flat.py`'s own `max_shape_buckets=4`/`attn_sq_budget=31_000_000` OOM fix via
-gate 5 — found necessary but never re-run to confirm it actually resolves the OOM at NoPE's own
-(untested-since-the-fix) scale.
+**Bug 7 RESOLVED — by switching frameworks, not by finding the torch_xla root cause.** Given how
+long bug 5 and bug 7 both took to (partially) pin down on torch_xla, the next move was testing
+whether `kvmem/hmn_jax.py` — independent XLA lowering, no torch_xla bridge layer — sidesteps this
+family of bug entirely, rather than continuing to dig into torch_xla's compiler internals.
+Sequence: (1) `hmn_tpu_sanity_w25_rope.py` run via `kvmem.hmn_jax` (plain fp32, no bf16 autocast
+in this port at all) trained cleanly at sanity scale — expected, since bug 6 was already known to
+be a bf16-specific issue. (2) The real test — `hmn_tpu_recall1024_flat_rope.py` (Run A's own
+scale, `L=1232-2128`, the exact config that reliably NaN'd on torch_xla regardless of every lever
+pulled) run via `kvmem.hmn_jax` (after fixing a real bug in `train_jax` itself: it hardcoded
+`n_chunks=1` in its `make_batch_tagged` call, silently correct for every `_w25*`-style config
+tested so far but wrong for Run A's `n_chunks=16` — fixed by threading `_build_trajectory`'s own
+computed `len(pos_content['enc_blocks'])` through as `traj['n_chunks']`) — **hit an HBM OOM
+first** (`Used 52.64G of 31.25G hbm`, since `hmn_jax.py` had no `grad_checkpoint`/bucketing yet at
+that point, so it inherited Run A's `B=64` un-checkpointed), **then, at `B=4`, completed all 20
+steps with FINITE loss throughout** (5.5752→5.5533, `[stage 0] done.`). **This is the decisive
+result**: the identical `rope=True` config at the identical scale that reliably NaN'd on
+torch_xla — including every yarn/checkpoint/precision variant tried — trains cleanly on JAX.
+`kvmem/hmn_jax.py` is therefore the working path for `rope=True` at Run A's scale; torch_xla's
+own root cause for bug 7 remains formally unexplained (not worth continuing to chase now that a
+working alternative exists), but is functionally closed for this project's purposes.
+
+**`kvmem/hmn_jax.py` brought to full feature parity with `kvmem.hmn`'s own `train()`, within this
+file's existing scope (single non-refine Q per entry), same day** — previously loss-only:
+- **`nnx.jit`-compiled training step** — one compiled step function per trajectory (built once,
+  cached on `traj['step_fn']`, `w0`/`c1` closed over as Python constants so the loss slice uses
+  plain indexing rather than `jax.lax.dynamic_slice`) — **~60x speedup** at sanity scale (1.4 → 85
+  steps/sec) once the per-shape compile cache warms up; loss values track the pre-jit run almost
+  exactly (5.5587→5.2666 vs 5.5585→5.2662 at the same steps), confirming jit changed only speed.
+- **KV-cache** (`HMNModel.__call__`'s `past_kv`/`return_kv`/`offset` now mirrors `kvmem.hmn.
+  HMNModel.forward`'s signature exactly) and **`remat`** (`nnx.remat`, JAX's gradient-checkpoint
+  transform, the counterpart to `grad_checkpoint='block'`) — both added to `MHAttention`/
+  `SingleAttnBlock`/`HMNModel`. One real bug caught immediately: `nnx.remat` traces ALL positional
+  args as dynamic by default, but `offset` feeds `jnp.arange(offset, ...)` inside `apply_rope`
+  (needs a concrete Python int) and `return_kv` gates a Python-level `if` — both need `static_
+  argnums`; without it, `ConcretizationTypeError` on the very first backward pass. Fixed via
+  `nnx.remat(_block_call, static_argnums=(4, 5))`. Verified on CPU: forward+backward through
+  `remat` gives finite loss and finite grads; KV-cache first-call + incremental-call (with a
+  `null_kv`-padded mask) both verified correct.
+- **`ar_decode_traj_nokv`/`ar_decode_traj_kv`** — ported eval, restricted (like the rest of this
+  file) to the single-non-refine-Q case. `_nokv` is the direct port of `kvmem.hmn.ar_decode_traj_
+  nokv` (full recompute per generated byte, matches what `train()` itself uses for its own
+  `val/weave/*` numbers — deliberately NOT jitted, since the growing-sequence-length loop would
+  retrace every token). `_kv` is NEW (not a port — `kvmem.hmn`'s own KV-cached decoders target
+  other position layouts, not `chunk_positions_traj`): encodes the fixed prefix once via
+  `return_kv=True`, then grows the cache one token at a time — mathematically identical greedy-
+  argmax result to `_nokv`, much faster for long generations. `train_jax`'s own periodic eval uses
+  `_kv`.
+- **`make_test_sequences`** (copied verbatim) and **`save_checkpoint`/`load_checkpoint`**
+  (pickle + numpy, not `torch.save`/orbax — no new dependency, and the two frameworks' checkpoints
+  were never going to be interchangeable regardless of format) round out the `stage{i}_last/
+  best/end.pt` pattern and `val/weave/*` + `MEAN` + `by_chunk_len` logging, matching `train()`'s
+  own format line-for-line.
+- **Verified end-to-end on both CPU and real TPU hardware (`tpu2`)**: training (jit+remat) + eval
+  (KV-cached decode, real match% output) + checkpoint save, all in one run, no errors, checkpoint
+  files confirmed written and independently reloadable.
+
+**Given this, `kvmem/hmn_jax.py` is now the recommended path for any `rope=True` work at Run A's
+scale** — `hmn_tpu_recall1024_flat.py`'s original `rope=False` torch_xla config remains a valid,
+still-untested-post-OOM-fix fallback (`max_shape_buckets=4`/`attn_sq_budget=31_000_000`, found
+necessary via a real `RESOURCE_EXHAUSTED` at `Lb=1744/B=32`, never re-verified since), but is no
+longer the only option. `hmn_tpu_recall1024_flat_rope.py`/`_noyarn.py`/`_noyarn_nockpt.py`
+(the torch_xla ablation trio) stay in the repo as the investigation record.
 
 ---
 
