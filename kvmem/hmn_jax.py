@@ -66,14 +66,29 @@ experimental upstream — force CPU):
 import argparse
 import importlib.util
 import inspect
+import json
 import math
+import os
 import time
+
+from tqdm import tqdm
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
+
+# Persistent XLA compilation cache — compiled executables for a given (shape,
+# architecture) survive across process restarts (e.g. a killed/relaunched
+# training run hitting the same bucket shapes again), instead of recompiling
+# from scratch every time. Directory is overridable via JAX_CACHE_DIR (e.g.
+# to point at a persistent disk on a TPU VM); defaults to /tmp so it's a free
+# win even with zero configuration. Safe to enable unconditionally — a cache
+# miss just falls back to a normal compile.
+jax.config.update('jax_compilation_cache_dir', os.environ.get('JAX_CACHE_DIR', '/tmp/jax_cache'))
+jax.config.update('jax_persistent_cache_min_compile_time_secs', 1)
+jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
 
 # =============================================================================
 # Vocab constants — copied verbatim from kvmem.hmn (kvmem/hmn.py:161-185)
@@ -661,6 +676,60 @@ def _block_call(block, x, mask, past_kv, return_kv, offset):
 _block_call_remat = nnx.remat(_block_call, static_argnums=(4, 5))
 
 
+def _group_call(blocks: list, x: jnp.ndarray, mask: jnp.ndarray, offset: int) -> jnp.ndarray:
+    """Runs a GROUP of consecutive blocks in sequence, no KV-cache/return_kv
+    — used only from `HMNModel.__call__`'s `use_ckpt` path, which is already
+    gated to `past_kv is None and not return_kv` (checkpointing is only ever
+    active during a fresh training forward, never during eval/decode), so
+    this helper doesn't need to carry either through the group."""
+    for block in blocks:
+        x = block(x, mask, offset=offset)
+    return x
+
+
+# static_argnums=(3,): `offset` is a Python int (always 0 for the depth-axis
+# checkpointing path — every group shares the SAME sequence positions,
+# unlike the time-axis segmented forward's per-group offset), same
+# static-vs-traced requirement as `_block_call_remat`. `blocks` (arg 0) is a
+# plain Python list of `SingleAttnBlock` nnx.Module objects — a valid nnx
+# graph/pytree, same category as `_block_call_remat`'s own single-`block`
+# arg 0, just a list instead of one module.
+_group_call_remat = nnx.remat(_group_call, static_argnums=(3,))
+
+
+def _grad_checkpoint_groups(grad_checkpoint, n_layers: int) -> list[tuple[int, int]] | None:
+    """Parses `grad_checkpoint` into a list of (start,end) index ranges over
+    the `n_layers` blocks — depth-axis counterpart to `forward_granularity`'s
+    own int/float duality (see `_make_train_step_segmented`'s docstring for
+    the time-axis version this mirrors). `False`/`None`/`0` -> no
+    checkpointing (returns `None`). `True`/`'block'` -> one group per layer
+    (group_size=1 — the project's original per-layer remat, kept as the
+    default so every existing config's behavior is UNCHANGED: verified
+    bit-exact against the pre-granularity per-block loop, see CLAUDE.md).
+    An int >=1 -> exact group size (layers per checkpoint unit). A float in
+    (0,1] -> fraction of `n_layers` per group, so it scales with model depth
+    instead of needing per-config retuning — `1.0` groups the WHOLE stack
+    into one checkpoint unit (still saves memory relative to no
+    checkpointing at all, since only that one group's OWN input is
+    retained rather than every intermediate layer's activations — just with
+    the fewest, largest remat call-sites, i.e. least per-call overhead but
+    the largest single recompute+peak-memory footprint; smaller fractions
+    trade the other way, more call-sites, smaller peaks, approaching the
+    per-layer extreme as they shrink toward `1/n_layers`)."""
+    if not grad_checkpoint:
+        return None
+    if grad_checkpoint is True or grad_checkpoint == 'block':
+        group_size = 1
+    elif isinstance(grad_checkpoint, float):
+        assert 0 < grad_checkpoint <= 1.0, 'fractional grad_checkpoint granularity must be in (0, 1]'
+        group_size = max(1, round(grad_checkpoint * n_layers))
+    else:
+        assert isinstance(grad_checkpoint, int) and grad_checkpoint >= 1, \
+            f'grad_checkpoint must be False/True/"block"/an int>=1/a float in (0,1], got {grad_checkpoint!r}'
+        group_size = int(grad_checkpoint)
+    return [(i, min(i + group_size, n_layers)) for i in range(0, n_layers, group_size)]
+
+
 # =============================================================================
 # HMNModel — restricted to block_type='single_attn' (see module docstring)
 # =============================================================================
@@ -699,6 +768,9 @@ class HMNModel(nnx.Module):
         # than hard-requiring the newer flax API.
         self.blocks = nnx.List(blocks) if hasattr(nnx, 'List') else blocks
         self.grad_checkpoint = grad_checkpoint
+        # Static (plain Python, not traced) — computed once here rather than
+        # per forward call. None when grad_checkpoint is falsy.
+        self._ckpt_groups = _grad_checkpoint_groups(grad_checkpoint, n_layers)
 
     def _embed(self, tokens: jnp.ndarray) -> jnp.ndarray:
         """Route tokens to data_embed (0-255) or special_embed (256+) — matches
@@ -737,15 +809,18 @@ class HMNModel(nnx.Module):
         # already a no-op overhead-wise; the `past_kv is None and not return_kv` gate
         # alone is sufficient here.
         use_ckpt = self.grad_checkpoint and past_kv is None and not return_kv
-        fn = _block_call_remat if use_ckpt else _block_call
-        for i, block in enumerate(self.blocks):
-            pkv = past_kv[i] if past_kv is not None else None
-            result = fn(block, x, mask, pkv, return_kv, offset)
-            if return_kv:
-                x, kv_i = result
-                kv_out.append(kv_i)
-            else:
-                x = result
+        if use_ckpt:
+            for start, end in self._ckpt_groups:
+                x = _group_call_remat(list(self.blocks[start:end]), x, mask, offset)
+        else:
+            for i, block in enumerate(self.blocks):
+                pkv = past_kv[i] if past_kv is not None else None
+                result = _block_call(block, x, mask, pkv, return_kv, offset)
+                if return_kv:
+                    x, kv_i = result
+                    kv_out.append(kv_i)
+                else:
+                    x = result
         h_out = self.norm_out(x)
         logits = self.W_out(h_out)
         if return_kv:
@@ -769,8 +844,13 @@ def build_model(hp: dict, rngs: nnx.Rngs) -> HMNModel:
         null_kv=hp.get('null_kv', False), rmsnorm=hp.get('rmsnorm', False),
         # kvmem.hmn's grad_checkpoint is bool|str|None ('block'/'attn' select a
         # PyTorch-specific granularity that doesn't apply here — single_attn only
-        # has one thing to checkpoint per layer). Any truthy value enables remat.
-        grad_checkpoint=bool(hp.get('grad_checkpoint', False)),
+        # has one thing to checkpoint per layer). Passed through UNCHANGED (not
+        # bool()-collapsed — a real bug caught directly: bool(2)/bool(0.25)/
+        # bool('block') are all True, which silently forced every numeric/string
+        # granularity down to the coarsest per-layer grouping regardless of what
+        # was actually requested) so HMNModel's own int/float granularity parsing
+        # (`_grad_checkpoint_groups`) sees the real value.
+        grad_checkpoint=hp.get('grad_checkpoint', False),
         V_out=hp.get('V_out', 256), rngs=rngs,
     )
 
@@ -798,6 +878,132 @@ def _build_trajectory(hp: dict, entry: dict, stage_chunk_len: int) -> dict:
                L=built['L'], chunk_len=chunk_len, weight=entry['weight'],
                w0=rb['w0'], c1=rb['c1'], dsl=entry['dsl'],
                n_chunks=len(pos_content['enc_blocks']))
+
+
+# ---------------------------------------------------------------------------
+# Length bucketing (TPU/XLA support) — copied verbatim from kvmem.hmn's own
+# _bucket_ceilings/_assign_bucket/_pad_mask_to/_pad_tok_to/_pow2_floor (pure
+# NumPy/Python, no torch involved, matching this file's copy-don't-import
+# convention). See kvmem.hmn's own docstring for the full rationale: XLA
+# compiles one graph per distinct input shape, so a weave_mix with many
+# distinct L values triggers a recompile storm; bucketing groups the
+# distinct L values into <= max_buckets ceilings (drawn from the observed
+# lengths themselves, not rounded to a power of 2) and pads each trajectory
+# up to its assigned ceiling once, at stage setup. Opt-in via
+# hp['bucket_lengths'] (default False) — existing configs unaffected.
+#
+# Tuning `token_budget`/`attn_sq_budget` against real HBM — worked example
+# (v6e/Trillium, 31.25 GiB usable per chip, confirmed via `tpu-info`):
+#
+#   b_cap = min(B, pow2_floor(token_budget / Lb), pow2_floor(attn_sq_budget / Lb**2))
+#
+# `token_budget` caps the LINEAR-in-L cost (embeddings, FFN, residual-stream
+# activations — everything that's O(B*L)); `attn_sq_budget` caps the
+# QUADRATIC-in-L cost (the (B,H,L,L) attention-score matrix — the term that
+# actually dominates at long L). Two separate budgets because a single one
+# calibrated for short L is wastefully small at long L, and vice versa.
+#
+# ONE real calibration point (2026-07-31, `hmn_tpu_recall1024_flat_rope_jax.py`
+# — d=128/n_layers=16/n_heads=8, ~1.12M params, grad_checkpoint='block',
+# no_autocast=True/fp32): B=64, Lb=2128 measured 29.51/31.25 GiB HBM via
+# `tpu-info` (steady state, post-compile). That's B*Lb=136,192 (token term)
+# and B*Lb**2=289,816,576 (attn term) mapping to ~29.5 GiB TOTAL usage — this
+# figure includes params/optimizer state/embeddings too, not purely the
+# attention matrix, so it is NOT a clean per-unit conversion factor to reuse
+# for a different architecture; it's a single-point anchor for THIS one.
+# `hmn_tpu_recall1024_flat_rope_jax.py` sets token_budget=200_000 (>136,192)
+# and attn_sq_budget=320_000_000 (>289,816,576) — both intentionally ABOVE
+# the calibration point, specifically so no bucket at or below Lb=2128 gets
+# capped below the already-verified-safe B=64 (the ~1.7 GiB gap to the 31.25
+# GiB ceiling is deliberate headroom, not something these budgets are meant
+# to fully consume — eval/checkpoint-save briefly need extra memory too).
+# To push B higher than what's already verified (not done in this session —
+# would need its own real HBM check before trusting it): raise attn_sq_budget
+# toward `B_target * Lb**2`, e.g. B=96 at Lb=2128 needs attn_sq_budget >=
+# 96*2128**2 ≈ 434.7M — then RE-VERIFY via `tpu-info`, don't just trust the
+# arithmetic, since the ~29.5 GiB figure already includes unknown fixed
+# overhead this formula doesn't separate out.
+# ---------------------------------------------------------------------------
+
+def _bucket_ceilings(lengths: list[int], weights: list[float], max_buckets: int) -> list[int]:
+    """Partitions the sorted distinct `lengths` into <= `max_buckets` contiguous
+    groups, minimizing sum over groups of `ceiling^2 * group_weight` (squared,
+    since attention cost scales with L^2) — a weighted k-segment DP. Returns
+    the sorted list of chosen ceilings (each an actual value from `lengths`)."""
+    from collections import defaultdict
+    import itertools
+    agg: dict[int, float] = defaultdict(float)
+    for L, w in zip(lengths, weights):
+        agg[L] += w
+    Ls = sorted(agg)
+    n = len(Ls)
+    if n <= max_buckets:
+        return Ls
+    W = [agg[L] for L in Ls]
+    prefix = [0.0] + list(itertools.accumulate(W))
+
+    def _cost(i: int, j: int) -> float:
+        return float(Ls[j]) ** 2 * (prefix[j + 1] - prefix[i])
+
+    INF = float('inf')
+    dp = [[INF] * (n + 1) for _ in range(max_buckets + 1)]
+    choice: list[list[int | None]] = [[None] * (n + 1) for _ in range(max_buckets + 1)]
+    dp[0][0] = 0.0
+    for k in range(1, max_buckets + 1):
+        for i in range(1, n + 1):
+            for j in range(i):
+                c = dp[k - 1][j] + _cost(j, i - 1)
+                if c < dp[k][i]:
+                    dp[k][i] = c
+                    choice[k][i] = j
+    best_k = min(range(1, max_buckets + 1), key=lambda k: dp[k][n])
+    ceilings = []
+    i, k = n, best_k
+    while i > 0:
+        j = choice[k][i]
+        assert j is not None
+        ceilings.append(Ls[i - 1])
+        i, k = j, k - 1
+    ceilings.reverse()
+    return ceilings
+
+
+def _assign_bucket(L: int, ceilings: list[int]) -> int:
+    """Smallest ceiling >= L (`ceilings` must be sorted and cover every L used)."""
+    import bisect
+    idx = bisect.bisect_left(ceilings, L)
+    assert idx < len(ceilings), f'L={L} exceeds every bucket ceiling {ceilings}'
+    return ceilings[idx]
+
+
+def _pad_mask_to(mask_np: np.ndarray, Lb: int) -> np.ndarray:
+    """Pads an [L,L] additive attention-bias mask to [Lb,Lb]. Every new column/
+    row is fully blocked (-1e9); safe against NaN softmax rows because
+    `null_kv=True` is mandatory in this project."""
+    L = mask_np.shape[0]
+    assert mask_np.shape == (L, L) and Lb >= L
+    if Lb == L:
+        return mask_np
+    out = np.full((Lb, Lb), -1e9, dtype=mask_np.dtype)
+    out[:L, :L] = mask_np
+    return out
+
+
+def _pad_tok_to(tok_np: np.ndarray, Lb: int) -> np.ndarray:
+    """Pads a [B,L] token batch to [B,Lb] with zeros. Safe because the loss
+    (see `_make_train_step_bucket`) is masked to the real [w0,c1) region."""
+    B, L = tok_np.shape
+    assert Lb >= L
+    if Lb == L:
+        return tok_np
+    out = np.zeros((B, Lb), dtype=tok_np.dtype)
+    out[:, :L] = tok_np
+    return out
+
+
+def _pow2_floor(x: float) -> int:
+    x = max(1, int(x))
+    return 1 << (x.bit_length() - 1)
 
 
 def _make_schedule(hp: dict, total_steps: int):
@@ -995,6 +1201,162 @@ def load_checkpoint(path: str, model) -> dict:
     return payload
 
 
+# ---------------------------------------------------------------------------
+# Segmented forward (`forward_granularity`/`segment_checkpoint`) — JAX port
+# AND re-derivation, not a straight port. kvmem.hmn's own `_iter_forward_
+# segments` is currently unconditionally `NotImplementedError`-guarded (see
+# its docstring): the old segment-boundary logic assumed STATE sits BEFORE
+# warmup/response, which broke under the current end-of-turn-STATE design
+# for ANY rec_block with a trailing STATE commit (`sl0 is not None` — the
+# non-terminal/relay case). This file's own scope (`_build_trajectory`'s own
+# assertion: exactly one 'initial', non-refine, TERMINAL rec_block) never
+# has that case — a terminal query's `sl0` is always `None` (nothing relays
+# from it, so no post-response STATE commit is ever built) — which is
+# EXACTLY the case kvmem.hmn's bug does NOT cover (verified directly below:
+# `rb['sl0'] is None`, `rb['w0']` sits immediately after the last encode
+# block's `sl1`, `rb['c1'] == L`). So the re-derivation here is narrower
+# than a general fix would be, but is independently correct for what this
+# file supports — segmenting is applied ONLY to the encode portion [0, w0);
+# the query itself always gets its own dedicated final forward pass (see
+# `_make_train_step_segmented`), never split further.
+# ---------------------------------------------------------------------------
+
+def _iter_forward_segments_jax(pos_content: dict) -> list[tuple[int, int]]:
+    """Returns the ordered, contiguous (seg_start, seg_end) list spanning
+    ONLY the encode portion of the packed sequence (one entry per encoding
+    block: `<chunk bytes>` through the end of that chunk's own STATE) —
+    verified contiguous by construction (`chunk_positions_traj` builds every
+    block from one monotonically increasing `offset`) and verified directly
+    (by running `_build_trajectory` against `hmn_tpu_recall1024_flat_rope.py`)
+    that `enc_blocks[-1]['sl1'] == rec_blocks[0]['w0']` and
+    `rec_blocks[0]['c1'] == L` — i.e. the encode portion and the query
+    portion partition the WHOLE sequence with no gap either side."""
+    enc_blocks = pos_content['enc_blocks']
+    rec_blocks = pos_content['rec_blocks']
+    assert len(rec_blocks) == 1 and rec_blocks[0]['type'] == 'initial' and rec_blocks[0]['sl0'] is None, (
+        '_iter_forward_segments_jax only supports one terminal non-refine Q '
+        '(matches _build_trajectory\'s own assertion) — kvmem.hmn\'s broken '
+        'general case (a rec_block with its own trailing STATE commit) is '
+        'out of scope here, not silently mishandled')
+    segs = []
+    prev_end = 0
+    for b in enc_blocks:
+        assert b['s0'] == prev_end, f"segment gap: expected {prev_end}, got {b['s0']}"
+        segs.append((b['s0'], b['sl1']))
+        prev_end = b['sl1']
+    rb = rec_blocks[0]
+    assert rb['w0'] == prev_end, f"segment gap before query: expected {prev_end}, got {rb['w0']}"
+    return segs
+
+
+def _make_train_step_segmented(w0: int, end: int, enc_segs: list[tuple[int, int]],
+                               granularity: float | int, segment_checkpoint: bool,
+                               update_takes_model: bool):
+    """Segmented counterpart to `_make_train_step`/`_make_train_step_bucket`
+    — walks the encode portion (`enc_segs`, from `_iter_forward_segments_jax`)
+    in GROUPS instead of one dense `model(tokens, mask)` call, carrying a KV
+    cache between groups (`past_kv`/`return_kv`/`offset`, the same primitives
+    `ar_decode_traj_kv` already uses for eval decode — this is that same
+    "process a NEW slice given an existing cache" operation, just with
+    `new_len` possibly >1 instead of always 1). `granularity`: an int >=1 is
+    an exact segment count per group; a float in (0,1] is a FRACTION of
+    `len(enc_segs)` per group (scales with sequence length instead of
+    needing per-config retuning). The query segment [w0,end) always gets its
+    OWN dedicated final forward pass — never merged into an encode group —
+    so this file's scope (see `_iter_forward_segments_jax`) never needs the
+    general per-rec_block accumulation kvmem.hmn's own `_forward_segmented`
+    does.
+
+    Loss reconstruction detail (the one non-obvious part): the loss slice
+    needs logits at GLOBAL index w0-1 (predicts token w0, the first byte of
+    the [w0,end) target region) THROUGH end-2. Index w0-1 is the LAST local
+    position of the FINAL encode group's own output (it's the last token of
+    the encode portion) — everything else (w0..end-2) comes from the query
+    group's own output (local indices 0..end-w0-2, i.e. all but its own
+    last position). These two slices are concatenated before the softmax/
+    NLL, reproducing exactly what a single dense `model(tokens[:,:end],
+    mask[:end,:end])` call's `logits[:, w0-1:end-1]` would have given —
+    verified numerically against the dense path in this session (see
+    `verify_segmented_matches_dense` / CLAUDE.md's segmented-forward entry).
+
+    `segment_checkpoint`: wraps EVERY group's own `model(...)` call
+    (encode groups AND the final query call, uniformly) in `nnx.remat` —
+    the JAX counterpart to kvmem.hmn's `segment_checkpoint` (`torch.utils.
+    checkpoint` there). Recomputes each group's forward during backward
+    instead of retaining its activations — the actual memory win this
+    feature exists for, same tradeoff (~2x forward compute for whichever
+    groups need a backward pass) as kvmem.hmn's own docstring describes."""
+    if isinstance(granularity, float):
+        assert 0 < granularity <= 1.0, 'fractional granularity must be in (0, 1]'
+        group_size = max(1, round(granularity * len(enc_segs)))
+    else:
+        assert granularity >= 1
+        group_size = int(granularity)
+    groups = [enc_segs[i:i + group_size] for i in range(0, len(enc_segs), group_size)]
+
+    def _group_fwd(model, tok_slice, seg_mask, kv_cache, offset_val):
+        return model(tok_slice, seg_mask, past_kv=kv_cache, return_kv=True, offset=offset_val)
+
+    # static_argnums=(4,): `offset_val` is a Python int closed over per call
+    # site (from `groups`/`w0`, structural — never traced data), same
+    # requirement `_block_call_remat` already has for its own `offset` arg.
+    fwd = nnx.remat(_group_fwd, static_argnums=(4,)) if segment_checkpoint else _group_fwd
+
+    @nnx.jit
+    def step(model, optimizer, tokens, mask, loss_mask):
+        def loss_fn(model):
+            kv_cache = None
+            last_enc_logit = None
+            for group in groups:
+                s0, s1 = group[0][0], group[-1][1]
+                tok_slice = tokens[:, s0:s1]
+                seg_mask = mask[s0:s1, :s1]
+                logits_grp, kv_seg = fwd(model, tok_slice, seg_mask, kv_cache, s0)
+                if kv_cache is None:
+                    kv_cache = kv_seg
+                else:
+                    kv_cache = tuple((jnp.concatenate([ka, kb], axis=2), jnp.concatenate([va, vb], axis=2))
+                                     for (ka, va), (kb, vb) in zip(kv_cache, kv_seg))
+                last_enc_logit = logits_grp[:, -1:, :]
+
+            q_tok = tokens[:, w0:end]
+            q_mask = mask[w0:end, :end]
+            logits_q, _ = fwd(model, q_tok, q_mask, kv_cache, w0)
+
+            lp_all = jnp.concatenate([last_enc_logit, logits_q[:, :-1, :]], axis=1)
+            lp = jax.nn.log_softmax(lp_all, axis=-1)
+            tgt = tokens[:, w0:end]
+            nll = -jnp.take_along_axis(lp, tgt[..., None], axis=-1).squeeze(-1)
+            m = loss_mask[w0:end]
+            denom = jnp.sum(m) * tokens.shape[0]
+            return jnp.sum(nll * m[None, :]) / jnp.maximum(denom, 1.0)
+        loss, grads = nnx.value_and_grad(loss_fn)(model)
+        if update_takes_model:
+            optimizer.update(model, grads)
+        else:
+            optimizer.update(grads)
+        return loss
+    return step
+
+
+class _StatusWriter:
+    """Truncate-and-rewrite file for tqdm — stays 1-2 lines, tail -f works.
+    Copied from kvmem.hmn's own _StatusWriter (kept file-local, matching this
+    file's no-cross-import design)."""
+    def __init__(self, path: str):
+        self._f = open(path, 'w', buffering=1)
+
+    def write(self, s: str):
+        self._f.seek(0)
+        self._f.truncate()
+        self._f.write(s)
+        self._f.flush()
+
+    def flush(self): pass
+
+    def close(self): self._f.close()
+
+
 def train_jax(hp: dict, log_base: str = 'logs'):
     """Training loop with feature parity to kvmem.hmn's own `train()` for the
     scope this file targets (single non-refine Q per weave_mix entry — see
@@ -1009,7 +1371,6 @@ def train_jax(hp: dict, log_base: str = 'logs'):
     `stage{i}_best.pt`; `stage{i}_end.pt` at stage end. `early_stop_mean`
     (per-stage key, like the PyTorch version) breaks out of the stage early
     once val MEAN reaches it."""
-    import os
     rng = np.random.default_rng(hp.get('seed', 42))
     rngs = nnx.Rngs(hp.get('seed', 42))
     model = build_model(hp, rngs)
@@ -1019,12 +1380,16 @@ def train_jax(hp: dict, log_base: str = 'logs'):
     log_dir = os.path.join(log_base, name)
     ckpt_dir = os.path.join(log_dir, 'checkpoints')
     os.makedirs(ckpt_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, 'train_jax.log')
-    log_file = open(log_path, 'a', buffering=1)
+    log_file    = open(os.path.join(log_dir, 'train.log'),    'a', buffering=1)
+    jsonl_file  = open(os.path.join(log_dir, 'train.jsonl'), 'a', buffering=1)
+    status_file = _StatusWriter(os.path.join(log_dir, 'train_status.log'))
 
     def _log(msg):
         print(msg)
         print(msg, file=log_file)
+
+    def _jlog(d):
+        jsonl_file.write(json.dumps(d) + '\n')
 
     _log(f'JAX/Flax NNX model: {n_params:,} params  backend={jax.default_backend()}')
     val_n_seqs = hp.get('val_n_seqs')
@@ -1055,17 +1420,105 @@ def train_jax(hp: dict, log_base: str = 'logs'):
             return loss
         return step
 
+    def _make_train_step_bucket(w0: int, Lb: int, update_takes_model: bool):
+        """Bucketed counterpart to `_make_train_step` — ONE jit-compiled step
+        function SHARED across every trajectory assigned to bucket ceiling
+        `Lb` (as opposed to one per trajectory). `w0`/`Lb` are still closed
+        over as Python constants (static shape, one compile per distinct Lb),
+        but different trajectories sharing this bucket have different real
+        `c1` (out_len varies with anchor) — so unlike `_make_train_step`, the
+        loss can't be a fixed-size Python slice ending at a per-trajectory
+        `c1`. Instead it's computed over the full static range [w0, Lb) and
+        weighted by a per-trajectory `loss_mask` (traced array input, 1.0 for
+        w0<=pos<c1 else 0.0) passed in at call time — this is what lets one
+        compiled program serve every trajectory in the bucket without
+        retracing. Requires all bucketed trajectories to share the same w0
+        (true for this file's single-query suffix-recall shape, where w0 is
+        fixed by n_chunks/chunk_len/state_len alone — asserted at setup)."""
+        @nnx.jit
+        def step(model, optimizer, tokens, mask, loss_mask):
+            def loss_fn(model):
+                logits = model(tokens, mask)
+                lp = jax.nn.log_softmax(logits[:, w0 - 1:Lb - 1], axis=-1)
+                tgt = tokens[:, w0:Lb]
+                nll = -jnp.take_along_axis(lp, tgt[..., None], axis=-1).squeeze(-1)
+                m = loss_mask[w0:Lb]
+                denom = jnp.sum(m) * tokens.shape[0]
+                return jnp.sum(nll * m[None, :]) / jnp.maximum(denom, 1.0)
+            loss, grads = nnx.value_and_grad(loss_fn)(model)
+            if update_takes_model:
+                optimizer.update(model, grads)
+            else:
+                optimizer.update(grads)
+            return loss
+        return step
+
     global_step = 0
     for stage_i, stage in enumerate(hp['curriculum']):
         trajectories = [_build_trajectory(hp, e, stage['chunk_len']) for e in stage['weave_mix']]
         weights = np.array([t['weight'] for t in trajectories], dtype=np.float64)
         weights /= weights.sum()
+
+        # Adaptive weave_mix reweighting — JAX port of kvmem.hmn's own `train()`
+        # mechanism (merged there from the former kvmem/hmn_adaptive_trainer.py),
+        # same formula, same config keys. Off by default (`hp['adaptive']=False`)
+        # — every existing config unaffected. Without this, a mixed-difficulty
+        # weave_mix (e.g. short-and-easy + long-and-hard entries together) samples
+        # every entry at its STATIC config weight forever — no mechanism ever
+        # shifts sampling effort toward entries the model is still struggling
+        # with, or away from ones it's already solved. That's a real gap: mixing
+        # entries of varying difficulty is not the same thing as a curriculum
+        # unless something adapts to per-entry performance.
+        adaptive = hp.get('adaptive', False)
+        adapt_signal = hp.get('adapt_signal', 'val_match')
+        assert adapt_signal in ('val_match', 'train_loss')
+        adapt_temp = hp.get('adapt_temp', 1.0)
+        adapt_floor = hp.get('adapt_floor', 0.05)
+        adapt_ema_alpha = hp.get('adapt_ema_alpha', 0.5)
+        for t in trajectories:
+            t['base_weight'] = t['weight']
+            t['ema_loss'] = None
+            t['last_match'] = None
+        _eval_count = 0
+
+        def _temp_softmax_rescale(diffs):
+            """softmax(diffs/adapt_temp), rescaled so a perfectly uniform difficulty
+            maps every trajectory back to d=1.0 — direct port of kvmem.hmn's own
+            helper (pure NumPy, unchanged)."""
+            n = len(diffs)
+            scores = diffs / adapt_temp
+            scores = scores - scores.max()
+            exp_s = np.exp(scores)
+            p = exp_s / exp_s.sum()
+            return p * n
+
+        def _adapt_reweight():
+            """Recompute sampling weights from the chosen difficulty signal —
+            direct port of kvmem.hmn's own `_adapt_reweight` (identical formula):
+            harder-than-average trajectories get scaled up, easier ones scaled
+            down (never below `adapt_floor`'s relative share)."""
+            if adapt_signal == 'val_match':
+                diffs = np.array([max(100.0 - (t['last_match'] if t['last_match'] is not None else 50.0), 0.0)
+                                  for t in trajectories])
+            else:
+                known = [t['ema_loss'] for t in trajectories if t['ema_loss'] is not None]
+                fallback = (sum(known) / len(known)) if known else 1.0
+                diffs = np.array([t['ema_loss'] if t['ema_loss'] is not None else fallback
+                                  for t in trajectories])
+            diffs = diffs / max(diffs.mean(), 1e-8)
+            diffs = _temp_softmax_rescale(diffs)
+            for t, d in zip(trajectories, diffs):
+                t['weight'] = t['base_weight'] * (adapt_floor + (1 - adapt_floor) * d)
+            new_weights = np.array([t['weight'] for t in trajectories], dtype=np.float64)
+            return new_weights / new_weights.sum()
+
         B = stage['B']
         n_steps = stage['n_steps']
         log_every = hp.get('log_every', 100)
         eval_every = stage.get('eval_every', n_steps)
 
-        tx = optax.adamw(_make_schedule(hp, n_steps), weight_decay=hp.get('wd', 0.0))
+        lr_schedule = _make_schedule(hp, n_steps)
+        tx = optax.adamw(lr_schedule, weight_decay=hp.get('wd', 0.0))
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         # nnx.Optimizer.update's signature changed across flax versions: newer
         # (verified 0.12.8) takes (model, grads) positionally; older (verified
@@ -1077,29 +1530,144 @@ def train_jax(hp: dict, log_base: str = 'logs'):
         # (grads, **kwargs) is already 2 params) — check for the 'model' NAME
         # specifically. Detected once per stage (cheap) rather than per-step.
         _update_takes_model = 'model' in inspect.signature(optimizer.update).parameters
-        for traj in trajectories:
-            traj['step_fn'] = _make_train_step(traj['w0'], traj['c1'], _update_takes_model)
+
+        bucket_lengths = hp.get('bucket_lengths', False)
+        forward_granularity = hp.get('forward_granularity')
+        segment_checkpoint = hp.get('segment_checkpoint', False)
+        if forward_granularity is not None:
+            assert not bucket_lengths, (
+                'forward_granularity + bucket_lengths not supported together yet — '
+                'each trajectory uses its own exact (unpadded) L in this path')
+            for t in trajectories:
+                enc_segs = _iter_forward_segments_jax(t['pos_content'])
+                t['loss_mask'] = jnp.ones(t['L'], dtype=jnp.float32)
+                t['step_fn'] = _make_train_step_segmented(
+                    t['w0'], t['c1'], enc_segs, forward_granularity, segment_checkpoint,
+                    _update_takes_model)
+        elif bucket_lengths:
+            max_buckets = hp.get('max_shape_buckets', 8)
+            token_budget = hp.get('token_budget', 131072)
+            attn_sq_budget = hp.get('attn_sq_budget', 125_000_000)
+            ceilings = _bucket_ceilings([t['L'] for t in trajectories],
+                                       [t['weight'] for t in trajectories], max_buckets)
+            w0_ref = trajectories[0]['w0']
+            for t in trajectories:
+                assert t['w0'] == w0_ref, (
+                    f'bucket_lengths requires every entry in a stage to share w0 '
+                    f'(got {t["w0"]} vs {w0_ref} for {t["dsl"]!r}) — see '
+                    f'_make_train_step_bucket docstring')
+                Lb = _assign_bucket(t['L'], ceilings)
+                t['Lb'] = Lb
+                t['mask_bucket'] = jnp.asarray(_pad_mask_to(np.asarray(t['mask']), Lb))
+                loss_mask = np.zeros(Lb, dtype=np.float32)
+                loss_mask[t['w0']:t['c1']] = 1.0
+                t['loss_mask'] = jnp.asarray(loss_mask)
+                b_cap = B
+                b_cap = min(b_cap, _pow2_floor(token_budget / Lb))
+                b_cap = min(b_cap, _pow2_floor(attn_sq_budget / (Lb * Lb)))
+                t['B_bucket'] = max(1, b_cap)
+
+            bucket_step_fns = {Lb: _make_train_step_bucket(w0_ref, Lb, _update_takes_model)
+                               for Lb in sorted(set(t['Lb'] for t in trajectories))}
+            for t in trajectories:
+                t['step_fn'] = bucket_step_fns[t['Lb']]
+
+            by_bucket: dict[int, list] = {}
+            for t in trajectories:
+                by_bucket.setdefault(t['Lb'], []).append(t)
+            _log(f'\n[stage {stage_i}] bucket table (max_buckets={max_buckets}):')
+            for Lb in sorted(by_bucket):
+                ts = by_bucket[Lb]
+                mean_L = sum(t['L'] for t in ts) / len(ts)
+                waste = 100.0 * (1.0 - mean_L / Lb)
+                _log(f'  Lb={Lb:<6} n_entries={len(ts):<3} B={ts[0]["B_bucket"]:<4} '
+                    f'mean_real_L={mean_L:.0f}  waste={waste:.1f}%')
+        else:
+            for traj in trajectories:
+                traj['step_fn'] = _make_train_step(traj['w0'], traj['c1'], _update_takes_model)
 
         _log(f'\n[stage {stage_i}] chunk_len={stage["chunk_len"]} n_entries={len(trajectories)} '
-             f'B={B} steps={n_steps}')
+             f'B={B} steps={n_steps} bucket_lengths={bucket_lengths} '
+             f'forward_granularity={forward_granularity} segment_checkpoint={segment_checkpoint}')
 
         early_stop_mean = stage.get('early_stop_mean')
         stage_best_val = -1.0
         t_start = time.time()
-        for local_step in range(1, n_steps + 1):
+        # Tracks which underlying compiled `step_fn`s have already been called once —
+        # keyed by `id(step_fn)`, not per-trajectory, since `step_fn` is SHARED across
+        # every trajectory in a bucket (`bucket_lengths=True`) or a shared Lb group.
+        # JAX compiles lazily on first call, so timing that first call directly
+        # measures compile+execute — `float(loss)` forces the (otherwise async)
+        # dispatch to actually finish before the timer stops, or the measurement
+        # would just capture dispatch overhead, not the real compile wait.
+        _compiled_step_fn_ids: set[int] = set()
+        _total_compile_s = 0.0
+        _n_distinct_shapes = len(set(id(t['step_fn']) for t in trajectories))
+        pbar = tqdm(range(1, n_steps + 1), desc=f'stage{stage_i}', dynamic_ncols=True, file=status_file)
+        for local_step in pbar:
             global_step += 1
             traj = trajectories[rng.choice(len(trajectories), p=weights)]
-            tok_np = make_batch_tagged(rng, B, traj['n_chunks'], traj['chunk_len'], hp['state_len'],
+            B_eff = traj['B_bucket'] if bucket_lengths else B
+            tok_np = make_batch_tagged(rng, B_eff, traj['n_chunks'], traj['chunk_len'], hp['state_len'],
                                        hp['state_vocab_size'], traj['pos_content'], traj['tags'])
+            if bucket_lengths and traj['Lb'] != traj['L']:
+                tok_np = _pad_tok_to(tok_np, traj['Lb'])
             tokens = jnp.asarray(tok_np, dtype=jnp.int32)
 
-            loss = traj['step_fn'](model, optimizer, tokens, traj['mask'])
+            step_fn = traj['step_fn']
+            is_first_call = id(step_fn) not in _compiled_step_fn_ids
+            if is_first_call:
+                _compile_t0 = time.time()
+
+            if forward_granularity is not None:
+                loss = step_fn(model, optimizer, tokens, traj['mask'], traj['loss_mask'])
+            elif bucket_lengths:
+                loss = step_fn(model, optimizer, tokens, traj['mask_bucket'], traj['loss_mask'])
+            else:
+                loss = step_fn(model, optimizer, tokens, traj['mask'])
+
+            if is_first_call:
+                float(loss)  # force the async dispatch to actually finish before stopping the timer
+                compile_s = time.time() - _compile_t0
+                _total_compile_s += compile_s
+                _compiled_step_fn_ids.add(id(step_fn))
+                shape_desc = f'Lb={traj["Lb"]}' if bucket_lengths else f'L={traj["L"]}'
+                _log(f'  [compile] step_fn for {shape_desc:<12} B={B_eff:<4} '
+                    f'first-call={compile_s:.1f}s  total_compile={_total_compile_s:.1f}s '
+                    f'({len(_compiled_step_fn_ids)}/{_n_distinct_shapes} shapes compiled so far)')
+                if len(_compiled_step_fn_ids) == _n_distinct_shapes:
+                    _log(f'  [compile] ALL {_n_distinct_shapes} shapes compiled — '
+                        f'total_compile_time={_total_compile_s:.1f}s')
+
+            # Per-trajectory loss bookkeeping — tracked every step (not just for
+            # adapt_signal='train_loss') so `weights`/`traj_loss` can be logged
+            # together at every log_every boundary for later plotting (weight vs.
+            # loss trajectory per entry over training). `float(loss)` here is the
+            # same host-sync already needed by the log_every block below in the
+            # common case; the extra cost on non-log_every steps is the tradeoff
+            # for having a per-trajectory loss curve at all, not just the single
+            # sampled trajectory's own.
+            _loss_f_step = float(loss)
+            traj['last_loss'] = _loss_f_step
+            traj['ema_loss'] = _loss_f_step if traj['ema_loss'] is None else (
+                traj['ema_loss'] * adapt_ema_alpha + _loss_f_step * (1 - adapt_ema_alpha))
 
             if local_step % log_every == 0 or local_step == n_steps:
+                loss_f = _loss_f_step
+                lr = float(lr_schedule(global_step))
                 elapsed = time.time() - t_start
+                pbar.set_postfix(loss=f'{loss_f:.3f}', lr=f'{lr:.1e}', entry=traj['dsl'], refresh=False)
+                _traj_loss = [round(t['last_loss'], 4) if t.get('last_loss') is not None else None
+                             for t in trajectories]
+                _weights_list = [round(float(w), 5) for w in weights]
+                _jlog(dict(step=global_step, stage=stage_i, loss=round(loss_f, 5), lr=lr, entry=traj['dsl'],
+                          weights=_weights_list, traj_loss=_traj_loss))
+                print(str(pbar), file=log_file, flush=True)
+                _traj_loss_str = '[' + ','.join(f'{v:.2f}' if v is not None else 'NA' for v in _traj_loss) + ']'
+                _weights_str = '[' + ','.join(f'{w:.2f}' for w in _weights_list) + ']'
                 _log(f'stage{stage_i} step={local_step}/{n_steps} g={global_step} '
-                    f'loss={float(loss):.4f} {elapsed:.1f}s')
-                if not np.isfinite(float(loss)):
+                    f'loss={loss_f:.4f} {elapsed:.1f}s  weights={_weights_str}  traj_loss={_traj_loss_str}')
+                if not np.isfinite(loss_f):
                     _log(f'  !! non-finite loss on entry {traj["dsl"]!r} (L={traj["L"]})')
 
             if local_step % eval_every == 0 or local_step == n_steps:
@@ -1134,6 +1702,20 @@ def train_jax(hp: dict, log_base: str = 'logs'):
                 for cl in sorted(by_cl):
                     cl_mean = sum(by_cl[cl]) / len(by_cl[cl])
                     _log(f'  val/weave/by_chunk_len/{cl:<4}     match={cl_mean:.1f}%  (n={len(by_cl[cl])})')
+
+                _eval_count += 1
+                if adaptive:
+                    # val_match's very first reading is the noisiest possible signal
+                    # (least-trained model) — skip adapting on it, matches kvmem.hmn's
+                    # own train_loss doesn't have this problem (EMA already accumulating
+                    # every step since step 1).
+                    if adapt_signal == 'train_loss' or _eval_count >= 2:
+                        weights = _adapt_reweight()
+                        _log(f'  [stage {stage_i}] adaptive reweight applied (signal={adapt_signal}): '
+                            + ', '.join(f'{t["dsl"]}={w:.2f}' for t, w in zip(trajectories, weights)))
+                    else:
+                        _log(f'  [stage {stage_i}] adaptive=True but adapt_signal=val_match skips '
+                            f'adapting until the 2nd eval (this is eval #{_eval_count})')
 
                 save_checkpoint(os.path.join(ckpt_dir, f'stage{stage_i}_last.pt'), model, hp, global_step)
                 if vmean > stage_best_val:

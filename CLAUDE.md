@@ -165,6 +165,25 @@ ssh -o ControlPath=/tmp/tpu1_ssh/cm muaz@<external-ip> "ps aux | grep hmn"
 ```
 Verified this resolves the repeated-connection-failure pattern in practice. `ssh -O check -o
 ControlPath=... <host>` confirms the master is still alive if a later command behaves oddly.
+
+**Standing rule: after launching any TPU training job, always give both of these two commands**
+(full explicit form, substituting the real host/`ControlPath`/run name/session name — no shell
+alias, since aliases require editing files outside this repo), so the user can immediately watch
+the job either as a scrolling log or as the live terminal:
+```
+ssh -o ControlPath=/tmp/<tpuN>_ssh/cm muaz@<ip> "tail -f -n 50 ~/kvmem/logs/<run_name>/train.log"
+ssh -o ControlPath=/tmp/<tpuN>_ssh/cm muaz@<ip> -t "tmux attach -t <session_name>"
+```
+**These `-o ControlPath=...` short forms only work from wherever the multiplexed master socket
+was actually opened** (verified: when the master was opened inside this assistant's own sandboxed
+shell, the user's own terminal got `Permission denied (publickey)` trying to reuse that same
+`ControlPath` — the socket file isn't visible across that boundary). For the user's own terminal,
+give the `gcloud` form instead, which handles auth itself and needs no pre-existing socket:
+```
+gcloud compute tpus tpu-vm ssh <tpuN> --zone=<zone> --command="tail -f -n 50 ~/kvmem/logs/<run_name>/train.log"
+gcloud compute tpus tpu-vm ssh <tpuN> --zone=<zone> -- -t "tmux attach -t <session_name>"
+```
+
 **One sharp edge hit directly**: a command that kills a large, actively-compiling process on the
 remote end (e.g. `pkill -9` against the training PID) can itself return a spurious immediate
 `exit 255` on the multiplexed channel even though the master session survives and the kill
@@ -463,6 +482,19 @@ file's existing scope (single non-refine Q per entry), same day** — previously
 - **Verified end-to-end on both CPU and real TPU hardware (`tpu2`)**: training (jit+remat) + eval
   (KV-cached decode, real match% output) + checkpoint save, all in one run, no errors, checkpoint
   files confirmed written and independently reloadable.
+- **Log format brought to parity with `kvmem.hmn`'s own `train()` a second time (2026-07-31)**:
+  `train_jax()` now writes `train.log` (renamed from `train_jax.log` — matches `train()`'s own
+  filename exactly, so tooling/aliases don't need a JAX-specific path), `train.jsonl` (per-
+  `log_every`-step `{step, stage, loss, lr, entry}` record), and a live-updating
+  `train_status.log` via a copied `_StatusWriter` (truncate-and-rewrite so `tail -f` shows a
+  single live-updating tqdm line rather than growing unboundedly). Training loop now drives a
+  real `tqdm` progress bar (`file=status_file`, `dynamic_ncols=True`) instead of a bare Python
+  `range()` loop, with `pbar.set_postfix(loss=..., lr=..., entry=...)` updated every `log_every`
+  steps and `str(pbar)` appended to `train.log` — same pattern `train()` itself uses. Scope note:
+  unlike `train()`'s own jsonl (which logs one `traj_loss` value per trajectory in the mix),
+  this file's jsonl logs only the single trajectory actually sampled that step (`entry`) — no
+  per-trajectory EMA-loss bookkeeping was added, since nothing in this file's current scope reads
+  it back.
 
 **Given this, `kvmem/hmn_jax.py` is now the recommended path for any `rope=True` work at Run A's
 scale** — `hmn_tpu_recall1024_flat.py`'s original `rope=False` torch_xla config remains a valid,
@@ -470,6 +502,79 @@ still-untested-post-OOM-fix fallback (`max_shape_buckets=4`/`attn_sq_budget=31_0
 necessary via a real `RESOURCE_EXHAUSTED` at `Lb=1744/B=32`, never re-verified since), but is no
 longer the only option. `hmn_tpu_recall1024_flat_rope.py`/`_noyarn.py`/`_noyarn_nockpt.py`
 (the torch_xla ablation trio) stay in the repo as the investigation record.
+
+**`kvmem/hmn_jax.py` gained length bucketing, a persistent XLA compilation cache, and a
+re-derived segmented forward — all opt-in, none change existing configs' behavior (2026-07-31).**
+- **Length bucketing** (`hp['bucket_lengths']`) — direct port of `kvmem.hmn`'s own
+  `_bucket_ceilings`/`_assign_bucket`/`_pad_mask_to`/`_pad_tok_to`/`_pow2_floor` (pure NumPy,
+  copied verbatim). Unlike the torch version's per-trajectory-but-padded design, the JAX port
+  shares ONE `nnx.jit`-compiled step function across every trajectory in a bucket
+  (`_make_train_step_bucket`) — different trajectories sharing a bucket have different real
+  `c1` (out_len varies with anchor), so the loss can't be a fixed-size Python slice; instead
+  it's computed over the full static `[w0, Lb)` range and weighted by a per-trajectory
+  `loss_mask` (traced array, 1.0 for real `w0<=pos<c1`, else 0.0) passed in at call time. This
+  requires every trajectory in a stage to share the same `w0` — true for this file's
+  single-query suffix-recall shape (asserted at setup, verified directly against
+  `hmn_tpu_recall1024_flat_rope.py`: all 16 entries have `w0=1104`, 4 buckets from 8 distinct
+  `L` values). Reduces Run A's distinct-shape compile count from 16 to `max_shape_buckets`.
+  Per-bucket batch size is `b_cap = min(B, pow2_floor(token_budget/Lb), pow2_floor(attn_sq_
+  budget/Lb**2))` — `token_budget` caps the linear-in-L cost (embeddings/FFN/residual-stream
+  activations), `attn_sq_budget` caps the quadratic-in-L attention-score-matrix cost, the term
+  that actually dominates at long `L`. **Worked numerical example against real v6e HBM** (31.25
+  GiB usable per chip, confirmed via `tpu-info`): the shared torch config's own `attn_sq_
+  budget=31_000_000` would cap `B` down to 4 at `Lb=2128` (`pow2_floor(31_000_000/2128**2)=4`)
+  — but a real run of `hmn_tpu_recall1024_flat_rope_jax.py`'s exact architecture (`d=128/
+  n_layers=16/n_heads=8`, ~1.12M params, `grad_checkpoint='block'`, fp32) at `B=64, Lb=2128`
+  measured only 29.51/31.25 GiB HBM (steady state) — so that torch-era budget was calibrated
+  for a different (more conservative, possibly torch_xla-specific) memory profile, not what
+  JAX actually needs here. `hmn_tpu_recall1024_flat_rope_jax.py` recalibrates both:
+  `token_budget=200_000` (> `64*2128=136,192`), `attn_sq_budget=320_000_000` (> `64*2128**2=
+  289,816,576`) — both set just above the real calibration point so no bucket shrinks below the
+  already-verified-safe `B=64`, leaving the remaining ~1.7 GiB as deliberate headroom (eval/
+  checkpoint-save need extra memory too). **Caveat**: the 29.5 GiB figure includes params/
+  optimizer-state/embedding overhead, not purely the attention matrix, so it is NOT a clean
+  per-unit conversion factor to reuse for a different architecture — treat it as a single-point
+  anchor, and re-verify via `tpu-info` after raising either budget rather than trusting the
+  arithmetic alone (full worked-example docstring: `kvmem/hmn_jax.py`, right above
+  `_bucket_ceilings`).
+- **Persistent compilation cache** (`jax.config.update('jax_compilation_cache_dir', ...)`,
+  defaults to `/tmp/jax_cache`, overridable via `JAX_CACHE_DIR`) — compiled executables survive
+  process restarts, so a killed/relaunched run hitting the same bucket shapes again skips
+  recompilation entirely. `jax_persistent_cache_min_compile_time_secs=1` avoids caching trivial
+  sub-second compiles. Verified end-to-end (cache files written, ~2.2x speedup on a warm rerun
+  at toy scale — real savings will be much larger at Run A's actual per-shape compile cost).
+- **Segmented forward** (`hp['forward_granularity']`/`hp['segment_checkpoint']`) — JAX port
+  AND re-derivation, not a straight port, of `kvmem.hmn`'s own `_iter_forward_segments`/
+  `_forward_segmented` (TIME-axis gradient checkpointing across STATE-bounded segments, walking
+  the packed sequence in groups with a carried KV cache instead of one dense forward pass —
+  separate from and orthogonal to `grad_checkpoint`'s model-DEPTH checkpointing). **The torch
+  version is currently unconditionally `NotImplementedError`-guarded** — its segment-boundary
+  logic assumed the old pre-end-of-turn-STATE layout and breaks for any rec_block with its own
+  trailing STATE commit (`sl0 is not None`, the non-terminal/relay case). This file's own scope
+  (`_build_trajectory`'s assertion: exactly one terminal, non-refine 'initial' rec_block) never
+  hits that case — a terminal query's `sl0` is always `None` — so `_iter_forward_segments_jax`
+  is a narrower, independently-correct re-derivation: it segments ONLY the encode portion
+  `[0, w0)` (verified contiguous, and verified `enc_blocks[-1]['sl1'] == rec_blocks[0]['w0']`
+  and `rec_blocks[0]['c1'] == L`, i.e. no gap on either side); the query itself always gets its
+  own dedicated final forward pass, never merged into an encode group. `_make_train_step_
+  segmented` reconstructs the full loss by concatenating the LAST local position of the final
+  encode group's own output (predicts token `w0`) with all-but-the-last of the query group's own
+  output (predicts `w0+1..end-1`) — mathematically identical to what a single dense
+  `model(tokens[:,:end], mask[:end,:end])` call's `logits[:, w0-1:end-1]` slice would give, since
+  the KV-cache-carrying grouped calls are just that same dense computation split into pieces.
+  `segment_checkpoint` wraps every group's own `model(...)` call (encode groups AND the final
+  query call, uniformly) in `nnx.remat` — same `static_argnums` requirement as the existing
+  model-depth remat (`offset` must be static, a Python int closed over per call site, never
+  traced data). **Verified bit-exact against the dense path** (`loss` diff `0.00e+00` across
+  granularity `1`/`4`/`16`/`1.0` and both `segment_checkpoint` settings) and gradients match to
+  float32 noise (`2.98e-08` max abs diff) — the project's own standing rule ("verify masking
+  changes against the actual attention-mask matrix, not just 'does it run'") applied here as a
+  direct numerical comparison against the already-trusted dense computation. **Not currently
+  needed for Run A** (`hmn_tpu_recall1024_flat_rope.py`'s HBM usage sits at ~29.5/31.25 GiB with
+  bucketing alone, not OOMing) — available as an opt-in lever if a future config needs it, and
+  asserted mutually exclusive with `bucket_lengths` for now (combining bucket-padding's variable
+  `Lb`/`loss_mask` with segmented forward's own loss reconstruction wasn't needed yet and would
+  add real complexity — not attempted).
 
 ---
 
