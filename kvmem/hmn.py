@@ -840,7 +840,8 @@ def chunk_positions_stitch(chunk_len: int, n_chunks: int, state_len: int,
     return dict(pos_content=pos_content, pos_mask=pos_mask, tags=tags, L=L)
 
 
-def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
+def chunk_mask_fb_traj(pos: dict, hops: int = -1, enc_hops: int = -1,
+                       enc_active_backs: dict | None = None) -> np.ndarray:
     """
     Mask for chunk_positions_traj layouts (REDESIGNED — see docs/HISTORY.md
     §15). No pre-filter STATE row anymore: warmup/response attend DIRECTLY
@@ -856,12 +857,40 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
     encoding-pass STATE PLUS the union of every earlier op's own STATE;
     hops>=1 blocks encoding-pass access for op_idx>0, leaving the bounded
     N-op relay window as the ONLY channel.
+
+    `enc_hops`/`enc_active_backs` (ported from `kvmem/hmn_jax.py`,
+    2026-07-31) — opt-in (default -1 = byte-identical to before these
+    params existed) windowing of the ENCODING-CHUNK sequence, orthogonal to
+    `hops` (which governs OP-to-op relay and is a no-op for any single-Q
+    trajectory, since `op_idx==0` is unconditionally exempt from it). A
+    single-query design (e.g. the `stitch`/suffix-recall family) gives its
+    one query PERMANENT, UNBOUNDED attention to every encoded chunk's STATE
+    — `hops` has nothing to bound there. This generalizes the same
+    "bounded N-back window, back=1 never dropped" relay concept that
+    already governs op-to-op relay to the CHUNK sequence itself: with
+    `enc_hops=N`, chunk k's own STATE computation may attend to at most the
+    previous N chunks' STATE (not just its own raw bytes — encoding
+    isolation for RAW bytes is untouched, only cross-chunk STATE-to-STATE
+    visibility is windowed), and any op that would otherwise get permanent
+    is_any_enc_state access (op_idx==0, or any op_idx under hops==-1) is
+    windowed the same way against the LAST N chunks instead. `enc_active_
+    backs` (dict: chunk index -> set of active back distances, or the
+    string key 'query' for op_idx==0) lets a caller further restrict an
+    already-windowed back-range — used both for per-step stochastic hop
+    DROPOUT during training (back=1 always present, back 2..N independently
+    kept/dropped) and for combinatorial per-hop-size eval. Absent, every
+    back distance 1..enc_hops is active (the deterministic, no-dropout
+    window). See `kvmem/hmn_jax.py`'s own docstring for the verification
+    this was checked against directly (mask-matrix inspection, not just
+    "does it run") before being trusted.
     """
     if hops == 0:
         raise ValueError("hops=0 is invalid — use hops=-1 for unbounded "
                          "(routing-style, full access to every prior op's "
                          "STATE and the encoding pass) or hops>=1 for a "
                          "bounded N-op recurrent window.")
+    if enc_hops != -1:
+        assert enc_hops >= 1, "enc_hops must be -1 (unbounded, legacy) or >=1"
     L = pos['L']
     r = np.arange(L); c = np.arange(L)
     causal  = c[None, :] <= r[:, None]
@@ -873,6 +902,34 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
     is_any_enc_state = np.zeros(L, dtype=bool)
     for b in enc_blocks:
         is_any_enc_state |= (c >= b['sl0']) & (c < b['sl1'])
+
+    def _enc_window_cols(backs_key) -> np.ndarray:
+        """Columns of the up-to-`enc_hops` preceding chunks' STATE, counted
+        back from chunk index `backs_key` (an int) or from one-past-the-last
+        chunk when `backs_key == 'query'`. Only called when enc_hops != -1."""
+        n_enc = len(enc_blocks)
+        ref_k = n_enc if backs_key == 'query' else backs_key
+        allowed_backs = (enc_active_backs.get(backs_key, set(range(1, enc_hops + 1)))
+                         if enc_active_backs else set(range(1, enc_hops + 1)))
+        cols = np.zeros(L, dtype=bool)
+        for back in range(1, enc_hops + 1):
+            src_k = ref_k - back
+            if src_k < 0:
+                break
+            if back not in allowed_backs:
+                continue
+            bsrc = enc_blocks[src_k]
+            cols |= (c >= bsrc['sl0']) & (c < bsrc['sl1'])
+        return cols
+
+    if enc_hops != -1:
+        n_enc = len(enc_blocks)
+        for k in range(1, n_enc):  # k=0 is the entry point, no predecessor, exempt
+            b_k = enc_blocks[k]
+            sl_row = (r >= b_k['sl0']) & (r < b_k['sl1'])
+            own_state = (c >= b_k['sl0']) & (c < b_k['sl1'])
+            allowed_cols = _enc_window_cols(k) | own_state
+            blocked |= sl_row[:, None] & (is_any_enc_state & ~allowed_cols)[None, :]
 
     last_rb_of_op: dict[int, int] = {}
     for i_rb, rb in enumerate(rec_blocks):
@@ -923,7 +980,18 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
         the relay window for op_idx>0 under any hops setting."""
         allowed = np.zeros(L, dtype=bool)
         if op_idx == 0 or hops == -1:
-            allowed |= is_any_enc_state
+            if enc_hops != -1 and op_idx == 0:
+                # Only the query (op_idx==0) gets the chunk-sequence window —
+                # `enc_hops` windows the CHUNK sequence, which has no defined
+                # correspondence to op_idx>0 (a different index space). Any
+                # op_idx>0 with hops==-1 keeps the original unrestricted
+                # is_any_enc_state; enc_hops does not currently generalize to
+                # that case (not needed by any single-Q trajectory, which is
+                # all `kvmem/hmn_jax.py`'s train_jax supports — this torch
+                # port keeps the same scope restriction for the same reason).
+                allowed |= _enc_window_cols('query')
+            else:
+                allowed |= is_any_enc_state
         if op_idx > 0:
             for lo, hi in _relay_ranges(op_idx):
                 allowed |= (c >= lo) & (c < hi)
@@ -1011,6 +1079,26 @@ def chunk_mask_fb_traj(pos: dict, hops: int = -1) -> np.ndarray:
 
     visible = causal & ~blocked
     return np.where(visible, 0.0, -1e9).astype(np.float32)
+
+
+def _sample_enc_active_backs(rng: np.random.Generator, enc_hops: int, drop_prob: float,
+                             n_enc: int) -> dict:
+    """Ported from `kvmem/hmn_jax.py`. Per-training-step stochastic hop
+    dropout ("layer drop in the time axis") for `chunk_mask_fb_traj`'s
+    `enc_active_backs` — independently for each chunk k=1..n_enc-1 and for
+    the query, back=1 (the immediately preceding chunk) is always kept;
+    each back 2..enc_hops is independently kept with probability
+    (1-drop_prob), dropped otherwise. `drop_prob=0` reproduces the full
+    deterministic window (equivalent to `enc_active_backs=None`)."""
+    keys = list(range(1, n_enc)) + ['query']
+    result = {}
+    for key in keys:
+        backs = {1}
+        for back in range(2, enc_hops + 1):
+            if rng.random() >= drop_prob:
+                backs.add(back)
+        result[key] = backs
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2988,6 +3076,28 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
     t_start = time.time()
 
     for stage_i, stage in enumerate(curriculum):
+        # Warm-start each stage (after the first) from the PREVIOUS stage's own BEST
+        # checkpoint, not whatever the live model happens to hold — ported from
+        # kvmem/hmn_jax.py, 2026-07-31 (a real gap found there: the model object
+        # persists across stages unconditionally, so a stage that collapsed late
+        # — loss still fine, but val match cratered, see this session's
+        # "positional-shortcut-vs-content-addressing trade-off" CLAUDE.md entry for
+        # why that can happen without a bug — would hand the NEXT stage its worst
+        # weights instead of its best). Opt-in via hp['warm_start_from_best']
+        # (default True, matching the JAX port's own default) so this can be
+        # disabled to reproduce the old always-continue behavior if ever needed.
+        if stage_i > 0 and hp.get('warm_start_from_best', True):
+            _prev_best_path = os.path.join(ckpt_dir, f'stage{stage_i - 1}_best.pt')
+            if os.path.exists(_prev_best_path):
+                _prev_ckpt = torch.load(_prev_best_path, map_location=device)
+                model.load_state_dict(_prev_ckpt['model'])
+                _log(f'\n[stage {stage_i}] warm-started from stage {stage_i - 1}\'s own best '
+                     f'checkpoint (step={_prev_ckpt["step"]}, val_mean='
+                     f'{_prev_ckpt.get("val_mean")}) instead of continuing from wherever '
+                     f'stage {stage_i - 1} training ended')
+            else:
+                _log(f'\n[stage {stage_i}] warm_start_from_best=True but no '
+                     f'stage{stage_i - 1}_best.pt found — continuing from live model state')
         if 'weave_mix' in stage:
             # Samples from a weighted mix of named weave patterns each step.
             # Only train-mix-safe patterns are accepted (asserted below) —
@@ -3015,6 +3125,18 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                          interleave_delayed=traj_interleave_delayed,
                                          suffix=traj_suffix)
             hops = stage.get('hops', -1)  # default -1 = unbounded (routing-style); hops=0 is invalid
+            enc_hops = hp.get('enc_hops', -1)  # ported from kvmem/hmn_jax.py, 2026-07-31 — bounded
+                                                # encoding-CHUNK-sequence window (orthogonal to `hops`,
+                                                # which governs op-to-op relay and is a no-op for any
+                                                # single-Q trajectory); see chunk_mask_fb_traj's own
+                                                # docstring for the full mechanism
+            hop_drop_prob = stage.get('hop_drop_prob', hp.get('hop_drop_prob', 0.0))  # per-stage,
+                                                # curriculum-annealable — LayerDrop-style stochastic
+                                                # dropout of enc_hops back-distances 2..enc_hops
+                                                # (back=1 never dropped), train-time only
+            if hop_drop_prob > 0:
+                assert enc_hops != -1, "hop_drop_prob>0 requires hp['enc_hops']>=1 — dropout has " \
+                    "nothing to drop when the encoding-chain window is unbounded"
             dual_rope = hp.get('dual_rope', False)  # see apply_rope_dual/_dual_positions —
                                                      # frozen macro clock during query phase,
                                                      # kills the query-order positional shortcut
@@ -3085,7 +3207,7 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                              n_refine=w_n_refine, state_vocab_size=state_vocab_size)
                 pos_content, pos_mask, tags, L = (built['pos_content'], built['pos_mask'],
                                                   built['tags'], built['L'])
-                mask_np = chunk_mask_fb_traj(pos_mask, hops=hops)
+                mask_np = chunk_mask_fb_traj(pos_mask, hops=hops, enc_hops=enc_hops)
                 pos_state_t = pos_local_t = scaled_pos_t = None
                 if dual_rope:
                     ps, pl = _dual_positions(pos_content, L)
@@ -3096,7 +3218,8 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     scaled_pos_t = torch.tensor(sp, dtype=torch.float32, device=device)
                 trajectories.append(dict(weight=wcfg['weight'], pattern=pname, n_chunks=w_n_chunks,
                                          chunk_len=w_chunk_len,
-                                         pos_content=pos_content, mask_np=mask_np, mask_t=None,
+                                         pos_content=pos_content, pos_mask=pos_mask,
+                                         mask_np=mask_np, mask_t=None, enc_hops=enc_hops,
                                          tags=tags, L=L, repeat_batch=w_repeat_batch,
                                          pos_state_t=pos_state_t, pos_local_t=pos_local_t,
                                          scaled_pos_t=scaled_pos_t,
@@ -3111,6 +3234,15 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
             # setup; the training loop below pads each sampled batch to traj['Lb'] and
             # samples traj['B'] rows instead of the stage-level B.
             bucket_lengths = hp.get('bucket_lengths', False)
+            if hop_drop_prob > 0:
+                assert not bucket_lengths and forward_granularity is None, (
+                    "hop_drop_prob>0 is not currently compatible with bucket_lengths or "
+                    "forward_granularity — bucketing pads to a shared Lb per group (the per-"
+                    "trajectory dropout mask would need re-padding every step) and segmented "
+                    "forward walks the encode pass as independent KV-cached groups no finer "
+                    "than enc_hops chunks at a time (a group boundary narrower than the hop "
+                    "window would silently truncate cross-chunk relay); neither integration "
+                    "has been built. Use the plain path for hop-dropout runs.")
             if bucket_lengths:
                 max_shape_buckets = hp.get('max_shape_buckets', 8)
                 # token_budget scales B linearly with 1/Lb — a reasonable proxy when
@@ -3252,6 +3384,23 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                 else:
                     traj, t_pos_content, t_mask_t, t_tags, tok_t = _cached_batch
                 _cached_repeat_left -= 1
+
+                if hop_drop_prob > 0:
+                    # Stochastic "hop dropout" (LayerDrop-style, along the chunk/time axis
+                    # rather than depth) — ported from kvmem/hmn_jax.py, 2026-07-31.
+                    # Rebuilt fresh every step (even under repeat_batch — the underlying
+                    # token batch may be cached/reused, but the dropout pattern is a
+                    # per-GRADIENT-STEP decision, not tied to the data) from `traj['pos_mask']`
+                    # (host-side numpy). back=1 (the immediately preceding chunk) is never
+                    # dropped; back 2..enc_hops each independently dropped w.p. hop_drop_prob.
+                    # eval/decode always use `traj['mask_t']`/`mask_np` (the static
+                    # full-window mask, no dropout) — this is train-time-only regularization.
+                    active_backs = _sample_enc_active_backs(rng, traj['enc_hops'], hop_drop_prob,
+                                                            traj['n_chunks'])
+                    mask_step_np = chunk_mask_fb_traj(traj['pos_mask'], hops=hops,
+                                                      enc_hops=traj['enc_hops'],
+                                                      enc_active_backs=active_backs)
+                    t_mask_t = torch.tensor(mask_step_np, dtype=torch.float32, device=device)
 
                 # bf16 autocast: TPU only (native fast path there). CPU/MPS behavior
                 # is byte-for-byte unchanged (autocast disabled => no-op context).
@@ -3401,6 +3550,52 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                     _jlog(dict(step=global_step, stage=stage_i, eval_mean=round(vmean, 2),
                                traj_match=[round(t['last_match'], 2) for t in trajectories],
                                by_chunk_len={cl: round(sum(v)/len(v), 2) for cl, v in by_cl.items()}))
+
+                    if hp.get('eval_combinatorial_hops', False) and any(t['enc_hops'] != -1 for t in trajectories):
+                        # "Combinatorial try each hop size" — ported from kvmem/hmn_jax.py,
+                        # 2026-07-31. For every subset S of the back distances {2..enc_hops}
+                        # (always unioned with {1}, since back=1 is never dropped in training
+                        # either), decode every trajectory with a mask that applies THAT SAME
+                        # subset uniformly (every chunk and the query alike) instead of the
+                        # full deterministic window, and report the aggregate MEAN for that
+                        # subset — a direct read of which relay distances the model actually
+                        # depends on vs. tolerates losing.
+                        import itertools
+                        H = next(t['enc_hops'] for t in trajectories if t['enc_hops'] != -1)
+                        decode_model, decode_device = _synced_eval_model()
+                        for r_size in range(0, H):
+                            for combo in itertools.combinations(range(2, H + 1), r_size):
+                                S = frozenset({1, *combo})
+                                combo_means = []
+                                for t in trajectories:
+                                    if t['enc_hops'] == -1:
+                                        continue
+                                    active_backs = {k: S for k in range(1, t['n_chunks'])}
+                                    active_backs['query'] = S
+                                    mask_combo = chunk_mask_fb_traj(
+                                        t['pos_mask'], hops=hops, enc_hops=t['enc_hops'],
+                                        enc_active_backs=active_backs)
+                                    val_seqs = make_test_sequences(t['n_chunks'] * t['chunk_len'])
+                                    val_n_seqs = hp.get('val_n_seqs')
+                                    if val_n_seqs is not None:
+                                        val_seqs = dict(list(val_seqs.items())[:val_n_seqs])
+                                    pcts = []
+                                    for seq_bytes in val_seqs.values():
+                                        chunks_list = [seq_bytes[k * t['chunk_len']:(k + 1) * t['chunk_len']]
+                                                      for k in range(t['n_chunks'])]
+                                        r = ar_decode_traj_nokv(decode_model, np.array(chunks_list), state_len,
+                                                                state_vocab_size, mask_combo,
+                                                                t['pos_content'], t['tags'], decode_device,
+                                                                dual_rope=dual_rope, rope_state_scale=rope_state_scale)
+                                        pcts.append(r['match_pct'])
+                                    combo_means.append(sum(pcts) / len(pcts))
+                                combo_mean = sum(combo_means) / len(combo_means)
+                                S_str = '{' + ','.join(str(b) for b in sorted(S)) + '}'
+                                _log(f'  val/weave/hopcombo/S={S_str:<12} MEAN={combo_mean:.1f}%  '
+                                    f'(n_entries={len(combo_means)})')
+                                _jlog(dict(step=global_step, stage=stage_i, hopcombo=sorted(S),
+                                          hopcombo_mean=round(combo_mean, 2)))
+
                     _eval_count += 1
 
                     if adaptive:

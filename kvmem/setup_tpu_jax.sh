@@ -21,7 +21,7 @@ set -euo pipefail
 # kvmem/hmn_jax.py itself detects the installed flax's nnx API surface
 # (nnx.List availability) at runtime and adapts, so whatever pip resolves
 # here works.
-pip install -q -U 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html flax optax tpu-info
+pip install -q -U 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html flax optax tpu-info tqdm
 
 python3 -c "
 import jax

@@ -100,6 +100,10 @@ Fast-weight language model — HashMemNet (HMN). **Current focus: `kvmem/hmn.py`
 - **`hmn_stitch_src1024_anchor` — content-addressing confirmed both behaviorally and mechanistically for the suffix-recall (single-query, `hops=-1`) design, reconfirmed at n_chunks=8; run deliberately stopped after stage1's first eval.** Restarted with a 10x'd schedule (100000/150000/150000 steps), `adaptive=True` (`early_stop_mean=80.0`), `repeat_batch` B4 (stage0)/B8 (stage1-2), warm-started from `hmn_notags_weave_anchor_rope`. **Stage0 (n_chunks in {2,4}) done**: best val MEAN=49.4% (eval1, step 20000), ended at 41.1% (step 100000) — 5 evals across the stage oscillated 38.9-49.4% without a clean monotonic trend (one dip to 38.9% at step 60000, mistaken mid-run for a possible collapse, fully recovered by step 80000 — a transient reweighting wobble, not real degradation). Near-end anchors (short response) consistently hit 83-100%; two entries (`Q(2,4,44,32)`, `Q(0,4,0,64)`) never broke above ~2% match across all 5 evals — the model's stubborn weak spot, unrelated to the addressing mechanism itself (see below). **Stage1 (n_chunks up to 8) eval #1** (step 30000, global step 130000): MEAN=36.1%. Per-entry: `Q(0,2,0,32)`=0.0%, `Q(0,2,88,32)`=58.3%, `Q(0,4,0,64)`=0.2%, `Q(0,4,184,64)`=83.3%, `Q(4,8,0,64)`=5.9%, `Q(4,8,92,64)`=9.0%, `Q(4,8,184,64)`=100.0%, `Q(0,8,0,96)`=1.0%, `Q(0,8,408,96)`=75.0%, `Q(0,8,0,128)`=2.1%, `Q(0,8,376,128)`=62.5% — same near-end-anchor-easy/near-start-anchor-hard pattern as stage0, now replicated at the harder n_chunks=8 shapes too, with no early-stop trigger (36.1% << 80.0%). **Run was then deliberately stopped (`kill 17291`, confirmed exited) per explicit user instruction, right after this eval and the probe re-run below** — not a crash or failure; `stage1_last.pt`/`stage1_best.pt` are the final checkpoints.
   - **Content-addressing swap test** (`kvmem/probe_stitch_content_addressing.py`) — originally against `stage0_best.pt`/`stage0_end.pt` at n_chunks=4 (4 anchor pairs: 44↔0, 64↔0, 20↔80, 80↔20), **position-match pinned at 0.0-0.8% in every trial** vs. content-match 33.7-79.7%. **Re-run against `stage1_last.pt` at the harder n_chunks=8, window_chunks=4/8 shapes** (matching stage1's own trained entries): low-baseline anchor pairs (0↔92, baseline 0.3-6.0%) were inconclusive (too weak a baseline to read a signal from either way), but the two high-baseline near-end-anchor pairs tested — `184↔92` (window_chunks=4, baseline 90.6%) and `408↔0` (window_chunks=8, baseline 90.6%) — both again showed the same clean pattern: **position-match 1.6% in both, content-match 37.5%/40.6%** — content-addressing reconfirmed at n_chunks=8, not just n_chunks=4.
   - **Mechanistic confirmation** (`kvmem/probe_stitch_mechanistic_addressing.py`) — against `stage0_end.pt` (n_chunks=4, anchor=44←chunk0 and anchor=88←chunk1): gradient L2 norm 5.9x/10.4x higher on the swap-source STATE, attention mass layers swap-dominant in both — **confirmed**. **Re-run against `stage1_last.pt`** (n_chunks=8, anchor=184←swap-chunk): swap-chunk=0 (far outside the window) was **mixed/inconclusive** (teacher-forced behavioral match 0.0% — this exact cross-distant-chunk construction is highly out-of-distribution for a checkpoint only 1 eval into n_chunks=8 training), but swap-chunk=3 (immediately adjacent to the window, still a genuinely different STATE) gave a clean **CONFIRMED** result: gradient L2 norm 7.7x higher on the swap-source STATE (1.38 vs 0.18), attention mass in the layer carrying the most overall weight (layer 1) swap-dominant. Net read: content-addressing holds mechanistically at n_chunks=8 too, though the far-chunk case shows the mechanism gets harder to probe cleanly (not necessarily weaker) the more novel/OOD the specific swap construction is relative to what's actually been trained so far.
+- **JAX curriculum val-MEAN "collapse" root-caused: not divergence, a positional-shortcut-to-content-addressing trade-off — adaptive reweighting ruled out as the cause.** `hmn_tpu_recall1024_jax_curriculum_staged.py` (5-stage curriculum starting at `n_chunks=2, chunk_len=64`) was relaunched from scratch on `tpu2` after landing the gradient-clipping + warm-start-from-best-checkpoint fixes (see the two entries below this one) — **result: every one of its first 4 stages finished at near-chance MEAN** (`[stage 0] done ... best=2.3%`, stage1 `best=1.0%`, stage2 `best=0.7%`, stage3 `best=0.6%`), monotonically WORSE each stage. Root cause: the curriculum starts at `chunk_len=64/n_chunks=2` — already a multi-chunk shape — without ever first proving single-chunk recall converges, unlike torch's own proven `hmn_notags_w25` ladder (`chunk_len` 8→16→32→64, single chunk, see the `chunk_len` ladder entry above). This run was stopped (killed) as a wasted trajectory; a corrected curriculum should start from `chunk_len=8, n_chunks=1` (matching `hmn_notags_w25_rope_jax_sanity_c8.py`, see below) and only escalate `n_chunks` after that stage genuinely converges, not after a fixed step budget expires.
+  - Separately, `hmn_notags_w25_rope_jax_sanity_c8.py` (the correctly-scoped `chunk_len=8, n_chunks=1` sanity config, matching torch's own easiest proven stage) showed what looked at first like a genuine training collapse on `tpu3`: val MEAN 37.5%→31.4%→**43.6%** (step 15000, peak)→30.8%→23.1%→16.2%→10.6%→13.3%→11.9% — `tpu3` was PREEMPTED (GCP spot reclaim) before the run could continue past this point, so the log/checkpoint are lost (see the TPU-provisioning standing rule above — do not recreate `tpu3` without the user; report and wait).
+  - **A/B control on `tpu2`** (`hmn_notags_w25_rope_jax_sanity_c8_noadaptive.py`, identical config with `adaptive=False`) reproduced the same shape of MEAN trajectory (28.3%→28.9%→29.7%→22.0%→15.1%→13.2%→17.3%→21.7% recovering by step 50000) — **ruling out adaptive reweighting as the cause** (it was disabled here and the collapse-then-partial-recovery pattern still occurred). The `lr_schedule` (`kvmem.hmn_jax._make_schedule`) is warmup-then-flat-constant, never cosine/restarting, ruling out an LR-spike artifact too.
+  - **Per-entry breakdown at the peak (step 15000, MEAN=32.5%) vs. the trough (step 45000, MEAN=15.1%) reveals the real mechanism**: at the peak, every **anchor=0** entry (`Q(0,1,0,2)`, `Q(0,1,0,3)`, `Q(0,1,0,4)` — warmup starting at the very first byte of the chunk) was at **0.0%** match while **anchor=1** entries were near-perfect (`Q(0,1,1,2)`=86.7%, `Q(0,1,1,3)`=91.7%) — the model had found a shortcut that works great whenever the anchor isn't at position 0, and was failing completely on the genuinely-hard near-start-anchor case (the same "near-start anchor hard" pattern already on record from the `hmn_stitch_src1024_anchor` entry above, now visible at `chunk_len=8` too). By the trough, anchor=0 entries had improved (5.6%/6.7%/16.7%) while anchor=1 entries had gotten much worse (20.0%/25.0%, down from 86.7%/91.7%) — a genuine trade-off, not a joint collapse: the aggregate MEAN dropped because the model was pushed off its easy shortcut faster than it consolidated the harder content-addressed solution. Train loss stayed low/stable throughout this window (0.06-0.3 for 5 of 6 trajectories) — one trajectory (`Q(0,1,2,2)`) spiked to loss=8.2-8.7 (above the ln(256)=5.545 random-baseline) between steps ~15000-35000 before recovering to ~1.1 by step 45000, consistent with genuine optimization turbulence during the shortcut-to-content-addressing transition rather than any numerical instability (no NaN, no exploding activations). Step 50000 (21.7%) shows the trade-off starting to resolve favorably. **Standing lesson reinforced**: a mid-training MEAN dip is not automatically a collapse — inspect the per-entry breakdown before concluding instability, the same "check before trusting" discipline CLAUDE.md's masking-verification rule already establishes for a different context.
 
 ---
 
@@ -125,6 +129,18 @@ Fast-weight language model — HashMemNet (HMN). **Current focus: `kvmem/hmn.py`
 ---
 
 ## TPU port (2026-07-30) — status: infra confirmed working, first real training run not yet completed
+
+**Standing rule: never create/recreate a TPU VM directly via `gcloud ... tpu-vm create` — even
+under an autonomous-work mandate.** This project's TPU access is via **TRC (TPU Research Cloud)
+free-tier quota**, which is consumed/tracked through `gcloud compute tpus queued-resources`, NOT
+the direct `tpu-vm create` API — creating a VM directly bills normally instead of drawing on the
+TRC quota. `tpu3` (`v6e-8`, `us-east1-d`, spot) was PREEMPTED (GCP spot reclaim) mid-run on
+2026-07-31; `gcloud ... tpu-vm start` does not support restarting a PREEMPTED node, and an
+attempt to `gcloud ... tpu-vm create tpu3 ...` to replace it was stopped by the user ("do not
+create own tpu... must use `gcloud compute tpus queued-resources` else will be billed not using
+TRC quota... not allowed to spin own vm"). Provisioning (even via the correct queued-resources
+path) is the user's call — report the loss and wait, don't self-serve a replacement, regardless
+of how much autonomy has otherwise been granted for the training work itself.
 
 **Context**: a scale-up experiment (target: 1024-byte perfect recall from a warmup anchored at
 any source index, `d=128/n_layers=16/n_heads=8`, ~1.12M params — see
@@ -575,6 +591,151 @@ re-derived segmented forward — all opt-in, none change existing configs' behav
   asserted mutually exclusive with `bucket_lengths` for now (combining bucket-padding's variable
   `Lb`/`loss_mask` with segmented forward's own loss reconstruction wasn't needed yet and would
   add real complexity — not attempted).
+
+**Depth-axis remat granularity, adaptive-mix sampling, compile-time instrumentation, and a
+decode-jit rewrite that fixed a real ~35-minute eval bottleneck — all landed in `kvmem/hmn_jax.py`
+the same session (2026-07-31), same "verify against the dense/eager baseline before trusting it"
+discipline throughout.**
+- **Depth-axis `grad_checkpoint` granularity** — mirrors `forward_granularity`'s own int/float
+  duality onto the model-DEPTH checkpointing axis: `False` (none), `True`/`'block'` (per-layer,
+  unchanged default), an int >=1 (exact layer-group size), or a float in `(0,1]` (fraction of
+  `n_layers` per checkpoint group — `1.0` = whole stack as one group, still saves memory vs no
+  checkpointing since only that group's own input is retained, just with the fewest/largest
+  remat call-sites). `_grad_checkpoint_groups`/`_group_call`/`_group_call_remat`. **A real bug
+  caught and fixed during this**: `build_model` was doing `grad_checkpoint=bool(hp.get(...))` —
+  `bool(2)`/`bool(0.25)`/`bool('block')` are all `True`, silently collapsing every numeric/
+  string granularity down to the coarsest per-layer grouping regardless of what was configured.
+  Fixed by passing the raw value through unchanged. Verified bit-exact (loss AND full gradient
+  tree) against the no-checkpoint baseline across `False`/`True`/`'block'`/`1`/`2`/`4`/`8`/
+  `0.25`/`0.5`/`1.0` on a local CPU test, same seed/init every time.
+- **Adaptive weave_mix reweighting** — JAX port of `kvmem.hmn`'s own `_adapt_reweight`/
+  `_temp_softmax_rescale` (identical formula: harder-than-average trajectories scaled up, easier
+  ones down, floor-blended so nothing drops below `adapt_floor`'s relative share). Motivated by a
+  real gap: `hmn_tpu_recall1024_jax_adaptive_mix.py`'s 60-entry mixed-difficulty weave_mix (see
+  below) was originally sampled at STATIC uniform weight forever — mixing easy-and-hard entries
+  without ever shifting sampling effort toward whichever ones are still failing isn't meaningfully
+  a curriculum, just wider static coverage. `adapt_signal='val_match'` (default) skips adapting
+  until the 2nd eval (first reading is the noisiest). Verified the rescaling formula directly
+  (uniform difficulty stays uniform, a harder entry gets upweighted, sum preserved) before
+  deploying.
+- **`weights`/`traj_loss` now logged to both `train.log` and `train.jsonl` every `log_every`
+  step** (not just the sampled trajectory's own loss) — for plotting weight/loss evolution per
+  entry over training. Per-trajectory loss materialized every step now (small added host-sync
+  cost, traded for having the curve at all).
+- **Per-shape compile-time instrumentation** (`[compile] step_fn for L=...` lines, keyed by
+  `id(step_fn)` since bucketed/grouped step functions are SHARED across trajectories) — real
+  compile times turned out much noisier than expected: same 60-shape training-step compile set
+  measured 154s in one run and 994s in another, with individual shapes alternating between ~2s
+  and ~20s in no clean pattern (ruled out monotonic cache-size growth as the explanation — fast
+  and slow compiles interleave). Not root-caused; logged so future runs have the data rather than
+  guessing.
+- **`hmn_tpu_recall1024_jax*.py` config family renamed and made self-contained** —
+  `hmn_tpu_recall1024_flat_rope.py` (the torch base config the JAX chain used to `load_config`
+  from) was deleted from the working tree outside this session's own actions (found via `git
+  status` showing it and several other torch configs as uncommitted deletions); `hmn_tpu_
+  recall1024_jax.py` now inlines its own `hp` directly instead of depending on a file that may not
+  exist. Chain: `hmn_tpu_recall1024_jax.py` (base, `B=64`) -> `_smallbatch.py` (`B=8, lr_max=1e-4`
+  — the original `B=64, lr_max=6e-4` run was still at the random-baseline loss after 1000 steps,
+  projected 46-60 HOURS to finish; `lr_max=6e-4` was √-scaled for a B≈256 target that was never
+  actually deployed, `6e-4` is too high for the real `B=64`, and large `B` alone means far fewer
+  updates/minute — this exact wrong-LR failure mode already happened once before, see the
+  `hmn_tpu_sanity_w25.py` entry above) -> `_adaptive_mix.py` (extends the weave_mix to `n_chunks`
+  in `{2,4,8,12,16}`, 60 entries total, `bucket_lengths=False` since `w0` scales with `n_chunks`
+  — 5 distinct values, violating the bucket path's shared-`w0` requirement — plus `adaptive=True`).
+  Renamed from `..._curriculum.py` mid-session: "curriculum" was misleading (no staged/sequential
+  difficulty progression, just one stage with adaptive reweighting over a static mixed-difficulty
+  set) — "adaptive_mix" names what it actually is.
+- **Decode-jit rewrite — the big one, fixed a real ~35-minute eval bottleneck.** `ar_decode_
+  traj_kv`'s eager, token-at-a-time Python loop scales badly once `weave_mix` has 60 heterogeneous
+  entries (`out_len` up to ~2000): a live run's eval pass ran for over 35 minutes and still hadn't
+  finished when checked. Root cause understood via a local CPU benchmark (tiny model, one
+  `out_len=352` entry) comparing four approaches: **(A) eager baseline** 85-92s; **(B) naively
+  jit the per-step forward call as-is** (growing `past_kv` via `concat`) ~62-68s extrapolated —
+  barely better, because a DIFFERENT input shape every step forces a full XLA recompile every
+  token, and B's "advantage" is just compiled matmuls beating eager dispatch despite constantly
+  recompiling; **(C) fixed-size KV buffer** (`jax.lax.dynamic_update_slice` instead of `concat`,
+  keeps every step's shapes IDENTICAL) **+ forward-pass-only jit, Python loop**: 0.73-0.39s
+  (~118-236x); **(D) same fixed buffer + the WHOLE loop jitted via `jax.lax.fori_loop`** (zero
+  Python-level dispatch inside the loop at all): 0.24-0.09s (~358-1000x, cached calls fastest).
+  All four verified byte-identical match% against the eager baseline. Two real bugs caught while
+  building this: (1) `apply_rope`'s `jnp.arange(offset, offset+L)` requires a CONCRETE `offset`,
+  which would force a recompile every step even with a fixed buffer — rewritten to `jnp.arange(L)
+  + offset` (mathematically identical, but `offset` can now be a TRACED scalar since only `L`,
+  always static from shape, needs to be concrete) — existing static-offset callers verified
+  bit-exact afterward; (2) the first `write_pos` (fixed-buffer) implementation on `MHAttention.
+  __call__` returned the KV buffer AFTER `null_kv`'s extra column got concatenated onto it,
+  silently growing the "fixed" buffer by one column every call and breaking the static-shape
+  guarantee entirely — caught by a shape-mismatch crash on the SECOND decode step, not silently
+  wrong; fixed by capturing the buffer before the `null_kv` branch. `MHAttention.__call__`/
+  `SingleAttnBlock.__call__`/`HMNModel.__call__` all gained an optional `write_pos` param (default
+  `None`, byte-identical to before — regression-checked via a bit-exact forward-pass comparison
+  before AND after each of the two bug fixes above). `ar_decode_traj_kv_jit` (variant D) is now
+  wired into `train_jax`'s own eval loop, replacing `ar_decode_traj_kv`; compiled decode programs
+  are cached module-level (`_decode_jit_cache`, keyed by `(id(model), prefix_end, out_len)`) and
+  reused across BOTH different trajectories sharing a shape AND repeated eval calls within one
+  run — confirmed on a local smoke test (2.3s first eval including 6 compiles, 0.1s second eval,
+  same 6 shapes, zero new compiles) and then on the real 60-entry/1.12M-param run: **first eval
+  279.8s total** (compiling all 60 decode shapes for the first time) vs. the eager path's 35+
+  minutes and still not done — roughly 7-8x faster even INCLUDING first-time compile cost, with
+  every later eval expected to be dramatically faster still once nothing new needs compiling.
+  `val/weave/decode_time_total` (+ per-entry `decode=Xs` alongside each match% line, + `train.
+  jsonl`'s `eval_decode_total_s`/`traj_decode_s`) now logged every eval specifically to track this.
+  Confirmed the caching itself is correct (not silently serving stale weights) via a direct local
+  test: decode before vs. after 200 real training steps on the same cached compiled function gave
+  different match% (0.57% -> 0.28%), proving `nnx.jit`'s per-call state-splitting reads current
+  params every time — only the compiled PROGRAM is cached by `(id(model), prefix_end, out_len)`,
+  never the weight values.
+
+**Staged curriculum (`hmn_tpu_recall1024_jax_curriculum_staged.py`, 5 sequential stages `n_chunks`
+2→4→8→12→16, each gated by `early_stop_mean=90.0`) — first real run surfaced two genuine bugs in
+`train_jax` itself, both fixed (2026-07-31).** Stage 0 (n_chunks=2, easiest) peaked at val
+MEAN=34.7% around step 16000-17000, then collapsed to ~1% over the next several evals with NO
+warning in the logged training loss (which kept declining smoothly the whole time) — confirmed via
+a direct decode comparison that this was NOT a decode-jit bug (eager vs jit agreed exactly on the
+collapsed checkpoint). Root cause investigation found two real gaps:
+- **No gradient clipping anywhere in `hmn_jax.py`** — `kvmem.hmn`'s own `train()` clips every step
+  (`torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)`, immediately after `backward()`); the
+  JAX port had plain `optax.adamw` with nothing composed in front of it. An unclipped outlier
+  gradient is a textbook cause of exactly this failure signature (loss looks fine, generation
+  quality collapses). Fixed: `hp['grad_clip_norm']` (default `1.0`, matching torch's hardcoded
+  value) composes `optax.clip_by_global_norm` in front of `adamw` via `optax.chain`; set to
+  `None`/`0` to reproduce the old unclipped behavior. Verified the composition actually clips
+  (a `[100,100,100]` gradient reduces to global norm ~1.0) before deploying.
+- **Curriculum stages warm-continued from whatever the live model held, not from that stage's own
+  best checkpoint** — so stage 1 inherited stage 0's COLLAPSED final weights (not its 34.7%-best
+  state) and, unsurprisingly, never recovered (finished its own full 30000 steps at MEAN=0.5%,
+  worse than the collapse it inherited) — a real cascading-failure design gap, not a training
+  instability question at all. Fixed: `hp['warm_start_from_best']` (default `True`) loads the
+  previous stage's own `stage{i-1}_best.pt` at the start of each new stage instead of continuing
+  from wherever training happened to land; set to `False` to reproduce the old always-continue
+  behavior. Verified locally (multi-stage smoke test confirms the "warm-started from stage N's own
+  best checkpoint" log line fires and the loaded weights are actually used).
+
+Both fixes verified independently before combining (grad-clip composition math checked in
+isolation; warm-start log line + checkpoint load confirmed in a 2-stage local smoke test) and
+together (same smoke test, both features active, no errors). Curriculum relaunched from scratch
+with both fixes rather than resumed from the now-poisoned checkpoints.
+
+- **`hmn_tpu_recall1024_jax_adaptive_mix.py` — first full run, done.** 20000 steps, `B=8`,
+  `lr_max=1e-4`, all fixes above combined (small batch, corrected LR, adaptive reweighting, jit
+  decode eval). Compile: 60 training shapes in 154-994s across different runs (noisy, not
+  root-caused — see compile-time-instrumentation entry above). Loss declined from the random
+  baseline (~5.545) down into the 5.25-5.35 range with real per-entry differentiation by step
+  4000-6000 (previously stuck flat at baseline for 2000+ steps before the small-batch/LR fixes).
+  **val MEAN**: 0.2% (step 2000) -> 0.5% (4000) -> 19.1% (6000) -> 33.7% (8000) -> **plateaued at
+  33.7-33.9% for the remaining 12000 steps** (evals at 10000/12000/14000/16000/18000/20000 all
+  landed within 0.2pp of each other) despite train loss continuing to decline the whole time —
+  a genuine generalization plateau, not an artifact (loss-still-falling-but-match-flat is exactly
+  the signature CLAUDE.md's own `hmn_single_recall_c128` entry already documents as "undertrained"
+  ELSEWHERE, but here 12000 steps of flat match against a still-declining loss reads more like a
+  real ceiling at this model scale/step budget than simple undertraining — not conclusively
+  settled either way). **Final: MEAN=33.9%, best checkpoint=33.9%** (same value, `stage0_end.pt`).
+  Adaptive weights stayed close to uniform throughout (0.01-0.02 range) — the difficulty spread
+  across entries was never large enough for the reweighting to meaningfully concentrate effort on
+  a specific subset. Natural next steps, not yet done: longer budget to see if the plateau is
+  truly a ceiling or would eventually break: a bigger model; or inspecting whether specific
+  entries (e.g. the hardest near-start-anchor ones, per this project's own recurring "near-end
+  anchor easy / near-start anchor hard" pattern) are the ones actually capping the MEAN.
 
 ---
 
