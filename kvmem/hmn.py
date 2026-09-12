@@ -3125,11 +3125,17 @@ def train(hp: dict, log_base: str = 'logs', device_str: str = 'cpu'):
                                          interleave_delayed=traj_interleave_delayed,
                                          suffix=traj_suffix)
             hops = stage.get('hops', -1)  # default -1 = unbounded (routing-style); hops=0 is invalid
-            enc_hops = hp.get('enc_hops', -1)  # ported from kvmem/hmn_jax.py, 2026-07-31 — bounded
-                                                # encoding-CHUNK-sequence window (orthogonal to `hops`,
-                                                # which governs op-to-op relay and is a no-op for any
-                                                # single-Q trajectory); see chunk_mask_fb_traj's own
-                                                # docstring for the full mechanism
+            enc_hops = stage.get('enc_hops', hp.get('enc_hops', -1))  # ported from kvmem/hmn_jax.py,
+                                                # 2026-07-31 — bounded encoding-CHUNK-sequence window
+                                                # (orthogonal to `hops`, which governs op-to-op relay
+                                                # and is a no-op for any single-Q trajectory); see
+                                                # chunk_mask_fb_traj's own docstring for the full
+                                                # mechanism. STAGE-scoped (matches hop_drop_prob's own
+                                                # per-stage override) — fixed 2026-07-31 same day as
+                                                # the JAX side: different curriculum stages legitimately
+                                                # want different enc_hops (e.g. unbounded early, bounded
+                                                # only once the target shape is reached), and reading
+                                                # only hp[...] silently ignored any stage-level override.
             hop_drop_prob = stage.get('hop_drop_prob', hp.get('hop_drop_prob', 0.0))  # per-stage,
                                                 # curriculum-annealable — LayerDrop-style stochastic
                                                 # dropout of enc_hops back-distances 2..enc_hops

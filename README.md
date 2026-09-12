@@ -17,7 +17,9 @@ This vision hasn't changed since the project started; the architecture implement
 
 **[`CLAUDE.md`](CLAUDE.md)** is the living instructions/status doc for this repo (agent-facing, but also the best human-facing summary of current architecture, terminology, and open questions) — read it before this file for anything beyond the vision above.
 
-Short version: the current implementation is **[`kvmem/hmn.py`](kvmem/hmn.py)**, a single consolidated file (chat-tag-style vocabulary, three selectable transformer block types, a training loop with bounded chain memory) — a from-scratch rewrite that replaced an earlier multi-file `kvmem/`+`experiments/` stack after a design review found the old chat-tag vocabulary encoded window identity into the token vocabulary itself (fixable, but required retraining, so it was also the point to add bounded persistent memory across chunks from the start rather than bolt it on later).
+Short version: the current implementation is **[`kvmem/hmn.py`](kvmem/hmn.py)** (torch, CPU/MPS) and its JAX/Flax NNX port **[`kvmem/hmn_jax.py`](kvmem/hmn_jax.py)** (the current and only supported TPU path — see `CLAUDE.md`'s "TPU access" section) — a from-scratch rewrite that replaced an earlier multi-file `kvmem/`+`experiments/` stack after a design review found the old chat-tag vocabulary encoded window identity into the token vocabulary itself (fixable, but required retraining, so it was also the point to add bounded persistent memory across chunks from the start rather than bolt it on later).
+
+Training now runs on real TPU hardware (TRC queued-resource nodes) rather than only CPU/MPS. The live target is **recall1024** — perfect byte recall from a warmup anchored anywhere in a 1024-byte source — staged as a roadmap of capability gates (see `CLAUDE.md`'s "Roadmap" section and [`docs/RESULTS_LOG.md`](docs/RESULTS_LOG.md) for current progress): stage 1 (single-chunk encode/decode) is passed; stage 2 (multi-chunk stitch) is in progress.
 
 **Everything from before that rewrite — including the RNN-style `<h>`-state design this README originally described, the dual-attention-block discovery, the chunk-memorization/SRS scaling work, and every prior experiment's code AND docs — is preserved, not deleted**, under [`archive_v1/`](archive_v1/) (old `kvmem/`, old `experiments/`, old `docs/`; still runs standalone via `PYTHONPATH=archive_v1`). The historical design docs (`archive_v1/docs/SRS_RECIPE.md`, `EARLY_ARCHITECTURE_HISTORY.md`, `MDL_MODEL_SIZE.md`) are still the most detailed record of *why* many of the current design's proven mechanisms (nochain masking, warmup-seeded stitching, IQ-before-IR staging, RoPE necessity) work the way they do — `kvmem/hmn.py` reuses that proven logic, not just the vision. The `docs/` folder at the repo root is a fresh start for the current rewrite — see [`docs/HMN_RECIPE.md`](docs/HMN_RECIPE.md) for the primary detailed writeup.
 
@@ -27,9 +29,11 @@ Short version: the current implementation is **[`kvmem/hmn.py`](kvmem/hmn.py)**,
 
 ```
 kvmem/
-  hmn.py            — current implementation: vocab, position/mask builders,
+  hmn.py            — torch implementation: vocab, position/mask builders,
                        model (3 block types), training loop, chain memory
-  configs/           — current training configs (Stage 0, Stage 1, ...)
+  hmn_jax.py         — JAX/Flax NNX port, the only supported TPU path
+                       (torch_xla was tried and abandoned — see CLAUDE.md)
+  configs/           — training configs (torch AND JAX/TPU, same directory)
   structured_data.py — compressible synthetic data generators (chaotic
                        maps, fractals, cellular automata), queued track
   eval_compression.py — test-time compression-quality diagnostics
@@ -42,14 +46,23 @@ archive_v1/
   CLAUDE_v1.md        — previous version of CLAUDE.md
 docs/
   HMN_RECIPE.md       — primary detailed writeup for the current architecture
+  HMN_WALKTHROUGH.md  — train & eval walkthrough, c64 → weave pipeline
+  RESULTS_LOG.md      — append-only experiment ledger (all run outcomes)
+  TPU_JAX_PORT.md     — torch_xla (abandoned) → JAX porting history
+  tpu_setup.md / tpu_direct_ssh.md — TPU operational how-to
 datasets/
   suratalfatihah.txt — test set
   juz1.txt            — scaling target (not yet used in training)
 ```
 
-Run a config:
+Run a config (torch, CPU/MPS):
 ```bash
 python3 -m kvmem.hmn --config kvmem/configs/hmn_stage0_round0_single.py --device mps
+```
+
+Run a config (JAX, TPU — see `CLAUDE.md`'s "TPU access" section for node setup):
+```bash
+python3 -m kvmem.hmn_jax --config kvmem/configs/hmn_tpu_sanity_w25_rope_jax.py
 ```
 
 ---

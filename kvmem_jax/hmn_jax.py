@@ -1,4 +1,25 @@
 """
+**FORK of `kvmem/hmn_jax.py` — this is `kvmem_mlp`, a deliberately non-DRY,
+standalone copy** (2026-09-06). Physically copied, not imported — nothing in
+this directory imports from `kvmem`, and nothing in `kvmem` imports from
+here. Motivation: test the hypothesis that Experiment 2's (roadmap stage 2,
+multi-chunk stitch) hard collapse at `chunk_len` 32/64 (best MEAN 4.6%/3.1%,
+falling off a cliff from stage 3's 83.5%) is a genuine model-CAPACITY
+ceiling caused by `block_type='single_attn'` having no FFN/MLP sublayer at
+all (`x = x + attn(norm(x))`, one attention op per layer, nothing else) —
+not a data/curriculum/masking problem. The one and only change from the
+original `kvmem/hmn_jax.py`: `block_type='attn_mlp'` is now implemented
+(`FFN`/`AttnMlpBlock` classes below, JAX port of `kvmem.hmn`'s own torch
+`FFN`/`AttnMlpBlock`) and selectable via `hp['block_type']` in
+`build_model`. Everything else — trajectory/mask builders, training loop,
+decode/eval, checkpointing — is byte-identical to the original file at fork
+time. Own `configs/` and `logs/` subdirectories, entirely separate from
+`kvmem/configs/` and `kvmem/logs/` — nothing here writes into or reads from
+the original tree.
+
+Original file's own header (kept for context, describes the base file this
+was forked from, not this fork's own scope):
+
 JAX/Flax NNX port of `kvmem/hmn.py` — SINGLE FILE, self-contained (no import
 of `kvmem.hmn`, no `torch` dependency at all). Motivated by the TPU-port
 investigation in CLAUDE.md's "TPU port" section: an unresolved,
@@ -19,7 +40,8 @@ project's own default going forward) with `rope`+`yarn`, `null_kv`,
 `attn_mlp`/`dual_attn`, `qk_norm`, `logit_cap`, `attn_temp`, `embed_scale`,
 `tied_embed`, `gated_ffn`, refine rounds/argmax feedback, structured
 (non-random) data, adaptive reweighting, and length bucketing/padding are
-NOT ported. **KV-caching, gradient checkpointing (`remat`), decode-eval
+NOT ported (**except `attn_mlp` — see this fork's own note above, now
+implemented in THIS file only**). **KV-caching, gradient checkpointing (`remat`), decode-eval
 (match%), and checkpoint save/load ARE ported** (added 2026-07-30, for
 feature parity with `kvmem.hmn`'s own `train()` within this file's scope):
 `HMNModel.__call__`'s `past_kv`/`return_kv`/`offset` signature mirrors
@@ -800,6 +822,62 @@ class SingleAttnBlock(nnx.Module):
         return x + attn_out
 
 
+class FFN(nnx.Module):
+    """JAX/Flax NNX port of `kvmem.hmn.FFN` — plain GELU-MLP by default
+    (`gated=True` selects SwiGLU: silu(W1 x) * W3 x -> W2, ~50% more params
+    at the same d_ff, an ablation flag, not param-matched — matches torch
+    exactly, including the tanh-approximation GELU formula so a param-count
+    comparison against a torch-trained checkpoint stays meaningful)."""
+    def __init__(self, d: int, d_ff: int, *, gated: bool = False, rngs: nnx.Rngs):
+        self.gated = gated
+        init = nnx.initializers.normal(stddev=math.sqrt(2.0 / d))
+        self.W1 = nnx.Linear(d, d_ff, use_bias=False, kernel_init=init, rngs=rngs)
+        if gated:
+            self.W3 = nnx.Linear(d, d_ff, use_bias=False, kernel_init=init, rngs=rngs)
+        self.W2 = nnx.Linear(d_ff, d, use_bias=False, kernel_init=init, rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        if self.gated:
+            h = jax.nn.silu(self.W1(x)) * self.W3(x)
+        else:
+            h = self.W1(x)
+            h = 0.5 * h * (1.0 + jnp.tanh(0.7978845608028654 * (h + 0.044715 * h ** 3)))
+        return self.W2(h)
+
+
+class AttnMlpBlock(nnx.Module):
+    """block_type='attn_mlp': x = x + attn(norm1(x)); x = x + ffn(norm2(x))
+    — JAX/Flax NNX port of `kvmem.hmn.AttnMlpBlock`, THIS FORK ONLY (not in
+    the original `kvmem/hmn_jax.py`). Same `__call__` signature as
+    `SingleAttnBlock` (including the unused-here `write_pos` kwarg) so
+    `_block_call`/`_group_call`/the grad-checkpoint groups all work
+    unchanged regardless of which block type `HMNModel` was built with."""
+    def __init__(self, d: int, n_heads: int, d_ff: int, *,
+                 rope: bool = False, freqs: jnp.ndarray | None = None,
+                 null_kv: bool = False, rmsnorm: bool = False,
+                 gated_ffn: bool = False, rngs: nnx.Rngs):
+        assert rmsnorm, 'LayerNorm variant not ported — every config this file targets uses rmsnorm=True'
+        self.norm1 = RMSNorm(d, rngs=rngs)
+        self.attn = MHAttention(d, n_heads, rope=rope, freqs=freqs, null_kv=null_kv, rngs=rngs)
+        self.norm2 = RMSNorm(d, rngs=rngs)
+        self.ffn = FFN(d, d_ff, gated=gated_ffn, rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray, mask: jnp.ndarray, *,
+                 past_kv: tuple[jnp.ndarray, jnp.ndarray] | None = None,
+                 return_kv: bool = False,
+                 offset: int = 0,
+                 write_pos: int | None = None):
+        attn_out = self.attn(self.norm1(x), mask, past_kv=past_kv, return_kv=return_kv, offset=offset,
+                             write_pos=write_pos)
+        if return_kv:
+            attn_out, kv = attn_out
+        x = x + attn_out
+        x = x + self.ffn(self.norm2(x))
+        if return_kv:
+            return x, kv
+        return x
+
+
 def _block_call(block, x, mask, past_kv, return_kv, offset, write_pos=None):
     return block(x, mask, past_kv=past_kv, return_kv=return_kv, offset=offset, write_pos=write_pos)
 
@@ -872,16 +950,20 @@ def _grad_checkpoint_groups(grad_checkpoint, n_layers: int) -> list[tuple[int, i
 
 
 # =============================================================================
-# HMNModel — restricted to block_type='single_attn' (see module docstring)
+# HMNModel — block_type in {'single_attn', 'attn_mlp'} (THIS FORK ONLY —
+# the original kvmem/hmn_jax.py is restricted to 'single_attn')
 # =============================================================================
 
 class HMNModel(nnx.Module):
     def __init__(self, V: int, d: int, n_layers: int, n_heads: int, *,
+                 block_type: str = 'single_attn', d_ff: int = 0, gated_ffn: bool = False,
                  rope: bool = False, yarn: bool = False,
                  L_train: int = 512, L_max: int = 4096,
                  null_kv: bool = False, rmsnorm: bool = False,
                  grad_checkpoint: bool = False,
                  V_out: int = 256, rngs: nnx.Rngs):
+        assert block_type in ('single_attn', 'attn_mlp'), \
+            f"kvmem_mlp/hmn_jax.py supports block_type in ('single_attn', 'attn_mlp'), got {block_type!r}"
         self.n_special = V - 256
         data_init = nnx.initializers.normal(stddev=0.02)
         special_init = nnx.initializers.normal(stddev=0.05)
@@ -897,10 +979,18 @@ class HMNModel(nnx.Module):
             d_head = d // n_heads
             freqs = yarn_freqs(d_head, L_train=L_train, L_max=L_max) if yarn else rope_freqs(d_head)
 
-        blocks = [
-            SingleAttnBlock(d, n_heads, rope=rope, freqs=freqs, null_kv=null_kv, rmsnorm=rmsnorm, rngs=rngs)
-            for _ in range(n_layers)
-        ]
+        if block_type == 'attn_mlp':
+            assert d_ff > 0, "block_type='attn_mlp' requires hp['d_ff'] > 0"
+            blocks = [
+                AttnMlpBlock(d, n_heads, d_ff, rope=rope, freqs=freqs, null_kv=null_kv,
+                             rmsnorm=rmsnorm, gated_ffn=gated_ffn, rngs=rngs)
+                for _ in range(n_layers)
+            ]
+        else:
+            blocks = [
+                SingleAttnBlock(d, n_heads, rope=rope, freqs=freqs, null_kv=null_kv, rmsnorm=rmsnorm, rngs=rngs)
+                for _ in range(n_layers)
+            ]
         # nnx.List (strict data/static pytree typing for a plain list attribute) was
         # added in a flax version newer than what's installable on some TPU VMs stuck
         # on Python 3.10 (flax>=0.11 requires Python 3.11+; verified directly on tpu2,
@@ -979,11 +1069,15 @@ class HMNModel(nnx.Module):
 
 def build_model(hp: dict, rngs: nnx.Rngs) -> HMNModel:
     """Factory mirroring kvmem.hmn.build_model(hp, device) -> HMNModel's own
-    signature/defaults, restricted to this file's single_attn-only scope."""
-    assert hp.get('block_type', 'single_attn') == 'single_attn', \
-        'kvmem/hmn_jax.py only ports block_type=single_attn — see module docstring'
+    signature/defaults. THIS FORK: block_type in ('single_attn', 'attn_mlp')
+    both allowed (the original kvmem/hmn_jax.py hard-asserts single_attn only)
+    — 'attn_mlp' requires hp['d_ff'] (typically 4*d, matching kvmem.hmn's own
+    FFN convention; not defaulted here since silently picking a value would
+    hide a capacity choice that's the whole point of this fork's ablation)."""
     return HMNModel(
         V=hp.get('V', 271), d=hp['d'], n_layers=hp['n_layers'], n_heads=hp['n_heads'],
+        block_type=hp.get('block_type', 'single_attn'), d_ff=hp.get('d_ff', 0),
+        gated_ffn=hp.get('gated_ffn', False),
         rope=hp.get('rope', False), yarn=hp.get('yarn', False),
         L_train=hp.get('L_train', hp.get('seg_len', 512)),
         L_max=hp.get('L_max', hp.get('seg_len', 512) * 8),
@@ -1022,26 +1116,56 @@ def _build_trajectory(hp: dict, entry: dict, stage_chunk_len: int, enc_hops: int
     is the full deterministic window (no dropout — used for eval/decode
     and as the training default), and `pos_mask` is additionally kept on
     the returned dict so `train_jax` can rebuild a fresh, stochastically
-    hop-dropped mask each step when `hop_drop_prob > 0`."""
+    hop-dropped mask each step when `hop_drop_prob > 0`.
+
+    THIS FORK (2026-09-06): `n_refine>0` (a trailing `R<n>` DSL token) is
+    now supported — one 'Q' op, optionally followed by `n_refine` refine
+    rounds, all sharing `op_idx=0` (still no `batch`/`stream`/multi-op
+    support — that restriction is unchanged). Returns two extra keys used
+    only when `n_refine>0`: `loss_terms` (a flat list of `(logit_start,
+    target_start, length)` int triples — one term per NLL contribution,
+    mirroring `kvmem.hmn.train()`'s own flat `nlls` list: every rec_block's
+    own `w0:c1` answer half, PLUS, for every refine round, its `wa`
+    self-correct-warmup term and its `am` argmax-feedback term, see
+    `_make_train_step_refine`'s own docstring for why `am`'s term starts
+    its logit slice at `opf0` rather than `opf0-1`) and `refine_fills` (a
+    list of `(am0, am1, argmax_src_c0, out_len)` int tuples — where to
+    write pass-1's own argmax predictions before pass 2, JAX port of
+    `kvmem.hmn._fill_argmax_fb`)."""
     ops, n_refine, _repeat_batch, dsl_chunk_len, dsl_warmup_len = parse_traj_dsl(entry['dsl'])
-    assert n_refine == 0, 'kvmem/hmn_jax.py train_jax does not support refine rounds (R token)'
     chunk_len = dsl_chunk_len if dsl_chunk_len is not None else stage_chunk_len
     warmup_len = dsl_warmup_len if dsl_warmup_len is not None else hp['warmup_len']
     built = chunk_positions_traj(chunk_len, hp['state_len'], warmup_len, ops,
-                                 n_refine=0, state_vocab_size=hp['state_vocab_size'])
+                                 n_refine=n_refine, state_vocab_size=hp['state_vocab_size'])
     pos_content = built['pos_content']
     if enc_hops is None:
         enc_hops = hp.get('enc_hops', -1)
     mask_np = chunk_mask_fb_traj(built['pos_mask'], hops=-1, enc_hops=enc_hops)
     rec_blocks = pos_content['rec_blocks']
-    assert len(rec_blocks) == 1 and rec_blocks[0]['type'] == 'initial', \
-        'kvmem/hmn_jax.py train_jax only supports one Q per entry (batch/stream/etc. not ported)'
+    assert len(rec_blocks) == n_refine + 1 and rec_blocks[0]['type'] == 'initial' \
+        and all(rb['type'] == 'refine' for rb in rec_blocks[1:]), \
+        'kvmem_mlp/hmn_jax.py train_jax only supports one Q per entry, optionally with refine ' \
+        'rounds (batch/stream/etc. still not ported)'
+    if n_refine > 0:
+        assert not hp.get('bucket_lengths', False) and hp.get('forward_granularity') is None, \
+            'refine rounds are not yet compatible with bucket_lengths/forward_granularity'
     rb = rec_blocks[0]
+    loss_terms = []
+    refine_fills = []
+    for r in rec_blocks:
+        loss_terms.append((r['w0'] - 1, r['w0'], r['c1'] - r['w0']))
+        if r['type'] == 'refine':
+            loss_terms.append((r['wa0'] - 1, r['wa0'], r['wa1'] - r['wa0']))
+            out_len_r = r['am1'] - r['am0']
+            loss_terms.append((r['opf0'], r['gt_c0'], out_len_r))
+            refine_fills.append((r['am0'], r['am1'], r['argmax_src_c0'], r['out_len']))
+    last_rb = rec_blocks[-1]
     return dict(pos_content=pos_content, pos_mask=built['pos_mask'], tags=built['tags'],
                mask=jnp.asarray(mask_np), enc_hops=enc_hops,
                L=built['L'], chunk_len=chunk_len, weight=entry['weight'],
-               w0=rb['w0'], c1=rb['c1'], dsl=entry['dsl'],
-               n_chunks=len(pos_content['enc_blocks']))
+               w0=rb['w0'], c1=last_rb['c1'], dsl=entry['dsl'],
+               n_chunks=len(pos_content['enc_blocks']),
+               n_refine=n_refine, loss_terms=loss_terms, refine_fills=refine_fills)
 
 
 # ---------------------------------------------------------------------------
@@ -1233,13 +1357,24 @@ def make_test_sequences(seg_len: int) -> dict[str, list[int]]:
 
 def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int,
                         mask_np: np.ndarray, pos_content: dict,
-                        tags: list[tuple[int, int]]) -> dict:
+                        tags: list[tuple[int, int]], return_bytes: bool = False) -> dict:
     """JAX port of kvmem.hmn.ar_decode_traj_nokv (full-recompute, no KV
-    cache — matches that function's own eval usage inside `train()`, so this
-    is what `train_jax`'s own periodic eval uses too, for direct parity).
-    Restricted to a single non-refine 'initial' rec_block (see module
-    docstring) — the noop/refine machinery in the PyTorch original is not
-    reachable via `_build_trajectory`'s own assertion, so it's not ported.
+    cache). Originally restricted to a single non-refine 'initial' rec_block
+    (see module docstring); THIS FORK (2026-09-06) extends it to walk
+    through `n_refine>0` refine rounds too — same real-argmax-feedback
+    mechanism as `kvmem.hmn.ar_decode_traj_nokv`'s own refine handling
+    (`_decode_segment` for the previous round already wrote its own greedy
+    predictions into `tok[argmax_src_c0:argmax_src_c0+out_len]`, so feeding
+    that into `am0:am1` here is genuinely "the model's own prior guess," no
+    separate argmax-fill step needed the way training's two-pass mechanism
+    requires — see `_make_train_step_refine`). `return_bytes=True` (used by
+    `log_qualitative_eyeball`) additionally returns the LAST round's own
+    `warmup`/`target`/`generated` byte arrays.
+
+    Non-refine (`len(rec_blocks) == 1`) behavior is UNCHANGED from before
+    this extension — verify this by inspection if ever touching this
+    function again, per this project's own "verify masking/decode changes,
+    don't just trust it runs" rule.
 
     Deliberately NOT jitted: `out_len` token-at-a-time, each call's sequence
     length GROWS by one every iteration, so jit would need to either retrace
@@ -1267,28 +1402,52 @@ def ar_decode_traj_nokv(model, chunks_arr, state_len: int, state_vocab_size: int
         tok[tag_pos] = tag_ids
 
     rec_blocks = pos_content['rec_blocks']
-    assert len(rec_blocks) == 1 and rec_blocks[0]['type'] == 'initial', \
-        'kvmem/hmn_jax.py ar_decode_traj_nokv only supports one non-refine Q per entry'
-    rb = rec_blocks[0]
-    span_s, span_e = rb['span']
-    gt_span = np.concatenate(chunks_list[span_s:span_e])
-    ws = rb.get('warmup_start', 0)
-    warmup_src = gt_span[ws:ws + wl]
-    if wl > 0:
-        tok[rb['w0']:rb['w1']] = warmup_src
+    assert rec_blocks[0]['type'] == 'initial' and all(rb['type'] == 'refine' for rb in rec_blocks[1:]), \
+        'kvmem_mlp/hmn_jax.py ar_decode_traj_nokv only supports one Q per entry, optionally with refine rounds'
 
-    for j in range(rb['out_len']):
-        pos = rb['c0'] + j
-        t = jnp.asarray(tok[:pos], dtype=jnp.int32)[None, :]
-        m = jnp.asarray(mask_np[:pos, :pos])
-        logits = model(t, m)
-        tok[pos] = int(jnp.argmax(logits[0, -1]))
+    turn_match_pcts = []
+    last_warmup = last_target = last_gen = None
+    for rb in rec_blocks:
+        span_s, span_e = rb['span']
+        gt_span = np.concatenate(chunks_list[span_s:span_e])
+        ws = rb.get('warmup_start', 0)
+        warmup_src = gt_span[ws:ws + wl]
 
-    out_len = rb['out_len']
-    rb_target = gt_span[ws + wl:ws + wl + out_len]
-    rb_gen = tok[rb['c0']:rb['c1']]
-    match_pct = 100.0 * float(np.sum(rb_gen[:len(rb_target)] == rb_target)) / max(len(rb_target), 1)
-    return dict(match_pct=match_pct)
+        if rb['type'] == 'refine':
+            # Real argmax feedback — the previous round's own greedy decode
+            # already wrote its predictions into tok[argmax_src_c0:...], so
+            # this is genuinely "feed the model its own prior guess."
+            if wl > 0:
+                tok[rb['wa0']:rb['wa1']] = warmup_src
+            tok[rb['opf0']] = HMN_OP_FEEDBACK
+            src_c0 = rb['argmax_src_c0']
+            tok[rb['am0']:rb['am1']] = tok[src_c0:src_c0 + rb['out_len']]
+            tok[rb['fsl0']:rb['fsl1']] = sids
+
+        if wl > 0:
+            tok[rb['w0']:rb['w1']] = warmup_src
+
+        for j in range(rb['out_len']):
+            pos = rb['c0'] + j
+            t = jnp.asarray(tok[:pos], dtype=jnp.int32)[None, :]
+            m = jnp.asarray(mask_np[:pos, :pos])
+            logits = model(t, m)
+            tok[pos] = int(jnp.argmax(logits[0, -1]))
+
+        if rb.get('sl0') is not None:  # mandatory post-response commit STATE unless the last round
+            tok[rb['sl0']] = HMN_OP_UPDATE
+            tok[rb['sl0'] + 1:rb['sl1']] = sids
+
+        out_len = rb['out_len']
+        rb_target = gt_span[ws + wl:ws + wl + out_len]
+        rb_gen = tok[rb['c0']:rb['c1']]
+        turn_match_pcts.append(100.0 * float(np.sum(rb_gen[:len(rb_target)] == rb_target)) / max(len(rb_target), 1))
+        last_warmup, last_target, last_gen = warmup_src, rb_target, rb_gen
+
+    result = dict(match_pct=sum(turn_match_pcts) / len(turn_match_pcts), turn_match_pcts=turn_match_pcts)
+    if return_bytes:
+        result.update(warmup=last_warmup, target=last_target, generated=last_gen)
+    return result
 
 
 def ar_decode_traj_kv(model, chunks_arr, state_len: int, state_vocab_size: int,
@@ -1550,9 +1709,17 @@ def log_qualitative_eyeball(model, trajectories: list[dict], hp: dict, _log,
             continue
         seq_bytes = val_seqs[seq_name]
         chunks_list = [seq_bytes[k * t['chunk_len']:(k + 1) * t['chunk_len']] for k in range(t['n_chunks'])]
-        r = ar_decode_traj_kv_jit(model, np.array(chunks_list), hp['state_len'],
-                                  hp['state_vocab_size'], np.asarray(t['mask']),
-                                  t['pos_content'], t['tags'], return_bytes=True)
+        if t.get('n_refine', 0) > 0:
+            # THIS FORK: no fast KV-jit path for refine rounds yet — the slower
+            # full-recompute decoder (still correct, just O(out_len*L^2)) is fine
+            # here since the eyeball only runs a handful of times per stage.
+            r = ar_decode_traj_nokv(model, np.array(chunks_list), hp['state_len'],
+                                    hp['state_vocab_size'], np.asarray(t['mask']),
+                                    t['pos_content'], t['tags'], return_bytes=True)
+        else:
+            r = ar_decode_traj_kv_jit(model, np.array(chunks_list), hp['state_len'],
+                                      hp['state_vocab_size'], np.asarray(t['mask']),
+                                      t['pos_content'], t['tags'], return_bytes=True)
         warmup, target, gen = r['warmup'], r['target'], r['generated']
         diff = ''.join('.' if a == b else '^' for a, b in zip(gen[:len(target)], target))
         _log(f'\n--- {t["dsl"]}  match={r["match_pct"]:.1f}% ---')
@@ -1906,6 +2073,62 @@ def train_jax(hp: dict, log_base: str = 'logs'):
             return loss
         return step
 
+    def _make_train_step_refine(loss_terms: list[tuple[int, int, int]],
+                                refine_fills: list[tuple[int, int, int, int]],
+                                update_takes_model: bool):
+        """THIS FORK — two-pass argmax-feedback training step for `n_refine>0`
+        trajectories, JAX port of `kvmem.hmn.train()`'s own pass-1 (no-grad)
+        forward -> `_fill_argmax_fb` -> pass-2 (grad) forward loop, folded
+        into ONE `nnx.jit`'d function rather than two separate Python-level
+        calls: pass 1's forward sits OUTSIDE `loss_fn`, so `nnx.value_and_
+        grad(loss_fn)` never differentiates through it — and `jnp.argmax`'s
+        non-differentiable integer output would sever any such path
+        regardless, so the `jax.lax.stop_gradient` below is belt-and-
+        suspenders, not load-bearing.
+
+        `loss_terms`: flat list of `(logit_start, target_start, length)` —
+        one term per NLL contribution (every rec_block's own `w0:c1`, plus
+        each refine round's `wa`/`am` terms), equal-weighted via a plain
+        mean over ALL terms — matches `kvmem.hmn.train()`'s own
+        `torch.stack(nlls).mean()` (flat, not per-round). The `am` term's
+        `logit_start` is deliberately `opf0` (not `opf0-1`, unlike every
+        other term here) — mirrors `kvmem.hmn.train()`'s own `logits[:,
+        opf0:am1-1]` slice exactly: `opf0`'s own logit (computed while
+        attending to the OP_FEEDBACK marker token itself, before even the
+        fed-back guess) predicts the FIRST target byte, not `opf0-1`'s.
+
+        `refine_fills`: list of `(am0, am1, argmax_src_c0, out_len)` — where
+        to write pass-1's own greedy argmax over `logits1[argmax_src_c0-1
+        : argmax_src_c0-1+out_len]` before pass 2 sees it. Both lists are
+        closed over as static Python tuples (matching `_make_train_step`'s
+        own w0/c1-as-Python-constants convention) — one compiled step_fn
+        per trajectory, never shared across trajectories."""
+        @nnx.jit
+        def step(model, optimizer, tokens, mask):
+            logits1 = jax.lax.stop_gradient(model(tokens, mask))
+            tokens_fed = tokens
+            for am0, am1, src_c0, out_len in refine_fills:
+                am_vals = jnp.argmax(logits1[:, src_c0 - 1:src_c0 - 1 + out_len], axis=-1)
+                tokens_fed = jax.lax.dynamic_update_slice_in_dim(
+                    tokens_fed, am_vals.astype(tokens.dtype), am0, axis=1)
+
+            def loss_fn(model):
+                logits2 = model(tokens_fed, mask)
+                terms = []
+                for logit_start, target_start, length in loss_terms:
+                    lp = jax.nn.log_softmax(logits2[:, logit_start:logit_start + length], axis=-1)
+                    tgt = tokens_fed[:, target_start:target_start + length]
+                    nll = -jnp.take_along_axis(lp, tgt[..., None], axis=-1).squeeze(-1)
+                    terms.append(jnp.mean(nll))
+                return jnp.mean(jnp.stack(terms))
+            loss, grads = nnx.value_and_grad(loss_fn)(model)
+            if update_takes_model:
+                optimizer.update(model, grads)
+            else:
+                optimizer.update(grads)
+            return loss
+        return step
+
     def _make_train_step_bucket(w0: int, Lb: int, update_takes_model: bool):
         """Bucketed counterpart to `_make_train_step` — ONE jit-compiled step
         function SHARED across every trajectory assigned to bucket ceiling
@@ -2123,7 +2346,11 @@ def train_jax(hp: dict, log_base: str = 'logs'):
                     f'mean_real_L={mean_L:.0f}  waste={waste:.1f}%')
         else:
             for traj in trajectories:
-                traj['step_fn'] = _make_train_step(traj['w0'], traj['c1'], _update_takes_model)
+                if traj.get('n_refine', 0) > 0:
+                    traj['step_fn'] = _make_train_step_refine(
+                        traj['loss_terms'], traj['refine_fills'], _update_takes_model)
+                else:
+                    traj['step_fn'] = _make_train_step(traj['w0'], traj['c1'], _update_takes_model)
 
         if data_parallel:
             # Replicate every non-batch (no leading B dim) trajectory array across the
@@ -2268,9 +2495,17 @@ def train_jax(hp: dict, log_base: str = 'logs'):
                     for seq_bytes in val_seqs.values():
                         chunks_list = [seq_bytes[k * t['chunk_len']:(k + 1) * t['chunk_len']]
                                       for k in range(t['n_chunks'])]
-                        r = ar_decode_traj_kv_jit(model, np.array(chunks_list), hp['state_len'],
-                                                  hp['state_vocab_size'], np.asarray(t['mask']),
-                                                  t['pos_content'], t['tags'])
+                        if t.get('n_refine', 0) > 0:
+                            # THIS FORK: refine trajectories use the slower full-recompute
+                            # decoder (no fast KV-jit path for refine yet) — correct, just
+                            # more expensive; fine at this eval cadence.
+                            r = ar_decode_traj_nokv(model, np.array(chunks_list), hp['state_len'],
+                                                    hp['state_vocab_size'], np.asarray(t['mask']),
+                                                    t['pos_content'], t['tags'])
+                        else:
+                            r = ar_decode_traj_kv_jit(model, np.array(chunks_list), hp['state_len'],
+                                                      hp['state_vocab_size'], np.asarray(t['mask']),
+                                                      t['pos_content'], t['tags'])
                         pcts.append(r['match_pct'])
                     t['last_decode_s'] = time.time() - _traj_decode_t0
                     m_ = sum(pcts) / len(pcts)
@@ -2417,4 +2652,6 @@ if __name__ == '__main__':
         _sanity_check()
     else:
         hp = load_config(args.config)
-        train_jax(hp)
+        # THIS FORK: logs go under kvmem_jax/logs, never kvmem/logs — keeps
+        # this fork's runs fully separate from the original tree.
+        train_jax(hp, log_base='kvmem_jax/logs')

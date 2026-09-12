@@ -45,70 +45,15 @@ Fast-weight language model — HashMemNet (HMN). **Current focus: `kvmem/hmn.py`
 
 **Cross-chain-step relay (`hop`)**: each chain step after the first gets its own round-0 STATE row a narrow **attention permission** (the relay exception, width controlled by `hops` — see the `hops` semantics entry above) to read the last `hops` preceding chain steps' own last-round STATE directly — resolved entirely by mask permissions within one packed-sequence forward pass, no sequential per-chain-step orchestration. This replaced the original `STATE_QUEUE`/`h_inject` design (see "Deleted mechanisms" below), which forced a `.detach()`'d feature-vector copy instead of a learned attention path. The nochain blackout (nothing in the mask lets one chain step attend directly into another's raw content) still holds — the relay exception is the *only* sanctioned cross-chain-step channel, scoped to the STATE row alone (never warmup/response rows). At `hops>=1` this is also the ONLY channel period (encoding-pass access is blocked for chain steps past the first); at `hops=-1` (default) it's additive on top of permanent encoding-pass access.
 
-**Deleted mechanisms**: the original `STATE_QUEUE`/`h_inject` relay (`chunk_positions_chained`, `HMNModel.forward`'s `h_inject` param, `train()`'s `chain=True` sequential per-chain-step training loop) was deleted after `hop` (the attention-permission alternative) was shown to massively outperform it — see "Results" below. `kvmem/configs/hmn_stage1_round0_chained.py` (the deleted mechanism's config) has also been removed — nothing in the codebase can execute a `chain=True` stage anymore.
+**Deleted mechanisms**: the original `STATE_QUEUE`/`h_inject` relay (`chunk_positions_chained`, `HMNModel.forward`'s `h_inject` param, `train()`'s `chain=True` sequential per-chain-step training loop) was deleted after `hop` (the attention-permission alternative) was shown to massively outperform it — see [`docs/RESULTS_LOG.md`](docs/RESULTS_LOG.md). `kvmem/configs/hmn_stage1_round0_chained.py` (the deleted mechanism's config) has also been removed — nothing in the codebase can execute a `chain=True` stage anymore.
 
 ---
 
 ## Results
 
-- **`chunk_len` ladder** (`kvmem/configs/hmn_single_recall_c64.py` → `hmn_single_recall_c128.py`, single chunk/single STATE, no routing, no relay — `n_chunks=1, chain_steps=[(0,1)]`) — **c64: Done**, 100000/100000 steps, trained from scratch, val MEAN=100.0%, loss=0.012 (converged by step ~60000). **c128: Done**, warm-started from c64's checkpoint, 100000/100000 steps, val MEAN plateaued at 47.5% (best checkpoint 52.5%), loss=0.759. **Do not read this as a proven `state_len=8` capacity ceiling** — train loss was still declining at the very end (0.804 at step 90000 → 0.759 at step 100000, noisy but not flat) while `lr` had already annealed to ~1e-6 (`cosine_T0=100000` matches `n_steps`, so the schedule gave it no room to keep pushing) — the likelier read is **undertrained**, not capacity-limited. A longer schedule (larger `n_steps`/`cosine_T0`) at the same `chunk_len=128` is the natural next step before concluding anything about capacity at this `state_len`.
-- **`repeat_batch=4` ablation on `hmn_single_recall_c64.py`** (`kvmem/configs/hmn_single_recall_c64_repeat4.py`, otherwise identical to the c64 baseline above) — **Done, negative result**: reached the same val MEAN=100.0% ceiling, but first hit it at step **80000** vs. the baseline's step **60000** — slower by 20000 steps, not faster. Unlike the `weave_mix_accum_rnn` case below (where the baseline was genuinely underfitting/plateaued and `repeat_batch=8` fixed it), `hmn_single_recall_c64` was already converging cleanly with no plateau — there was no underfitting problem to fix, so `repeat_batch>1` here just means fewer distinct random sequences seen per wall-clock step, a pure cost with no offsetting benefit. **Takeaway: `repeat_batch` is not a universal win** — helps when training is stuck/underfitting, neutral-to-harmful when it isn't.
-- **`hmn_routing_4to1_state.py` (`solo`) — archived.** No checkpoint for it exists on disk (it was never actually (re)trained under the current vocab in this working tree — the numbers below are preserved from before, not reproducible from a file on disk today). `hmn_recall_queue.py` (`hop`), `hmn_weave_mix.py`, and `hmn_weave_mix_accum_rnn.py` have all been repointed to warm-start from `hmn_single_recall_c64.py`'s checkpoint instead (same architecture — `d`/`n_layers`/`n_heads`/`state_len`/`V` unchanged, only `n_chunks`/schedule differ, so weights transfer directly) — see `docs/HMN_WALKTHROUGH.md` for the current pipeline. The `solo`/`hop`/`weave_mix` numbers below describe what those stages measured under the OLD `hmn_routing_4to1_state` warm-start and are historical record, not reproducible as-is from the configs on disk now.
-- **`solo`** (`kvmem/configs/hmn_routing_4to1_state.py`, renamed from `hmn_single_recall.py` — the recall STATE routes across all n_chunks encoding STATEs simultaneously via attention, verified zero-blocked in the mask; matches the `hops=-1` default's own unbounded/routing behavior, since a single chain step has no predecessor to relay from either way) — one chain step, round 0 only, no relay. **Done**: 160000/160000 steps, val per-span MEAN=94.4% (best 97.2% at step 150000), test=100%, loss=0.017 — matches the historical ~100% single-window initial-round ceiling.
-- **`relay`** (config file and logs both deleted — the now-removed `STATE_QUEUE`/`h_inject` mechanism) — three chain steps (`[(0,2),(1,3),(2,4)]`), warm-started from `solo`. **Done, everything removed** (old vocab, superseded mechanism). Final numbers (preserved here since the run itself is gone): val MEAN=45.8% (STITCHED=44.6%), test MEAN=48.6% (STITCHED=44.6%). Chain step 2 (the 2-hop case) closed at 12.5%/12.5%, never exceeding its step-90000 peak of 11.1%/25.0% across the final 70000 steps despite loss continuing to decline (1.448→1.051). Motivated `hop`.
-- **`hop`** (`kvmem/configs/hmn_recall_queue.py`, the attention-permission relay) — identical hyperparameters/schedule to `relay`, warm-started from `solo`. **Done, run twice, with a real discrepancy between the two runs** (see below) — the checkpoint currently on disk is from the SECOND run, weaker than what the recovery-probe result below was measured against.
-  - **First run** (logs since deleted, old vocab): val = 100.0%/95.8%/72.2% (STITCHED=88.1%), test = 100.0%/95.8%/70.8% (STITCHED=85.7%), loss=0.603, best checkpoint 88.7%. Massively outperformed `relay` on every metric (chain step 2 test 70.8% vs relay's 12.5%, 5.7x) — strong evidence the gradient-flow fix (full backprop vs. `.detach()`-truncated copy) matters. This is the run the recovery-probe result immediately below was measured against.
-  - **Second run** (current checkpoint, post vocab-reorder — same config, warm-started from the reordered-vocab `solo`): val/test STITCHED=71.4%/71.4%, loss=1.851 — substantially worse, loss plateaued flat around 1.84-1.86 from step 50000 onward, never broke out like the first run did. Mask/relay mechanism independently verified correct in both runs (byte-identical mask regardless of vocab ID relabeling); the discrepancy is attributed to warm-start sensitivity, not a code defect — two `solo` checkpoints can both hit ~100% on solo's own near-trivial task while differing enough in underlying weight configuration to matter for `hop`'s much harder relay-learning objective. Re-running `hop` is not guaranteed to reproduce either result exactly.
-- **`accum_rnn` masking fix** (`kvmem/hmn.py`, 2026-07-15 — see the `hops` semantics entry above for the full mechanism) — closed a real gap found by direct mask inspection of `hop`: every chain step had PERMANENT, unblocked attention access to all n_chunks encoding-pass STATEs regardless of chain step (verified: chain step 2 showed 0/64 blocked against every one of the 4 encoding STATEs), so the relay exception was layered on top of that, never the only channel — `hop` could always bypass the relay and re-derive an answer straight from the encoding pass. `hops=1` now automatically forces genuine `state_t=f(state_{t-1},query_t)` recurrence (no separate flag). Since `hmn_recall_queue.py` already sets `hops=1`, it now exercises this corrected masking with no config change — its already-measured results above were produced under the OLD leaky version and are not guaranteed to reproduce. **`hmn_weave_mix_accum_rnn.py`** (new, `hops=1` explicit — `hmn_weave_mix.py` itself is unaffected, since it never sets `hops` and keeps the `-1`/unbounded default) is the trajectory-generalization counterpart: mirrors `weave_mix`'s test (does forced accumulation generalize across `batch`/`stream`/`interleave_delayed`) but under the corrected masking — **done, see its own entry below** (plateaued/underfit, fixed by the `repeat_batch` ablation immediately following it). If `hmn_recall_queue.py` collapses relative to its previously-measured numbers once re-run, that's direct evidence those numbers were substantially propped up by the encoding-pass bypass rather than genuine relay use.
-- **`hmn_weave_mix_accum_rnn.py`** — **Done**. `hops=1` (forced single-hop recurrence, corrected masking) + `weave_mix` (`batch`/`stream`/`interleave_delayed`), warm-started from `hmn_single_recall_c64`. 160000/160000 steps. Loss and val both **plateaued from step ~50000 onward and never recovered**: loss (10k-step rolling avg) sits flat at 2.57-2.94 for the entire second half of training (no downward trend at all, not just a slow one), val MEAN 42.7-44.8% across steps 60000-160000, final=43.8%, best checkpoint=44.8%. This is a genuine **training-loss plateau** (underfitting), not merely a generalization ceiling.
-- **`repeat_batch` ablation** (`hp['repeat_batch']`, `kvmem/hmn.py` — takes N gradient steps on the same sampled batch before resampling a new one, default 1 = no change from prior behavior; see `kvmem/configs/hmn_weave_mix_accum_rnn_repeat8.py`, identical config to `hmn_weave_mix_accum_rnn.py` above except `repeat_batch=8`) — **fixes the plateau**. Direct comparison (10k-step rolling-avg loss, val MEAN, both configs otherwise identical):
+Full experiment ledger (every run's outcome, chronological) lives in [`docs/RESULTS_LOG.md`](docs/RESULTS_LOG.md) — this section only tracks the current best-known config, not history.
 
-  | step | baseline loss | repeat8 loss | baseline val MEAN | repeat8 val MEAN |
-  |---|---|---|---|---|
-  | 10000 | 3.896 | 4.013 | 34.0% | 27.6% |
-  | 30000 | 3.058 | 3.078 | 40.7% | 36.4% |
-  | 50000 | 2.782 | 3.006 | 41.4% | 45.8% |
-  | 60000 | 2.775 | **2.660** | 41.4% | **50.2%** |
-  | 70000 | 2.842 | **2.360** | 43.8% | **52.2%** |
-  | 80000 | 2.872 | **2.434** | 43.4% | **53.7%** |
-  | 90000 | 2.935 | **2.499** | 42.7% | **53.2%** |
-  | 100000 | 2.707 | **2.374** | 42.9% | 50.6% |
-
-  `repeat_batch=8` starts *behind* the baseline through step ~40000 (fewer distinct batches seen per wall-clock step), crosses over decisively at step 50000, and from step 60000 onward has BOTH a lower (still-declining) loss AND 6-10pp higher val MEAN than the baseline ever reached at any step in its 160000-step run — the baseline's own peak val (44.8% best checkpoint) is beaten by repeat8's step-60000 checkpoint alone, at 3/8 of the training budget. Loss trajectory is the more important signal here: baseline's loss is flat-noisy (no trend) past step 50000 while repeat8's keeps trending down through at least step 100000, i.e. the baseline wasn't failing to generalize from an already-fit training signal — it was failing to fit the training data itself, and taking multiple gradient steps per batch is enough to unstick that.
-
-  **Done** (was "in progress" — finished at step 160000/160000: loss=1.821, val `batch`=50.5%/`stream`=44.9%/`interleave_delayed`=48.1%/MEAN=47.8%, **best checkpoint=53.7%** at step 80000; came down slightly off that peak over the last 60000 steps — 53.7%→53.2%→50.6%→...→47.8% — but never dropped back to baseline's 42.9-44.8% range).
-
-  **Qualitative comparison** (`ar_decode_traj_nokv`, pattern `batch`, seq `up_counter`, generated bytes vs ground truth — script preserved in this session's scratchpad, not checked into the repo): baseline's checkpoint degrades from readable-but-wrong to complete non-printable noise almost immediately —
-  ```
-  op0 (45.8% match): ()*+,-./0Q2S4;VW/YT5\]X_        <- trails off after ~9 correct bytes
-  op1 (0.0% match):  \xd9H(}1-11F\x9d\xcb\xed]...     <- complete non-printable garbage
-  op2 (0.0% match):  ()*+\xd1-./6#\xce_&\xfe...        <- complete non-printable garbage
-  ```
-  repeat8's best checkpoint (53.7%) is qualitatively different in kind, not just degree — `stream` op0 hits 100.0% EXACT match; `interleave_delayed` op0 hits 70.8% (`HIJKLMNO` — 8 exact bytes before diverging); `batch` op2 (the 2-hop case) goes from 0.0%/pure-noise to 25-29% with genuinely plausible printable characters mixed into the wrong bytes, instead of uniform escape sequences. The one op that stays weak in every pattern is **op1** (the 1-hop relay case specifically) — 4.2-8.3% match, still mostly non-printable — a real, specific remaining gap, not a uniform improvement across the board.
-- **`hmn_stitch_src1024.py` — REDESIGNED, multi-hop relay-chain version abandoned before completing a full run.** Original attempt: src=1024 (`chunk_len=64, n_chunks=16`), true-continuous-decode via a CHAIN of ~30-126 relay hops (`chunk_positions_stitch`/`make_batch_stitch`/`ar_decode_stitch`, all new code in `kvmem/hmn.py`). Got as far as a working, verified pipeline (two real bugs found and fixed via smoke testing: (1) the original "_nokv" full-recompute decode OOM'd on MPS during eval at L~4900, fixed by making it genuinely KV-cached like `ar_decode_iq_global_rw_tagged`, byte-identical to a brute-force reference; (2) an off-by-one in KV-cache bookkeeping, the `</response>` closing tag's own token was never cached, fixed by explicitly caching that position too) and a real memory/speed fix (`segment_checkpoint` hp flag — TIME-axis/segment gradient checkpointing via `torch.utils.checkpoint.checkpoint`, separate from `HMNModel`'s own model-depth `grad_checkpoint`, verified mathematically equivalent to the non-checkpointed path — combined with `B=2, forward_granularity=0.125-0.25` this got a 100-step smoke test through cleanly at 1.4-4 it/s on an 8GB-RAM machine that had OOM'd at more aggressive settings). Launched twice (once killed by an apparent machine reboot at step 199, restarted) but abandoned before completing any real training — decided the whole multi-hop-chain design was more complex and expensive than needed for the actual question being asked.
-  - **New design** (current): no relay chain at all. Encode n_chunks chunks, then a SINGLE query recalling the SUFFIX of the source — warmup anchors partway through (8 ground-truth bytes), response must generate everything after that anchor through the true end, whatever length that is. New `traj_suffix` trajectory constructor (`kvmem/hmn.py`, registered in the `weave_mix` dispatch as `pattern='suffix'`) builds this as `Q(n_chunks-window_chunks, n_chunks)` — `window_chunks` here means "how many chunks back from the end the anchor sits," not a sliding window; enforced `>=2` so there's always a non-trivial response (the degenerate "warmup right at the end" case is excluded by construction). Since there's only ever one query (`op_idx=0`, always exempt from the `hops`-bounded relay restriction), none of `hops`/`forward_granularity`/`segment_checkpoint` are needed — a plain dense forward pass, and `L` is dramatically smaller (1452 at n_chunks=16 vs. 2800-4900 for the abandoned chain versions).
-  - **Curriculum**: 3 stages in one run (continuing the same model/optimizer) ramping `n_chunks` up — {2,4} → {2,4,8} → {2,4,8,16} — each stage additionally mixing several `window_chunks` values so the warmup anchor lands at varying distances from the end (the practical stand-in for "warmup from any byte index," since each distinct shape needs its own fixed packed-sequence layout). Warm-started from `hmn_weave_c64`'s checkpoint (chunk_len=64-matched, see that config's own docstring).
-  - **Extrapolation check planned** (held out from training entirely): evaluate at n_chunks=24/32, sizes never seen during training (capped at 16), using the existing generic `ar_decode_traj_nokv` — verified directly (offline, tiny CPU model) that all planned training shapes AND both extrapolation sizes build/forward/decode correctly before trusting this design, per this file's own "verify before trusting mid-run" rule.
-- **Chain-memory recovery probe** (`eval_weave.py --patterns repeat_query`, run against `hop`'s FIRST-run checkpoint, since deleted) — **failed cleanly**. Query span (0,2)→(1,3)→(2,4)→re-query (0,2): first occurrence 100% (trivial), repeated occurrence (reachable only through the accumulated 3-hop relay chain, since direct attention back to chunk 0/1 is blocked) **0.0% across all 3 test sequences** — complete, not partial, failure. Caveat: `repeat_query` is a trajectory shape `hop` was never trained on (only the fixed 3-query schedule), so this could reflect either "the relay doesn't preserve information across 3 hops" or "the model can't generalize to this novel trajectory shape at all" — the total (not gradual) failure leans toward the latter, but this test alone can't cleanly separate the two. `long_hop_recovery` (n_chunks=8) scored near-zero including first occurrences — the known length-extrapolation confound (trained at L=236), not an additional signal. This motivated `weave_mix` (below) — re-running the probe against a `weave_mix`-trained checkpoint is the direct follow-up test.
-- **Vocab reorder** — mechanism verified correct (mask byte-identical regardless of vocab ID relabeling, batch construction confirmed correct under the new IDs). Chat tags now occupy IDs 256-261 (fixed, small), STATE occupies the tail from 262 (pure append-growth). Old-vocab logs/checkpoints (original `solo`/`relay`/`hop`) have been deleted, and the `_vreorder`-suffixed configs/logs were renamed to drop that suffix now that the reordered vocab is simply *the* vocab (no more old-vocab comparison to distinguish against) — `kvmem/configs/hmn_routing_4to1_state.py` (renamed from `hmn_single_recall.py`) and `hmn_recall_queue.py` (renamed from `hmn_flow.py`) are now the reordered-vocab versions. See the `hop` entry above for the reproducibility-check numbers themselves (kept there, not duplicated here).
-- **`squeeze`** (`kvmem/configs/hmn_squeeze_markov_n4.py` + `hmn_squeeze_random_n4.py`) — **not currently running; earlier partial progress (paused at step 17998/60000) deleted** as stale/low-value (superseded by the sweet-spot pair below, see `nominal_capacity_accounting`) — both configs are queued from scratch if resumed. Dedicated compression-capacity test (Markov-structured vs. random-byte paired control) at `chunk_len=96, state_len=8, d=64` — nominal capacity headroom is large (KV-cache view 682.7x the true content), so this pair alone doesn't force genuine compression, only demonstrates it's tractable. Switched from `data_kind='ca'` to `data_kind='markov'` (the earlier `hmn_squeeze_ca_n4.py`, never trained, is superseded/deleted) — `gen_ca`'s `target_bits` calibration is zlib measure-and-search (seed-dependent, imprecise); `gen_markov`'s is an exact closed-form bisection against the true entropy rate. See `docs/HISTORY.md` §10 for the full design rationale, including the `chunk_len` capacity-pressure correction.
-- **`squeeze` sweet-spot pair** (`kvmem/configs/hmn_squeeze_sweetspot_n4.py` + `hmn_squeeze_sanity_bigmodel_n4.py`) — deliberately sized so success is neither trivial (STATE smaller than the raw file, ruling out byte-for-byte copying) nor information-theoretically impossible (STATE still bigger than the data's true Shannon content), the only window where a result actually means something (see `nominal_capacity_accounting`). `hmn_squeeze_sweetspot_n4.py` (`chunk_len=1024, state_len=2, d=8, n_layers=4`, 5,304 params, KV-cache/true-content ratio=2.0x, KV-cache/raw ratio=0.5x — genuinely can't trivial-copy) — **queued, not yet run** (~7.0 hrs measured for 60000 steps). `hmn_squeeze_sanity_bigmodel_n4.py` (same dataset, `state_len=8, d=8, n_layers=4`, 128x more nominal headroom — a pure "does recall even work at this chunk_len/L~2000 sequence length at all, independent of any capacity question" reference ceiling) — **not currently running; earlier minimal progress (stopped step 5999/60000, near-random loss=5.541) deleted** as stale — queued from scratch if resumed.
-- **`weave_mix`** (`kvmem/configs/hmn_weave_mix.py`) — **Done**. Uniform mix of `batch`/`stream`/`interleave_delayed`, 160000/160000 steps, warm-started from `solo`'s checkpoint (NOT `hop`'s — `hop`'s current checkpoint is the weaker, non-reproduced second run; `solo` has no such ambiguity, see the `hop` entry above). Final: `batch`=63.4%, `stream`=95.8%, `interleave_delayed`=63.9%, MEAN=74.4% (best checkpoint 74.7%). `batch` (byte-shape-identical to what `hop` trained on) landed well below `hop`'s own 88.7% on that shape — since this run had to learn the relay exception AND generalize across trajectory shapes simultaneously (no pre-learned relay to transfer from), that gap suggests a weaker relay, not just weaker generalization.
-  - **Recovery probe re-run** (`eval_weave.py --patterns repeat_query,long_hop_recovery,decay_curve`, against this checkpoint) — **partial, not clean, improvement over `hop`'s 0.0%**: `repeat_query`'s repeated occurrence of span (0,2) after 3 intervening queries now recovers 0.0-4.2% (vs `hop`'s uniform 0.0% across all 3 test sequences), average drop 80.6pp. `decay_curve` shows the same pattern — recovery degrades with hop distance (80.6pp drop @1 hop, 98.6pp @2-4 hops, 94.4pp @8 hops, noisy at the tail). Not a clean confirmation OR refutation of the original hypothesis ("was `repeat_query`'s failure pure generalization gap, since `hop` never trained on varied orderings?") — the weaker relay (from the `solo` warm-start, see above) confounds the result; a cleaner test would warm-start from a strong `hop` checkpoint (would need re-running `hop` first, see its own entry's caveat) so relay-strength and generalization-gap aren't both varying at once.
-- **Positional shortcut in `batch`/`interleave_delayed` — three RoPE-mechanism fixes failed, anchor variation (a completely different attack) succeeded so far.** `kvmem/probe_positional_shortcut.py` found the root cause of `batch`/`interleave_delayed`'s persistent 8-20% ceiling (`hmn_adaptive_trainer.py`'s reweighting couldn't fix it either): the model resolves these two shapes' shared queries via pure attention POSITION, not warmup content (91.1% match to the wrong-but-positionally-usual chunk vs. 0.4% to the chunk whose real bytes were actually given). Three RoPE-mechanism fixes tried under the old tagged design — dual-clock RoPE, `rope_state_scale`, `relpos` — all failed or were abandoned (`docs/HISTORY.md` §12-13); all three are now marked **deprecated** (see `_dual_positions`/`_scaled_state_positions` docstrings, `kvmem/hmn.py`). A live head-to-head under the NEW opcode/no-tags design (`hmn_notags_w25` vs `hmn_notags_w25_rope`, otherwise identical) then found RoPE itself converges dramatically faster/higher than NoPE at every comparable stage/step — reframing the question: maybe RoPE wasn't the problem, and the fix should attack the shortcut a different way instead of changing the position encoding. `hmn_notags_weave_anchor(_rope).py` (`_grid_shapes` sweep of chunk_len x non-zero-biased recall anchors, on top of `hmn_weave_c64.py`'s curriculum) tests exactly that. Both the original behavioral swap test AND a new mechanistic check (attention-mass + gradient-saliency, `kvmem/probe_mechanistic_addressing.py` + `MHAttention.capture_attn`, `kvmem/hmn.py`) confirm content-addressed (not position-addressed) recall at every length where training has converged so far (chunk_len 8/16/32); chunk_len=64 needs more training before it can be tested (the run finished — cl64 plateaued flat all stage, cl8/16/32 kept climbing — undertrained there, not capacity-limited; the cl64 mechanistic question stays open). Full detail: `docs/HISTORY.md` §16.
-- **Refine-round redesign: uniform `[STATE][w][content]` primitive, within-op bottleneck relay, `am` now exposure-bias-trained.** Every round (round-0 and every refine round) now reduces to one repeating shape instead of three visually different ones; the post-response commit-STATE between rounds is now mandatory (not just claimed-by-relay), within-op round transitions are masked exactly like a between-op relay hop (no more free raw lookback across a whole op's history), and the argmax feedback (`am`) is now NLL-scored against the SAME ground truth every response uses (not against its own content) — genuine exposure-bias training. Caught and fixed a real bug during the pass: the `'S'`-claim logic still referenced a field (`end_sl0/end_sl1`) removed by the field-unification, which would have silently broken every claimed refine-relay. Verified via direct mask-matrix inspection plus `train()` smoke tests (single-op multi-round, cross-op relay with refine on both sides, the new loss terms) — no config sets `n_refine>0` yet, so nothing live was disrupted. Full detail: `docs/HISTORY.md` §17.
-- **`hmn_locate_nope_curriculum_dense` — is the architecture or the dataset a limiting factor? Both: no.** `kvmem/probe_signal_propagation.py` (`--mode signal`/`--mode ambiguity`, two real bugs found/fixed in the diagnostic itself before trusting any result — see its own docstring) found no vanishing gradients (grad norm is actually LARGER in early layers, the healthy residual-network pattern), no exploding activations (RMSNorm re-normalizes each block's input regardless of residual-stream growth), and attention genuinely sharpens with training (entropy 0.73-0.90 uniformly at random init vs. 0.30 in layer 1 post-training) — no architectural/signal-propagation ceiling evident. Separately, empirical genuine-ambiguity rate (does the TRUE warmup excerpt's exact bytes recur elsewhere in the same random chunk) is under 0.1% even at the hardest tested `chunk_len=64`/`warmup_len=2` — the `data_kind='random'` training data is not a meaningful limiting factor either; uniform random is close to the best-case distribution for this task (structured/repetitive data would introduce MORE genuine duplicate substrings, not fewer). Full detail: `docs/HISTORY.md` §14.
-- **`kvmem/hmn.py` promoted to the opcode+shared-value-alphabet, no-chat-tags design — STATE-role ambiguity fixed.** Without chat tags, an encode's claim-STATE and a query's own recall-STATE share the same token family — no vocab-level signal distinguishes them, only local order. Fix: one **opcode token** (`update`/`noop`/`feedback`) per STATE emission + a single **shared value alphabet** across all three roles. Separately found the query's own STATE emission is **redundant for the terminal op** (nothing relays from it) but **load-bearing for any non-terminal op** (it's the `h_t=f(h_{t-1},x_t)` transition output itself — masking can't substitute for a value that was never computed). STATE moved to *end-of-turn* (`[warmup][response][STATE]` instead of `[STATE][warmup][response]`), claimed by a trailing `'S'`, omitted for terminal ops. Hand-verified across single-recall/batch/stream/3-query-chain trajectories before writing code; the stream+`hops=1` case reproduces the exact empirical weak spot already on record (`hmn_weave_mix_accum_rnn_repeat8`'s persistent "op1" ceiling) from first principles. **Fully implemented, ported, and promoted**: all four stage-dispatch paths (`weave_mix`/`chunk_positions_traj` native; `chain_steps`/`chunk_positions_hop` now a thin delegating wrapper; the legacy global-window path/`chunk_positions_iq_global_rw_tagged`; `stitch_mix`/`chunk_positions_stitch`) rewritten around one positive `allowed_state` allowlist per op, refine-round support added (`OP_FEEDBACK` placed before the argmax content, fixing a real boundary ambiguity between feedback content and the prior round's response), and two critical bugs caught during pre-promotion verification: (1) the named pattern constructors `traj_batch`/`traj_stream`/`traj_interleave_delayed`/`traj_repeat_query` never inserted a trailing `'S'` between consecutive queries, making every query terminal (no end-of-turn STATE at all) and silently breaking the relay chain for every config using these patterns; (2) `_relay_source` mishandled `'noop'`-type blocks (`KeyError: 'end_sl0'` on `decay_curve`). Both fixed and re-verified via direct mask-matrix inspection (including confirming under `hops=1` that a later query sees ONLY its predecessor's end-of-turn STATE, not the encoding-pass STATEs directly) plus a real end-to-end train+eval smoke test through the actual `weave_mix` dispatch path. `kvmem/hmn.py` was archived to `kvmem/hmn_v4_backup.py` (old tagged design, `V=274`) before promotion, and that backup (along with the earlier `hmn_v1-v3_backup.py` diffing snapshots) has since been deleted as a pure cleanup pass; `kvmem/hmn_notags.py` no longer exists as a separate file either — its content IS `kvmem/hmn.py` now. **Caveat not yet resolved**: every config with `_pretrained_ckpt` set (`hmn_single_recall_c128`, `hmn_weave_c64*`, `hmn_weave_mix*`, `hmn_stitch_src1024`, etc.) warm-starts from a checkpoint trained under the OLD tagged vocab (`V=274`, tags at IDs 256-261) — loading it into the new opcode vocab (`V=271`, opcodes at 256-258) via the existing shape-mismatch-tolerant loader would silently reinterpret old tag-token embeddings as new opcode-token embeddings, which is wrong, not just stale. Do not warm-start any of those configs from pre-promotion checkpoints without addressing this; configs training from scratch (e.g. `hmn_notags_w25`, `hmn_notags_locate` — no `_pretrained_ckpt` key) are unaffected. Full detail: `docs/HISTORY.md` §15.
-- **`hmn_stitch_src1024_anchor` — content-addressing confirmed both behaviorally and mechanistically for the suffix-recall (single-query, `hops=-1`) design, reconfirmed at n_chunks=8; run deliberately stopped after stage1's first eval.** Restarted with a 10x'd schedule (100000/150000/150000 steps), `adaptive=True` (`early_stop_mean=80.0`), `repeat_batch` B4 (stage0)/B8 (stage1-2), warm-started from `hmn_notags_weave_anchor_rope`. **Stage0 (n_chunks in {2,4}) done**: best val MEAN=49.4% (eval1, step 20000), ended at 41.1% (step 100000) — 5 evals across the stage oscillated 38.9-49.4% without a clean monotonic trend (one dip to 38.9% at step 60000, mistaken mid-run for a possible collapse, fully recovered by step 80000 — a transient reweighting wobble, not real degradation). Near-end anchors (short response) consistently hit 83-100%; two entries (`Q(2,4,44,32)`, `Q(0,4,0,64)`) never broke above ~2% match across all 5 evals — the model's stubborn weak spot, unrelated to the addressing mechanism itself (see below). **Stage1 (n_chunks up to 8) eval #1** (step 30000, global step 130000): MEAN=36.1%. Per-entry: `Q(0,2,0,32)`=0.0%, `Q(0,2,88,32)`=58.3%, `Q(0,4,0,64)`=0.2%, `Q(0,4,184,64)`=83.3%, `Q(4,8,0,64)`=5.9%, `Q(4,8,92,64)`=9.0%, `Q(4,8,184,64)`=100.0%, `Q(0,8,0,96)`=1.0%, `Q(0,8,408,96)`=75.0%, `Q(0,8,0,128)`=2.1%, `Q(0,8,376,128)`=62.5% — same near-end-anchor-easy/near-start-anchor-hard pattern as stage0, now replicated at the harder n_chunks=8 shapes too, with no early-stop trigger (36.1% << 80.0%). **Run was then deliberately stopped (`kill 17291`, confirmed exited) per explicit user instruction, right after this eval and the probe re-run below** — not a crash or failure; `stage1_last.pt`/`stage1_best.pt` are the final checkpoints.
-  - **Content-addressing swap test** (`kvmem/probe_stitch_content_addressing.py`) — originally against `stage0_best.pt`/`stage0_end.pt` at n_chunks=4 (4 anchor pairs: 44↔0, 64↔0, 20↔80, 80↔20), **position-match pinned at 0.0-0.8% in every trial** vs. content-match 33.7-79.7%. **Re-run against `stage1_last.pt` at the harder n_chunks=8, window_chunks=4/8 shapes** (matching stage1's own trained entries): low-baseline anchor pairs (0↔92, baseline 0.3-6.0%) were inconclusive (too weak a baseline to read a signal from either way), but the two high-baseline near-end-anchor pairs tested — `184↔92` (window_chunks=4, baseline 90.6%) and `408↔0` (window_chunks=8, baseline 90.6%) — both again showed the same clean pattern: **position-match 1.6% in both, content-match 37.5%/40.6%** — content-addressing reconfirmed at n_chunks=8, not just n_chunks=4.
-  - **Mechanistic confirmation** (`kvmem/probe_stitch_mechanistic_addressing.py`) — against `stage0_end.pt` (n_chunks=4, anchor=44←chunk0 and anchor=88←chunk1): gradient L2 norm 5.9x/10.4x higher on the swap-source STATE, attention mass layers swap-dominant in both — **confirmed**. **Re-run against `stage1_last.pt`** (n_chunks=8, anchor=184←swap-chunk): swap-chunk=0 (far outside the window) was **mixed/inconclusive** (teacher-forced behavioral match 0.0% — this exact cross-distant-chunk construction is highly out-of-distribution for a checkpoint only 1 eval into n_chunks=8 training), but swap-chunk=3 (immediately adjacent to the window, still a genuinely different STATE) gave a clean **CONFIRMED** result: gradient L2 norm 7.7x higher on the swap-source STATE (1.38 vs 0.18), attention mass in the layer carrying the most overall weight (layer 1) swap-dominant. Net read: content-addressing holds mechanistically at n_chunks=8 too, though the far-chunk case shows the mechanism gets harder to probe cleanly (not necessarily weaker) the more novel/OOD the specific swap construction is relative to what's actually been trained so far.
-- **JAX curriculum val-MEAN "collapse" root-caused: not divergence, a positional-shortcut-to-content-addressing trade-off — adaptive reweighting ruled out as the cause.** `hmn_tpu_recall1024_jax_curriculum_staged.py` (5-stage curriculum starting at `n_chunks=2, chunk_len=64`) was relaunched from scratch on `tpu2` after landing the gradient-clipping + warm-start-from-best-checkpoint fixes (see the two entries below this one) — **result: every one of its first 4 stages finished at near-chance MEAN** (`[stage 0] done ... best=2.3%`, stage1 `best=1.0%`, stage2 `best=0.7%`, stage3 `best=0.6%`), monotonically WORSE each stage. Root cause: the curriculum starts at `chunk_len=64/n_chunks=2` — already a multi-chunk shape — without ever first proving single-chunk recall converges, unlike torch's own proven `hmn_notags_w25` ladder (`chunk_len` 8→16→32→64, single chunk, see the `chunk_len` ladder entry above). This run was stopped (killed) as a wasted trajectory; a corrected curriculum should start from `chunk_len=8, n_chunks=1` (matching `hmn_notags_w25_rope_jax_sanity_c8.py`, see below) and only escalate `n_chunks` after that stage genuinely converges, not after a fixed step budget expires.
-  - Separately, `hmn_notags_w25_rope_jax_sanity_c8.py` (the correctly-scoped `chunk_len=8, n_chunks=1` sanity config, matching torch's own easiest proven stage) showed what looked at first like a genuine training collapse on `tpu3`: val MEAN 37.5%→31.4%→**43.6%** (step 15000, peak)→30.8%→23.1%→16.2%→10.6%→13.3%→11.9% — `tpu3` was PREEMPTED (GCP spot reclaim) before the run could continue past this point, so the log/checkpoint are lost (see the TPU-provisioning standing rule above — do not recreate `tpu3` without the user; report and wait).
-  - **A/B control on `tpu2`** (`hmn_notags_w25_rope_jax_sanity_c8_noadaptive.py`, identical config with `adaptive=False`) reproduced the same shape of MEAN trajectory (28.3%→28.9%→29.7%→22.0%→15.1%→13.2%→17.3%→21.7% recovering by step 50000) — **ruling out adaptive reweighting as the cause** (it was disabled here and the collapse-then-partial-recovery pattern still occurred). The `lr_schedule` (`kvmem.hmn_jax._make_schedule`) is warmup-then-flat-constant, never cosine/restarting, ruling out an LR-spike artifact too.
-  - **Per-entry breakdown at the peak (step 15000, MEAN=32.5%) vs. the trough (step 45000, MEAN=15.1%) reveals the real mechanism**: at the peak, every **anchor=0** entry (`Q(0,1,0,2)`, `Q(0,1,0,3)`, `Q(0,1,0,4)` — warmup starting at the very first byte of the chunk) was at **0.0%** match while **anchor=1** entries were near-perfect (`Q(0,1,1,2)`=86.7%, `Q(0,1,1,3)`=91.7%) — the model had found a shortcut that works great whenever the anchor isn't at position 0, and was failing completely on the genuinely-hard near-start-anchor case (the same "near-start anchor hard" pattern already on record from the `hmn_stitch_src1024_anchor` entry above, now visible at `chunk_len=8` too). By the trough, anchor=0 entries had improved (5.6%/6.7%/16.7%) while anchor=1 entries had gotten much worse (20.0%/25.0%, down from 86.7%/91.7%) — a genuine trade-off, not a joint collapse: the aggregate MEAN dropped because the model was pushed off its easy shortcut faster than it consolidated the harder content-addressed solution. Train loss stayed low/stable throughout this window (0.06-0.3 for 5 of 6 trajectories) — one trajectory (`Q(0,1,2,2)`) spiked to loss=8.2-8.7 (above the ln(256)=5.545 random-baseline) between steps ~15000-35000 before recovering to ~1.1 by step 45000, consistent with genuine optimization turbulence during the shortcut-to-content-addressing transition rather than any numerical instability (no NaN, no exploding activations). Step 50000 (21.7%) shows the trade-off starting to resolve favorably. **Standing lesson reinforced**: a mid-training MEAN dip is not automatically a collapse — inspect the per-entry breakdown before concluding instability, the same "check before trusting" discipline CLAUDE.md's masking-verification rule already establishes for a different context.
-- **`enc_hops`/`hop_drop_prob` — bounded, stochastically-dropped encoding-chain window, ported to BOTH `kvmem/hmn_jax.py` and `kvmem/hmn.py` (2026-07-31).** Motivated directly by the finding above: the recall1024 single-query design gives its one query permanent unbounded attention to every encoded chunk's STATE (`hops` is structurally inert there), which is exactly the kind of dense all-chunks-shortcut a positional/attention-availability shortcut can exploit instead of genuine content-addressed recall. See the "Masking rule names"/`enc_hops` entries near the top of this file for the full mechanism (bounded N-back window over the CHUNK sequence, back=1 never dropped, `hop_drop_prob` independently drops back 2..N per training step, curriculum-annealable) and its mask-matrix verification (done independently in both files, all checks pass, `enc_hops=-1` regression-confirmed byte-identical to legacy). Combinatorial per-hop-size eval (`val/weave/hopcombo/S=...`, `hp['eval_combinatorial_hops']`) reports val MEAN for every active-backs subset at each eval — a direct read of which relay distances the model actually depends on.
-  - **JAX**: `hmn_tpu_recall1024_jax_hopdrop.py` — 5-stage curriculum (`n_chunks` 4→8→16→16→16, `chunk_len` 8→8→8→32→64, `hop_drop_prob` annealed 0.1→0.5), warm-started from `hmn_notags_w25_rope_jax_sanity_c8_noadaptive.py`'s converged checkpoint (val_mean=35.4%, `hp['pretrained_ckpt']` — new this session, exact-shape-match-only load, no shape-mismatch tolerance the way torch's loader has). `_weave_mix_for` uses a dense, evenly-spaced anchor sweep (matching `hmn_notags_w25_rope`'s own `_grid` formula) rather than a few coarse fixed fractions, since a sparser grid has no more reason to avoid the same anchor=0-vs-anchor=1 positional-shortcut trade-off at `n_chunks>1` than it did at `n_chunks==1`. Launched on `tpu2`; stage 0 reached MEAN=2.4% by step 25000/40000 (much harder task than the single-chunk warm-start source, expected to start low) before being stopped by explicit user request — checkpoints preserved for a later resume.
-  - **torch**: `kvmem/hmn.py`'s `train()` (`weave_mix` branch) gained the identical `enc_hops`/`hop_drop_prob`/combinatorial-eval wiring, plus a **new** `warm_start_from_best` (default `True`) — torch never had the between-stage warm-start fix the JAX port needed (torch already had `_pretrained_ckpt` for stage-0 warm start and gradient clipping on every step, neither needed porting). **This changes existing multi-stage configs' default behavior** (e.g. `hmn_notags_w25.py`'s 4-stage ladder now warm-starts stage N+1 from stage N's own best checkpoint instead of continuing from wherever stage N's training ended) — set `hp['warm_start_from_best']=False` to reproduce the old always-continue behavior if that matters for reproducing a prior run's exact numbers. New config: `kvmem/configs/hmn_notags_recall1024_hopdrop.py`, warm-started from `hmn_notags_w25_rope.py`'s own real converged local checkpoint (`logs/hmn_notags_w25_rope/checkpoints/stage0_best.pt`, val_mean=91.7% — a much stronger starting point than the JAX version had available), using a new `_grid_multi` helper (generalizes `hmn_notags_w25_rope.py`'s own dense-anchor-sweep `_grid` to multi-chunk suffix recall). **Verified only** (mask-matrix checks, a 2-stage full-mechanism smoke test, a real-config-structure smoke test, and an unmodified-`hmn_notags_w25.py` regression run — all pass) — **not yet launched on real hardware**, per explicit instruction to keep this port local-only for now.
+**Current best config**: `state_vocab_size=1` (Experiment 1, 2026-09-06 — beat `state_vocab_size=4` on 3 of 4 stages, decisively at the hardest one). Roadmap stage 1 (single-step encode/decode) is passed at the real target architecture (`d=128, n_layers=16, n_heads=8`, ~1.12M params). Roadmap stage 2 (multi-chunk stitch, `hmn_tpu_recall1024_jax_incremental.py`) is in progress — see `docs/RESULTS_LOG.md` for live per-stage numbers.
 
 ---
 
@@ -131,616 +76,103 @@ Fast-weight language model — HashMemNet (HMN). **Current focus: `kvmem/hmn.py`
 
 **Caution before using this for the chain-memory recovery probe specifically**: structured data risks contaminating that probe — a model could "recover" an earlier chain step's content by inferring the generating rule from its own visible span, without touching the relay at all. Keep the recovery probe on pure random data first; structured data is queued as a separate, later question (does bounded `STATE` capacity effectively increase when content is compressible), not a replacement for the current validation.
 
+
+**First ablation run result** (markov/ca vs random, 2026-08-01): moved to [`docs/RESULTS_LOG.md`](docs/RESULTS_LOG.md) — not a clean win either direction, open question, queued for a matched-step-count rerun.
+
 ---
 
-## TPU port (2026-07-30) — status: infra confirmed working, first real training run not yet completed
+## TPU access
 
-**Standing rule: never create/recreate a TPU VM directly via `gcloud ... tpu-vm create` — even
-under an autonomous-work mandate.** This project's TPU access is via **TRC (TPU Research Cloud)
-free-tier quota**, which is consumed/tracked through `gcloud compute tpus queued-resources`, NOT
-the direct `tpu-vm create` API — creating a VM directly bills normally instead of drawing on the
-TRC quota. `tpu3` (`v6e-8`, `us-east1-d`, spot) was PREEMPTED (GCP spot reclaim) mid-run on
-2026-07-31; `gcloud ... tpu-vm start` does not support restarting a PREEMPTED node, and an
-attempt to `gcloud ... tpu-vm create tpu3 ...` to replace it was stopped by the user ("do not
-create own tpu... must use `gcloud compute tpus queued-resources` else will be billed not using
-TRC quota... not allowed to spin own vm"). Provisioning (even via the correct queued-resources
-path) is the user's call — report the loss and wait, don't self-serve a replacement, regardless
-of how much autonomy has otherwise been granted for the training work itself.
+**`TPU.md` and `TPU_WORKFLOW.md` (repo root) are the user's own scratchpad — do not edit, restructure, or archive their content.** They hold personal gcloud/ssh notes (including cross-project ones) in whatever shorthand form is convenient for the user; treat them as read-only reference, not as project docs to prune or fold into the files below.
 
-**Context**: a scale-up experiment (target: 1024-byte perfect recall from a warmup anchored at
-any source index, `d=128/n_layers=16/n_heads=8`, ~1.12M params — see
-`/Users/muaz/.claude/plans/dazzling-waddling-widget.md` for the full plan) needed far more
-throughput than MPS/CPU could give, motivating the actual TPU port `docs/TRC_TPU.md` had
-previously only estimated. `docs/TRC_TPU.md` now has the up-to-date, corrected version of
-everything below (tier confirmation, the packing-recommendation reversal, grad_checkpoint
-correction) — this entry is the CLAUDE.md-level summary of what's confirmed working and what
-broke, for quick reference.
+**Current path: JAX/Flax NNX (`kvmem/hmn_jax.py`), exclusively.** `torch_xla` was tried first and abandoned — real, reproducible, never-root-caused instability (a data-dependent NaN independent of every hyperparameter tried, and a separate RoPE-at-long-length NaN that persisted through every fix) that JAX simply doesn't reproduce on the identical computation. `kvmem/hmn.py`'s own torch_xla-specific plumbing (`bucket_lengths`, `device_str='tpu'`) still exists but is dead/frozen code — do not extend it. Full forensic history of both the torch_xla saga and the JAX port: [`docs/TPU_JAX_PORT.md`](docs/TPU_JAX_PORT.md).
 
-**Access**: `gcloud compute tpus tpu-vm ssh tpu1 --zone=europe-west4-b` — confirmed `tpu1` is
-`v5litepod-1`, ONE v5e chip (not a `-8` slice), `torch 2.6.0`/`torch_xla 2.6.1` preinstalled.
-SSH is flaky/slow to connect (sometimes several retries, occasionally outright fails) WHILE the
-TPU process is mid-XLA-compile and pegging most of the host's 24 vCPUs — this is contention, not
-a real connectivity problem; retry rather than assume the VM is down. **Use tmux for anything
-that must survive a dropped SSH session** — every run in this project's TPU work goes through a
-persistent tmux session (`tmux new-session -d -s kvmem_gate`, `tmux send-keys ... Enter`, `tmux
-capture-pane -t kvmem_gate -p` to read output) rather than a bare `--command`, specifically
-because a long-running training job must not die when a flaky SSH connection drops.
+**Operational how-to** (gcloud commands, persistent SSH, tmux conventions, common failure modes): [`docs/tpu_setup.md`](docs/tpu_setup.md) + [`docs/tpu_direct_ssh.md`](docs/tpu_direct_ssh.md). Available TRC queued-resource nodes: [`TPU.md`](TPU.md).
 
-**Fix for the flakiness itself, for one-off status-check commands (separate from the tmux point
-above, which is about the training job surviving a drop)**: each `gcloud compute tpus tpu-vm ssh
---command=...` invocation is a brand-new SSH handshake + gcloud auth/IAM/IAP round-trip from
-scratch, which collides badly with the host being CPU-starved during a compile — this is why
-repeated status-check calls fail far more often than the one persistent tmux session does. Get
-the real `ssh` invocation gcloud would run via `gcloud compute tpus tpu-vm ssh tpu1
---zone=europe-west4-b --dry-run` (prints something like `/usr/bin/ssh -t -i
-~/.ssh/google_compute_engine -o HostKeyAlias=... muaz@<external-ip>`), then open ONE multiplexed
-master connection directly with plain `ssh` and reuse it for every subsequent command instead of
-going through `gcloud`'s wrapper each time:
-```
-ssh -o ControlMaster=auto -o ControlPersist=1h -o ControlPath=/tmp/tpu1_ssh/cm \
-    -o CheckHostIP=no -o HashKnownHosts=no -o HostKeyAlias=<from dry-run> -o IdentitiesOnly=yes \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/google_compute_known_hosts \
-    -i ~/.ssh/google_compute_engine muaz@<external-ip> "echo CONNECTED"
-# every later command reuses the same authenticated socket, no new handshake:
-ssh -o ControlPath=/tmp/tpu1_ssh/cm muaz@<external-ip> "ps aux | grep hmn"
-```
-Verified this resolves the repeated-connection-failure pattern in practice. `ssh -O check -o
-ControlPath=... <host>` confirms the master is still alive if a later command behaves oddly.
+**Standing rule: never create/recreate a TPU VM directly via `gcloud ... tpu-vm create`** — this project's TPU access is via TRC (TPU Research Cloud) free-tier quota, tracked through `gcloud compute tpus queued-resources`, NOT the direct `tpu-vm create` API (that bills normally instead of drawing on TRC quota). If a node is preempted, report it and wait — do not self-provision a replacement, regardless of how much autonomy is otherwise granted for the training work itself.
 
-**Standing rule: after launching any TPU training job, always give both of these two commands**
-(full explicit form, substituting the real host/`ControlPath`/run name/session name — no shell
-alias, since aliases require editing files outside this repo), so the user can immediately watch
-the job either as a scrolling log or as the live terminal:
-```
-ssh -o ControlPath=/tmp/<tpuN>_ssh/cm muaz@<ip> "tail -f -n 50 ~/kvmem/logs/<run_name>/train.log"
-ssh -o ControlPath=/tmp/<tpuN>_ssh/cm muaz@<ip> -t "tmux attach -t <session_name>"
-```
-**These `-o ControlPath=...` short forms only work from wherever the multiplexed master socket
-was actually opened** (verified: when the master was opened inside this assistant's own sandboxed
-shell, the user's own terminal got `Permission denied (publickey)` trying to reuse that same
-`ControlPath` — the socket file isn't visible across that boundary). For the user's own terminal,
-give the `gcloud` form instead, which handles auth itself and needs no pre-existing socket:
-```
-gcloud compute tpus tpu-vm ssh <tpuN> --zone=<zone> --command="tail -f -n 50 ~/kvmem/logs/<run_name>/train.log"
-gcloud compute tpus tpu-vm ssh <tpuN> --zone=<zone> -- -t "tmux attach -t <session_name>"
-```
+**Mindset shift now that TPU compute is no longer scarce**: with multiple queued v4-8 nodes available in parallel, prefer throwing more parallel TPU-hours at an ablation or a bridging-curriculum-stage question over the older MPS/CPU-era discipline of very carefully rationed single-run curricula. Run redundant copies across nodes to hedge against spot preemption rather than babysitting one run.
 
-**One sharp edge hit directly**: a command that kills a large, actively-compiling process on the
-remote end (e.g. `pkill -9` against the training PID) can itself return a spurious immediate
-`exit 255` on the multiplexed channel even though the master session survives and the kill
-actually landed — don't read that as "the connection is broken," re-check with a plain command
-(`ps aux`) on the same socket before concluding anything failed.
+**URGENT, unresolved as of 2026-09-09: every `kvmem_jax` TPU run this session has used only 1 of a v4-8 node's 4 chips, and MFU on that one chip is almost certainly very low.** Direct evidence from the `[util:...]` log lines every run already prints: `chip0: duty_cycle=100%` but `chip1/chip2/chip3: duty_cycle=0.0%, HBM=0.00/30.75GiB` — the other 3 chips sit completely idle the entire run, and HBM usage on the one active chip is only ~7-9% of capacity (2.2-2.7 GiB of 30.75 GiB). `duty_cycle=100%` only means the chip's pipeline isn't stalled waiting on the host — it says nothing about how efficiently that compute is used, and at this model's scale (~1.1M params, `B=32-64`, `L`~700-1200) the matmuls are almost certainly far too small to saturate a v4 chip's systolic array (~197 TFLOPS bf16 peak), meaning real MFU is likely in the low single digits. This is why runs that "should" be fast (a ~1M-param model) have been taking many hours per stage. **Fix already exists in code, just never enabled for these runs**: `hp['data_parallel']=True` (`kvmem_jax/hmn_jax.py`, `jax.jit`+`Mesh`/`NamedSharding`, previously verified working elsewhere in this project) spreads the batch across all 4 chips — batch size must be divisible by 4. This alone should give close to a 4x wall-clock speedup; it does not by itself fix the small-matmul-shape MFU problem on top of that (a separate, unaddressed question — larger per-chip batch via `data_parallel` may help some of that too, since bigger matmuls are usually more MXU-efficient, but this hasn't been measured). **TODO, not yet done: retrain the recall1024/STATE-capacity lineage with `data_parallel=True` enabled** — every config launched so far (`hmn_oneshotrecall_jax*.py`, `hmn_recall1024_jax_oneshotrecall*.py`, the `_bucket_*` variants) ran single-chip; none of their reported wall-clock times or resource usage should be read as representative of what this workload actually needs once fixed.
 
-**Monitoring**: `~/.local/bin/tpu-info` (already installed) shows chip/PID/HBM-usage/duty-cycle —
-useful for confirming which process holds the device and current HBM usage. **Caveat found
-directly**: running it under `watch` in a second tmux session (`tmux new-session -d -s
-tpu_monitor`) appears to STALL/freeze (stale timestamps, no refresh) while the training process
-is mid-compile — contention between `tpu-info`'s own metrics query and the busy compile. Don't
-trust its wall-clock freshness during a compile; use `ps aux`'s CPU-time field on the training
-PID instead (climbing steadily = genuinely still working, not hung) as the reliable liveness
-signal during that phase.
+---
 
-**Porting work landed in `kvmem/hmn.py`** (`train()`, opt-in via `hp['bucket_lengths']`/
-`device_str='tpu'` — every existing CPU/MPS config unaffected): length bucketing + padding
-(`_bucket_ceilings`/`_pad_mask_to`/`_pad_tok_to`, a weighted k-segment DP minimizing `L^2`-weighted
-cost, since attention cost scales with `L^2` not `L`), per-bucket batch sizing from TWO memory
-ceilings (`token_budget` for the `B*L` term, `attn_sq_budget` for the `B*L^2` attention-matrix
-term — see the grad_checkpoint finding below for why the second one is load-bearing, not
-optional), `torch_xla.sync()` + bf16 autocast, host-sync-throttled loss/logging (avoids a device
-round-trip every step), a CPU eval replica (`_synced_eval_model()` — autoregressive decode is a
-token-at-a-time Python loop over a growing shape, a recompile-per-token disaster on XLA, so eval
-copies weights to a CPU copy of the model instead of porting decode), and a vectorized (no more
-per-`b_idx` Python loop) `make_batch_tagged`. Verification harness: `kvmem/gate_check.py`
-(gates 3/4/5 — CPU/TPU loss-curve parity, bf16-vs-fp32 byte-exact match, real-config end-to-end
-smoke test), run as `python3 -m kvmem.gate_check <gate3_cpu|gate3_tpu|gate3_compare|gate4|gate5>`.
+## Roadmap (recall1024, staged by capability — set 2026-07-31, not by fixed step budgets)
 
-**Four real bugs found and fixed, plus a fifth still open (see below), all confirmed on `tpu1`
-directly (not theoretical)**:
-1. **Mixing a CPU `.backward()` call and a TPU `.backward()` call in the SAME Python process
-   crashes the second one** — `RuntimeError: 0 <= device.index() && device.index() <
-   ... device_ready_queues_.size() INTERNAL ASSERT FAILED`. PyTorch's autograd Engine singleton
-   sizes `device_ready_queues_` when first used; if that first use is a CPU backward, it never
-   learns about XLA registered afterward. Not specific to this codebase. **Fix: one device per
-   process** — `gate_check.py`'s `gate3_cpu`/`gate3_tpu` are separate `python3 -m` invocations,
-   compared only via their logged output on disk, never in-process.
-2. **`torch.utils.checkpoint.checkpoint`'s default (`use_reentrant=False`) path is incompatible
-   with XLA tensors** — `AttributeError: module 'torch' has no attribute 'xla'`, because it calls
-   `getattr(torch, device_type)` to save/restore per-device RNG state, and `torch_xla` doesn't
-   register itself under `torch.xla`.
-3. **Gradient checkpointing is NOT optional at long `L`, regardless of how small the model is** —
-   without checkpointing, training the ~1.12M-param model at `B=64, L=1232` hit a hard HBM OOM:
-   `Used 52.85G of 15.75G hbm`. The requested amount matches `B*H*L^2*n_layers*4bytes`
-   (`64*8*1232^2*16*4 ≈ 52.8G`) almost exactly — every layer's `O(B*H*L^2)` attention-score matrix
-   was being retained simultaneously for backward. Recomputing one layer's activations at a time
-   instead fixes it. The lesson generalizes: whether checkpointing matters is a function of `L`
-   (quadratic term) vs. model size (linear term), NOT primarily a function of param count the way
-   `docs/TRC_TPU.md`'s original (now-corrected) guidance assumed.
-4. **`torch_xla.utils.checkpoint.checkpoint` (the initial fix for bug 2) silently breaks under bf16
-   autocast — trains "successfully" all the way to `loss=NaN` from the very first logged step,
-   never crashing.** It doesn't reapply the surrounding `torch.autocast` context during backward's
-   recompute the way stock PyTorch's reentrant `CheckpointFunction` does. Found by direct A/B on
-   `hmn_tpu_sanity_w25.py`: `grad_checkpoint='block'` (via `torch_xla.utils.checkpoint`) → NaN from
-   step 1; `grad_checkpoint=False` (no checkpointing at all, same everything else) → loss
-   5.33→5.39, finite, over 600 steps. A local CPU repro of the same architecture under forced bf16
-   autocast — both with and without `torch.utils.checkpoint` — never produced NaN either, ruling
-   out autocast or checkpointing individually and isolating the interaction specifically to
-   torch_xla's implementation. **Real fix** (`kvmem/hmn.py`'s `_ckpt`): for XLA tensors, use stock
-   PyTorch's REENTRANT path instead — `torch.utils.checkpoint.checkpoint(fn, *args,
-   use_reentrant=True, preserve_rng_state=False)`. `CheckpointFunction.backward` explicitly
-   reapplies `torch.amp.autocast(device_type=ctx.device_type, **ctx.device_autocast_kwargs)`
-   around the recomputed forward — the handling torch_xla's version lacks. `preserve_rng_state=
-   False` is required too: it's what gates the `_get_device_module`/`getattr(torch, 'xla')` call
-   from bug 2 (safe here — no dropout/stochastic ops in any checkpointed block). One more wrinkle:
-   even with `preserve_rng_state=False`, `torch.random.fork_rng` (called unconditionally inside
-   `CheckpointFunction.backward`, before it checks its own `enabled` flag) still does `getattr(
-   torch, 'xla', None)` and raises if that's `None` — fixed by `torch._register_device_module(
-   'xla', torch_xla)` once at import time (any non-None object satisfies it; with `enabled=False`
-   nothing downstream actually touches it). Verified: re-running `hmn_tpu_sanity_w25.py` with
-   `grad_checkpoint='block'` restored and this fix in place reproduced the SAME finite loss values
-   (5.33→5.39) as the no-checkpoint run, at the same speed (~3.4-4 it/s) — checkpointing is now
-   free at this scale, not just avoided.
+Each stage is a genuine capability gate, not a scheduled step count — advance only once the
+current stage actually converges; insert whatever intermediate stage is needed if it doesn't
+(see the third bullet). Supersedes any earlier fixed n_steps-per-stage curriculum plan for this
+line of work (`hmn_tpu_recall1024_jax_curriculum_staged.py`, the original `hmn_tpu_recall1024_
+jax_hopdrop.py` design) where the prior stage's own convergence wasn't actually verified first.
 
-**A fifth issue, still OPEN and NOT root-caused despite extensive ablation** (2026-07-30):
-bug 4's fix resolved `hmn_tpu_sanity_w25.py`'s stage 0 (`chunk_len=8`, finite loss 5.33→5.39,
-`best=3.1%` match, clean eval) — but **stage 1 (`chunk_len=16`) hit `loss=NaN` again, from step 1**.
-A long sequence of single-variable ablations followed, each built as a genuine positive/negative
-pair on `tpu1` directly (never reproduced on CPU under any settings, including forced bf16
-autocast and the exact reentrant-checkpoint code path) — **every one of the following was
-individually ruled out as the sole cause**:
-- **Real padding** (a bucket mixing different real `L` under one ceiling) — a config with a
-  single bucket genuinely forced to pad (`max_shape_buckets=1`, 3 entries with real `L=19/20/21`
-  merged into one `Lb=21`) NaN'd; the exact same 3 entries with `max_shape_buckets=3` (each gets
-  its own exact bucket, verified `waste=0.0%` on every bucket) **also NaN'd** — padding is not
-  necessary for the failure.
-- **`grad_checkpoint='block'`** — set to `False` on an otherwise-identical config: still NaN'd.
-- **bf16 autocast** — added `hp['no_autocast']` (forces fp32 via `torch.autocast(...,
-  enabled=False)`, `kvmem/hmn.py`'s weave_mix forward) and reran: **still NaN'd even in fp32**.
-  This alone rules out precision as the cause, contradicting the working hypothesis at the time.
-- **`rope`/`state_vocab_size`** — swapping `rope=False, state_vocab_size=1` (the scale-up
-  target's settings) for `rope=True, state_vocab_size=2` (every historically-proven-working
-  config's settings) on the same shape: still NaN'd.
-- **Batch size** — `B=4096` (the value used throughout `hmn_tpu_sanity_w25.py`) vs `B=64` on the
-  ORIGINAL known-good 6-entry stage-0 weave_mix (unmodified from the config that trained cleanly
-  earlier): `B=4096` finite and declining (confirmed twice, including a fresh re-run late in the
-  investigation confirming the environment itself had not degraded from repeated `pkill -9`s),
-  **`B=64` NaN'd from step 4** — the one result that looked like a real, single-variable
-  correlation.
+**Live status (2026-09-06)**: **stage 1 PASSED** (`hmn_tpu_sanity_w25_rope_jax.py`, `state_vocab_size=1`,
+best=85.5% at the final chunk_len=64 stage — see Experiment 1 in `docs/RESULTS_LOG.md`). **Stage 2 IN
+PROGRESS** (`kvmem/configs/hmn_tpu_recall1024_jax_incremental.py`, warm-started from stage 1's winner,
+running on two TPU nodes as redundant copies — see Experiment 2 in `docs/RESULTS_LOG.md` for live
+per-stage numbers). The stage-1/2 descriptions below are the target-shape design, not yet updated
+per-run — check `docs/RESULTS_LOG.md` for what's actually happened.
 
-**Why even the batch-size result is not trustworthy as a root cause**: changing `B` changes how
-many values `rng.integers`/`rng.beta` draws per batch-construction call in `make_batch_tagged`,
-which shifts the ENTIRE subsequent NumPy RNG stream from the very first batch onward — `B=4096`
-and `B=64` runs are not "the same data, fewer rows," they diverge into completely different
-random draws immediately. Every ablation above has this same confound: each config edit was
-also, unavoidably, a different RNG stream. **Net honest conclusion**: this looks like a rare,
-data-dependent numerical edge case specific to real XLA/TPU execution (bf16 OR fp32 — precision
-doesn't gate it) that no single hyperparameter reliably triggers or avoids — some specific random
-batch draws hit it, others don't, across every setting tried. The next step that would actually
-localize this (not yet done) is forward hooks checking each block's output for NaN/inf at a FIXED
-seed, to find exactly which layer and which row first goes non-finite, rather than continued
-hyperparameter-level ablation. **`tpu1` was shut down at the end of this investigation — no
-further TPU work has happened since.** `kvmem/configs/hmn_tpu_sanity_w25_ablate*.py` (three
-variants: `_ablate`, `_ablate_2`, `_ablate_3`) and `kvmem/configs/hmn_tpu_recall1024_flat.py`
-are all still `rope=False`/`state_vocab_size=1`-based and untouched since. **Do not re-attempt
-Run A until this is resolved** — its own buckets will mix real lengths, hitting the identical
-open failure mode.
+**Update (2026-09-10, run now complete)**: the `chunk_len` 16→32 collapse (stage 2's own failure
+point) got a real, reproducible partial fix — a STATE-capacity ablation (`kvmem_jax` fork:
+`state_len=8`, `state_vocab_size=2`, MLP still disabled) hit **27.5-28.6% at chunk_len=32** across two
+independent runs, vs. 2.4-4.6% for both the original no-MLP and MLP-variant attempts at the same
+stage — roughly 6-10x better. But the improvement did NOT hold going further: both runs ran their
+full step budget to completion (260,000 steps, no crash, no early stop) and finished at **14.7-15.8%**
+once `chunk_len=64` and the bounded `enc_hops=4` relay were reached — well below every stage's own
+early-stop gate. See `docs/RESULTS_LOG.md` for the full ablation trail and the hopcombo breakdown.
+**This result's own wall-clock/step-budget numbers are still suspect** — see the URGENT single-chip/
+MFU note above (neither run ever used more than 1 of 4 chips); a real retrain with
+`data_parallel=True` is a TODO before treating 14.7-15.8% as any kind of ceiling rather than an
+artifact of running out of step budget on a badly-underutilized setup.
 
-**JAX/Flax NNX port, and the finding that actually answers bug 5** (`kvmem/hmn_jax.py`,
-2026-07-30): `torch_xla` is one bridge among several onto XLA; JAX is XLA's own first-party
-frontend, built independently — a genuinely different data point on whether bug 5 is a
-`torch_xla`-bridge-layer bug or something XLA itself does with this exact computation.
-**Single file, fully self-contained** (no import of `kvmem.hmn`, no `torch` at all) —
-`chunk_positions_traj`/`chunk_mask_fb_traj`/`parse_traj_dsl`/`make_batch_tagged` are copied
-byte-for-byte (pure NumPy/Python, no torch involved in any of them) rather than imported, so the
-file has zero PyTorch dependency. Scope: only `block_type='single_attn'` with `rope`+`yarn`/
-`null_kv`/`rmsnorm` — `hmn_notags_w25_rope.py`'s exact feature set. `build_model(hp, rngs) ->
-HMNModel` mirrors `kvmem.hmn.build_model`'s own signature; `train_jax(hp)` is a genuine (if
-scope-limited — no refine rounds, no padding/bucketing, no label smoothing, no decode-eval)
-optimization loop: weighted trajectory sampling, real gradient steps via
-`nnx.value_and_grad`/`optax.adamw`, teacher-forced NLL loss only.
-
-**One real bug caught while porting, not yet flagged elsewhere in this codebase**:
-`kvmem.hmn.MHAttention`'s own docstring claims `null_kv`'s null K/V pair is "learnable," but the
-actual `forward()` code constructs it as a fresh `torch.zeros(...)` every call, never wrapped in
-`nn.Parameter` — it can never receive gradients and is permanently zero, contradicting the
-docstring (now corrected in `kvmem/hmn.py`'s own docstring, behavior left unchanged since no
-checkpoint has ever exercised a learned null slot). Caught by a 1024-param mismatch (166,400 vs
-165,376) between the JAX port (which initially matched the docstring) and the real PyTorch model,
-found by comparing param counts directly, not by inspection.
-
-**Two flax-API version mismatches hit and fixed, both real portability bugs, not TPU-specific**:
-newer flax (verified 0.12.8) requires wrapping a plain Python list of submodules in `nnx.List`
-(a bare list now raises `ValueError: ... Static attributes should not contain data values`);
-older flax (0.10.7 — the newest installable on a TPU VM still shipping Python 3.10, since
-flax>=0.11 requires Python 3.11+, both verified directly) predates `nnx.List` entirely and just
-accepts a bare list. `nnx.Optimizer.update`'s signature also changed — newer takes `(model,
-grads)` positionally, older takes just `(grads)` with the model reference stored at `__init__`.
-Both detected at runtime (`hasattr(nnx, 'List')`, `'model' in inspect.signature(...).parameters`)
-rather than pinned to one version — **first attempt at the second one used a parameter-COUNT
-check instead of a name check, which was wrong** (`**kwargs` inflates both signatures' arg count
-equally, so count alone doesn't discriminate) and produced the exact same crash again on
-`tpu2` — fixed by checking for the `'model'` parameter name specifically.
-
-**`kvmem/setup_tpu_jax.sh`**: one-shot install script for a fresh TPU VM (`pip install
-'jax[tpu]' -f <libtpu index> flax optax tpu-info`, no flax version pin — pinning one broke the
-install outright on `tpu2`'s Python 3.10 instead of degrading gracefully) plus a self-check that
-`jax.devices()` actually returns a TPU device. Verified on `tpu2` (`v6e-1`, Trillium,
-`europe-west4-a`, a fresh VM with zero ML packages preinstalled — 44 vCPU/172GB host, notably
-larger than `tpu1`'s 24/47) from a cold start.
-
-**The actual finding**: with `kvmem/hmn_jax.py` running cleanly on `tpu2` (real gradient steps,
-finite loss, both stage 0 no-padding and general training confirmed), `torch_xla` was ALSO
-installed on `tpu2` (`pip install torch~=2.6.0 torch_xla[tpu]~=2.6.0`, same versions as `tpu1`)
-and `hmn_tpu_sanity_w25_ablate_2.py` — the exact config that reliably produced bug 5's NaN on
-`tpu1`/v5e (genuine padding via `max_shape_buckets=1` forcing 3 different real lengths into one
-`Lb=21` bucket, `rope=False`, `state_vocab_size=1`, `grad_checkpoint='block'`, bf16 autocast) —
-was run unchanged on `tpu2`/v6e. **It completed all 100 steps with ZERO non-finite loss values**
-(`[stage 0] done.`, final losses in the 5.2-5.5 range throughout, vs. instant `loss=nan` from
-step 1 on every v5e attempt). **This is strong evidence bug 5 is specific to the v5e chip
-generation (or its particular libtpu/PJRT build), not a generic torch_xla bug, not this
-architecture's masking/padding logic, and not any of the hyperparameters ablated earlier** (all
-of which were tested on v5e only). Not yet fully conclusive — only one config variant has been
-re-tested on v6e so far (not, e.g., `hmn_tpu_recall1024_flat.py`'s much longer `L`), and "clean
-for 100 steps" is not as strong as the multi-thousand-step confirmation bug 5 itself needed to
-surface reliably — but this is the first actionable lead after a full day of inconclusive
-same-hardware ablation.
-
-**A sixth, DIFFERENT bug found immediately after, on the SAME chip (`tpu2`/v6e) — `rope=True` +
-bf16 autocast NaNs; fp32 fixes it cleanly.** Once `hmn_tpu_sanity_w25.py` (NoPE, `state_vocab_
-size=1`, `lr_max` corrected to `1e-4` — see below) was training on `tpu2` with real, healthy
-progress (match 21.7% at step 5000, loss monotonically declining past step 10000), a clone with
-only `rope=True` changed (`hmn_tpu_sanity_w25_rope.py`, everything else identical: same `lr_max`,
-`grad_checkpoint='block'`, bf16 autocast, `B=16`, no padding — every bucket `waste=0.0%`) hit
-`loss=nan` on ALL 6 trajectories from step 1. Setting `hp['no_autocast']=True` (forces fp32,
-the same escape hatch built for bug 5) on that exact config fixed it immediately — loss finite
-and declining smoothly (4.627→2.981 over 4400 steps, no NaN anywhere). **This is mechanistically
-distinct from bug 5**: bug 5 turned out to be a v5e-hardware/libtpu issue independent of
-precision (fp32 didn't fix it there, and it disappeared on v6e regardless of precision); this one
-is a genuine bf16-precision issue specific to RoPE (`rope=True`) that reproduces even on v6e
-where bug 5 doesn't — plausible mechanism is accumulated phase/rotation error in bf16's ~8-bit
-mantissa compounding across the `sin`/`cos` position-angle computation
-(`kvmem.hmn.apply_rope`), a classically bf16-sensitive operation, unrelated to chip generation.
-**Not yet deeply isolated beyond the fp32 fix** (didn't test whether `grad_checkpoint`/batch size
-matter here the way they were ruled out for bug 5) — fp32 is a working, if unoptimized,
-workaround; any future `rope=True` TPU run should set `no_autocast=True` until this gets a
-proper mechanistic fix (e.g. computing `apply_rope`'s `cos`/`sin` in fp32 even under an
-otherwise-bf16 autocast region, a much narrower and cheaper fix than disabling autocast
-entirely).
-
-**`lr_max` also needed correcting for `hmn_tpu_sanity_w25.py`'s real convergence attempt**:
-carried over unexamined from Run A's large-batch √-scaled value (`6e-4`), it produced a fast
-initial drop (loss 4.5→2.5 by step 1000) followed by plateau/oscillation (2.2-2.9 for the next
-4000 steps, match=2.3% at step 5000) instead of continued convergence. Reverting to
-`hmn_notags_w25.py`'s original `1e-4` (the value that config actually converged under, per
-CLAUDE.md's own chunk_len-ladder results) fixed it — smooth monotonic loss decline, match=21.7%
-at the same step-5000 checkpoint (vs. 2.3% at the wrong LR), continuing to decline past step
-10000 (match wobbled 21.7%→17.4%, plausibly eval noise from the tiny `val_n_seqs=3` sample —
-loss kept improving monotonically through that same window, and CLAUDE.md's own `weave_c64`
-entry documents an identical wobble-not-degradation pattern elsewhere).
-
-**Bug 6 turned out to be much bigger than the fp32 fix suggested — a SEVENTH issue, length-
-dependent, isolated down to "XLA-compilation-specific" and still OPEN.** Once the fp32 fix looked
-clean at sanity scale (`hmn_tpu_sanity_w25_rope.py`: match=50.1% at step 5000, more than double
-NoPE's 21.7% at the same step — confirming RoPE's known advantage holds once precision is
-handled), the natural next step was re-testing Run A's real config with `rope=True`. A direct
-clone (`hmn_tpu_recall1024_flat_rope.py` — `rope=True, yarn=True, no_autocast=True,
-L_train=2200, L_max=8192`, otherwise identical to `hmn_tpu_recall1024_flat.py` including the
-OOM-driven `max_shape_buckets=4`/`attn_sq_budget=31_000_000` fix) hit **`loss=nan` across every
-single entry** in its own 30-step gate-5-style smoke test — at Run A's real scale (`L=1232-2128`),
-`no_autocast=True` did NOT fix it, unlike at sanity scale. A systematic single-variable ablation
-followed, same pattern as bug 5's own investigation:
-- **`yarn=False`** (removes YaRN's interpolation ramp entirely, plain unscaled RoPE frequencies)
-  — still NaN, every entry. Rules out the YaRN ramp formula.
-- **`grad_checkpoint=False`** (plus `attn_sq_budget` cut ~16x to `2_000_000` to compensate for no
-  longer checkpointing) — still NaN, every entry. Rules out checkpointing.
-- **Direct on-device component test**: ran `kvmem.hmn.apply_rope` and raw `torch.sin`/`torch.cos`
-  directly on a real TPU tensor at the exact failing scale (`pos` up to 2127, the freq=1 channel
-  — angle up to ~2127 radians) — **all finite, no NaN**. Rules out RoPE's own trig computation as
-  the mechanism, even at this position magnitude.
-- **CPU reproduction, the decisive test**: ran the EXACT same config (`rope=True`, `L` up to 2128,
-  real data pipeline, `B=2`, 10 steps) via `device_str='cpu'` (eager PyTorch, no XLA at all) —
-  **loss finite throughout** (5.56-5.59, zero NaN). The identical architecture, identical `L`,
-  identical RoPE math trains cleanly off-XLA.
-
-**Net conclusion (2026-07-30, at the time)**: real, reproducible, isolated to XLA's COMPILED
-graph specifically — not RoPE's math (fine in isolation on-device AND in the full CPU pipeline),
-not YaRN, not checkpointing, not batch size, not raw position magnitude. This was a different
-flavor of "XLA does something CPU/component-testing can't catch" than bug 5 — it persisted on the
-SAME chip (`tpu2`/v6e) that bug 5's own config trained cleanly on, so it was specifically about
-`rope=True` at long `L` in torch_xla's compiled graph, not chip generation.
-
-**Bug 7 RESOLVED — by switching frameworks, not by finding the torch_xla root cause.** Given how
-long bug 5 and bug 7 both took to (partially) pin down on torch_xla, the next move was testing
-whether `kvmem/hmn_jax.py` — independent XLA lowering, no torch_xla bridge layer — sidesteps this
-family of bug entirely, rather than continuing to dig into torch_xla's compiler internals.
-Sequence: (1) `hmn_tpu_sanity_w25_rope.py` run via `kvmem.hmn_jax` (plain fp32, no bf16 autocast
-in this port at all) trained cleanly at sanity scale — expected, since bug 6 was already known to
-be a bf16-specific issue. (2) The real test — `hmn_tpu_recall1024_flat_rope.py` (Run A's own
-scale, `L=1232-2128`, the exact config that reliably NaN'd on torch_xla regardless of every lever
-pulled) run via `kvmem.hmn_jax` (after fixing a real bug in `train_jax` itself: it hardcoded
-`n_chunks=1` in its `make_batch_tagged` call, silently correct for every `_w25*`-style config
-tested so far but wrong for Run A's `n_chunks=16` — fixed by threading `_build_trajectory`'s own
-computed `len(pos_content['enc_blocks'])` through as `traj['n_chunks']`) — **hit an HBM OOM
-first** (`Used 52.64G of 31.25G hbm`, since `hmn_jax.py` had no `grad_checkpoint`/bucketing yet at
-that point, so it inherited Run A's `B=64` un-checkpointed), **then, at `B=4`, completed all 20
-steps with FINITE loss throughout** (5.5752→5.5533, `[stage 0] done.`). **This is the decisive
-result**: the identical `rope=True` config at the identical scale that reliably NaN'd on
-torch_xla — including every yarn/checkpoint/precision variant tried — trains cleanly on JAX.
-`kvmem/hmn_jax.py` is therefore the working path for `rope=True` at Run A's scale; torch_xla's
-own root cause for bug 7 remains formally unexplained (not worth continuing to chase now that a
-working alternative exists), but is functionally closed for this project's purposes.
-
-**`kvmem/hmn_jax.py` brought to full feature parity with `kvmem.hmn`'s own `train()`, within this
-file's existing scope (single non-refine Q per entry), same day** — previously loss-only:
-- **`nnx.jit`-compiled training step** — one compiled step function per trajectory (built once,
-  cached on `traj['step_fn']`, `w0`/`c1` closed over as Python constants so the loss slice uses
-  plain indexing rather than `jax.lax.dynamic_slice`) — **~60x speedup** at sanity scale (1.4 → 85
-  steps/sec) once the per-shape compile cache warms up; loss values track the pre-jit run almost
-  exactly (5.5587→5.2666 vs 5.5585→5.2662 at the same steps), confirming jit changed only speed.
-- **KV-cache** (`HMNModel.__call__`'s `past_kv`/`return_kv`/`offset` now mirrors `kvmem.hmn.
-  HMNModel.forward`'s signature exactly) and **`remat`** (`nnx.remat`, JAX's gradient-checkpoint
-  transform, the counterpart to `grad_checkpoint='block'`) — both added to `MHAttention`/
-  `SingleAttnBlock`/`HMNModel`. One real bug caught immediately: `nnx.remat` traces ALL positional
-  args as dynamic by default, but `offset` feeds `jnp.arange(offset, ...)` inside `apply_rope`
-  (needs a concrete Python int) and `return_kv` gates a Python-level `if` — both need `static_
-  argnums`; without it, `ConcretizationTypeError` on the very first backward pass. Fixed via
-  `nnx.remat(_block_call, static_argnums=(4, 5))`. Verified on CPU: forward+backward through
-  `remat` gives finite loss and finite grads; KV-cache first-call + incremental-call (with a
-  `null_kv`-padded mask) both verified correct.
-- **`ar_decode_traj_nokv`/`ar_decode_traj_kv`** — ported eval, restricted (like the rest of this
-  file) to the single-non-refine-Q case. `_nokv` is the direct port of `kvmem.hmn.ar_decode_traj_
-  nokv` (full recompute per generated byte, matches what `train()` itself uses for its own
-  `val/weave/*` numbers — deliberately NOT jitted, since the growing-sequence-length loop would
-  retrace every token). `_kv` is NEW (not a port — `kvmem.hmn`'s own KV-cached decoders target
-  other position layouts, not `chunk_positions_traj`): encodes the fixed prefix once via
-  `return_kv=True`, then grows the cache one token at a time — mathematically identical greedy-
-  argmax result to `_nokv`, much faster for long generations. `train_jax`'s own periodic eval uses
-  `_kv`.
-- **`make_test_sequences`** (copied verbatim) and **`save_checkpoint`/`load_checkpoint`**
-  (pickle + numpy, not `torch.save`/orbax — no new dependency, and the two frameworks' checkpoints
-  were never going to be interchangeable regardless of format) round out the `stage{i}_last/
-  best/end.pt` pattern and `val/weave/*` + `MEAN` + `by_chunk_len` logging, matching `train()`'s
-  own format line-for-line.
-- **Verified end-to-end on both CPU and real TPU hardware (`tpu2`)**: training (jit+remat) + eval
-  (KV-cached decode, real match% output) + checkpoint save, all in one run, no errors, checkpoint
-  files confirmed written and independently reloadable.
-- **Log format brought to parity with `kvmem.hmn`'s own `train()` a second time (2026-07-31)**:
-  `train_jax()` now writes `train.log` (renamed from `train_jax.log` — matches `train()`'s own
-  filename exactly, so tooling/aliases don't need a JAX-specific path), `train.jsonl` (per-
-  `log_every`-step `{step, stage, loss, lr, entry}` record), and a live-updating
-  `train_status.log` via a copied `_StatusWriter` (truncate-and-rewrite so `tail -f` shows a
-  single live-updating tqdm line rather than growing unboundedly). Training loop now drives a
-  real `tqdm` progress bar (`file=status_file`, `dynamic_ncols=True`) instead of a bare Python
-  `range()` loop, with `pbar.set_postfix(loss=..., lr=..., entry=...)` updated every `log_every`
-  steps and `str(pbar)` appended to `train.log` — same pattern `train()` itself uses. Scope note:
-  unlike `train()`'s own jsonl (which logs one `traj_loss` value per trajectory in the mix),
-  this file's jsonl logs only the single trajectory actually sampled that step (`entry`) — no
-  per-trajectory EMA-loss bookkeeping was added, since nothing in this file's current scope reads
-  it back.
-
-**Given this, `kvmem/hmn_jax.py` is now the recommended path for any `rope=True` work at Run A's
-scale** — `hmn_tpu_recall1024_flat.py`'s original `rope=False` torch_xla config remains a valid,
-still-untested-post-OOM-fix fallback (`max_shape_buckets=4`/`attn_sq_budget=31_000_000`, found
-necessary via a real `RESOURCE_EXHAUSTED` at `Lb=1744/B=32`, never re-verified since), but is no
-longer the only option. `hmn_tpu_recall1024_flat_rope.py`/`_noyarn.py`/`_noyarn_nockpt.py`
-(the torch_xla ablation trio) stay in the repo as the investigation record.
-
-**`kvmem/hmn_jax.py` gained length bucketing, a persistent XLA compilation cache, and a
-re-derived segmented forward — all opt-in, none change existing configs' behavior (2026-07-31).**
-- **Length bucketing** (`hp['bucket_lengths']`) — direct port of `kvmem.hmn`'s own
-  `_bucket_ceilings`/`_assign_bucket`/`_pad_mask_to`/`_pad_tok_to`/`_pow2_floor` (pure NumPy,
-  copied verbatim). Unlike the torch version's per-trajectory-but-padded design, the JAX port
-  shares ONE `nnx.jit`-compiled step function across every trajectory in a bucket
-  (`_make_train_step_bucket`) — different trajectories sharing a bucket have different real
-  `c1` (out_len varies with anchor), so the loss can't be a fixed-size Python slice; instead
-  it's computed over the full static `[w0, Lb)` range and weighted by a per-trajectory
-  `loss_mask` (traced array, 1.0 for real `w0<=pos<c1`, else 0.0) passed in at call time. This
-  requires every trajectory in a stage to share the same `w0` — true for this file's
-  single-query suffix-recall shape (asserted at setup, verified directly against
-  `hmn_tpu_recall1024_flat_rope.py`: all 16 entries have `w0=1104`, 4 buckets from 8 distinct
-  `L` values). Reduces Run A's distinct-shape compile count from 16 to `max_shape_buckets`.
-  Per-bucket batch size is `b_cap = min(B, pow2_floor(token_budget/Lb), pow2_floor(attn_sq_
-  budget/Lb**2))` — `token_budget` caps the linear-in-L cost (embeddings/FFN/residual-stream
-  activations), `attn_sq_budget` caps the quadratic-in-L attention-score-matrix cost, the term
-  that actually dominates at long `L`. **Worked numerical example against real v6e HBM** (31.25
-  GiB usable per chip, confirmed via `tpu-info`): the shared torch config's own `attn_sq_
-  budget=31_000_000` would cap `B` down to 4 at `Lb=2128` (`pow2_floor(31_000_000/2128**2)=4`)
-  — but a real run of `hmn_tpu_recall1024_flat_rope_jax.py`'s exact architecture (`d=128/
-  n_layers=16/n_heads=8`, ~1.12M params, `grad_checkpoint='block'`, fp32) at `B=64, Lb=2128`
-  measured only 29.51/31.25 GiB HBM (steady state) — so that torch-era budget was calibrated
-  for a different (more conservative, possibly torch_xla-specific) memory profile, not what
-  JAX actually needs here. `hmn_tpu_recall1024_flat_rope_jax.py` recalibrates both:
-  `token_budget=200_000` (> `64*2128=136,192`), `attn_sq_budget=320_000_000` (> `64*2128**2=
-  289,816,576`) — both set just above the real calibration point so no bucket shrinks below the
-  already-verified-safe `B=64`, leaving the remaining ~1.7 GiB as deliberate headroom (eval/
-  checkpoint-save need extra memory too). **Caveat**: the 29.5 GiB figure includes params/
-  optimizer-state/embedding overhead, not purely the attention matrix, so it is NOT a clean
-  per-unit conversion factor to reuse for a different architecture — treat it as a single-point
-  anchor, and re-verify via `tpu-info` after raising either budget rather than trusting the
-  arithmetic alone (full worked-example docstring: `kvmem/hmn_jax.py`, right above
-  `_bucket_ceilings`).
-- **Persistent compilation cache** (`jax.config.update('jax_compilation_cache_dir', ...)`,
-  defaults to `/tmp/jax_cache`, overridable via `JAX_CACHE_DIR`) — compiled executables survive
-  process restarts, so a killed/relaunched run hitting the same bucket shapes again skips
-  recompilation entirely. `jax_persistent_cache_min_compile_time_secs=1` avoids caching trivial
-  sub-second compiles. Verified end-to-end (cache files written, ~2.2x speedup on a warm rerun
-  at toy scale — real savings will be much larger at Run A's actual per-shape compile cost).
-- **Segmented forward** (`hp['forward_granularity']`/`hp['segment_checkpoint']`) — JAX port
-  AND re-derivation, not a straight port, of `kvmem.hmn`'s own `_iter_forward_segments`/
-  `_forward_segmented` (TIME-axis gradient checkpointing across STATE-bounded segments, walking
-  the packed sequence in groups with a carried KV cache instead of one dense forward pass —
-  separate from and orthogonal to `grad_checkpoint`'s model-DEPTH checkpointing). **The torch
-  version is currently unconditionally `NotImplementedError`-guarded** — its segment-boundary
-  logic assumed the old pre-end-of-turn-STATE layout and breaks for any rec_block with its own
-  trailing STATE commit (`sl0 is not None`, the non-terminal/relay case). This file's own scope
-  (`_build_trajectory`'s assertion: exactly one terminal, non-refine 'initial' rec_block) never
-  hits that case — a terminal query's `sl0` is always `None` — so `_iter_forward_segments_jax`
-  is a narrower, independently-correct re-derivation: it segments ONLY the encode portion
-  `[0, w0)` (verified contiguous, and verified `enc_blocks[-1]['sl1'] == rec_blocks[0]['w0']`
-  and `rec_blocks[0]['c1'] == L`, i.e. no gap on either side); the query itself always gets its
-  own dedicated final forward pass, never merged into an encode group. `_make_train_step_
-  segmented` reconstructs the full loss by concatenating the LAST local position of the final
-  encode group's own output (predicts token `w0`) with all-but-the-last of the query group's own
-  output (predicts `w0+1..end-1`) — mathematically identical to what a single dense
-  `model(tokens[:,:end], mask[:end,:end])` call's `logits[:, w0-1:end-1]` slice would give, since
-  the KV-cache-carrying grouped calls are just that same dense computation split into pieces.
-  `segment_checkpoint` wraps every group's own `model(...)` call (encode groups AND the final
-  query call, uniformly) in `nnx.remat` — same `static_argnums` requirement as the existing
-  model-depth remat (`offset` must be static, a Python int closed over per call site, never
-  traced data). **Verified bit-exact against the dense path** (`loss` diff `0.00e+00` across
-  granularity `1`/`4`/`16`/`1.0` and both `segment_checkpoint` settings) and gradients match to
-  float32 noise (`2.98e-08` max abs diff) — the project's own standing rule ("verify masking
-  changes against the actual attention-mask matrix, not just 'does it run'") applied here as a
-  direct numerical comparison against the already-trusted dense computation. **Not currently
-  needed for Run A** (`hmn_tpu_recall1024_flat_rope.py`'s HBM usage sits at ~29.5/31.25 GiB with
-  bucketing alone, not OOMing) — available as an opt-in lever if a future config needs it, and
-  asserted mutually exclusive with `bucket_lengths` for now (combining bucket-padding's variable
-  `Lb`/`loss_mask` with segmented forward's own loss reconstruction wasn't needed yet and would
-  add real complexity — not attempted).
-
-**Depth-axis remat granularity, adaptive-mix sampling, compile-time instrumentation, and a
-decode-jit rewrite that fixed a real ~35-minute eval bottleneck — all landed in `kvmem/hmn_jax.py`
-the same session (2026-07-31), same "verify against the dense/eager baseline before trusting it"
-discipline throughout.**
-- **Depth-axis `grad_checkpoint` granularity** — mirrors `forward_granularity`'s own int/float
-  duality onto the model-DEPTH checkpointing axis: `False` (none), `True`/`'block'` (per-layer,
-  unchanged default), an int >=1 (exact layer-group size), or a float in `(0,1]` (fraction of
-  `n_layers` per checkpoint group — `1.0` = whole stack as one group, still saves memory vs no
-  checkpointing since only that group's own input is retained, just with the fewest/largest
-  remat call-sites). `_grad_checkpoint_groups`/`_group_call`/`_group_call_remat`. **A real bug
-  caught and fixed during this**: `build_model` was doing `grad_checkpoint=bool(hp.get(...))` —
-  `bool(2)`/`bool(0.25)`/`bool('block')` are all `True`, silently collapsing every numeric/
-  string granularity down to the coarsest per-layer grouping regardless of what was configured.
-  Fixed by passing the raw value through unchanged. Verified bit-exact (loss AND full gradient
-  tree) against the no-checkpoint baseline across `False`/`True`/`'block'`/`1`/`2`/`4`/`8`/
-  `0.25`/`0.5`/`1.0` on a local CPU test, same seed/init every time.
-- **Adaptive weave_mix reweighting** — JAX port of `kvmem.hmn`'s own `_adapt_reweight`/
-  `_temp_softmax_rescale` (identical formula: harder-than-average trajectories scaled up, easier
-  ones down, floor-blended so nothing drops below `adapt_floor`'s relative share). Motivated by a
-  real gap: `hmn_tpu_recall1024_jax_adaptive_mix.py`'s 60-entry mixed-difficulty weave_mix (see
-  below) was originally sampled at STATIC uniform weight forever — mixing easy-and-hard entries
-  without ever shifting sampling effort toward whichever ones are still failing isn't meaningfully
-  a curriculum, just wider static coverage. `adapt_signal='val_match'` (default) skips adapting
-  until the 2nd eval (first reading is the noisiest). Verified the rescaling formula directly
-  (uniform difficulty stays uniform, a harder entry gets upweighted, sum preserved) before
-  deploying.
-- **`weights`/`traj_loss` now logged to both `train.log` and `train.jsonl` every `log_every`
-  step** (not just the sampled trajectory's own loss) — for plotting weight/loss evolution per
-  entry over training. Per-trajectory loss materialized every step now (small added host-sync
-  cost, traded for having the curve at all).
-- **Per-shape compile-time instrumentation** (`[compile] step_fn for L=...` lines, keyed by
-  `id(step_fn)` since bucketed/grouped step functions are SHARED across trajectories) — real
-  compile times turned out much noisier than expected: same 60-shape training-step compile set
-  measured 154s in one run and 994s in another, with individual shapes alternating between ~2s
-  and ~20s in no clean pattern (ruled out monotonic cache-size growth as the explanation — fast
-  and slow compiles interleave). Not root-caused; logged so future runs have the data rather than
-  guessing.
-- **`hmn_tpu_recall1024_jax*.py` config family renamed and made self-contained** —
-  `hmn_tpu_recall1024_flat_rope.py` (the torch base config the JAX chain used to `load_config`
-  from) was deleted from the working tree outside this session's own actions (found via `git
-  status` showing it and several other torch configs as uncommitted deletions); `hmn_tpu_
-  recall1024_jax.py` now inlines its own `hp` directly instead of depending on a file that may not
-  exist. Chain: `hmn_tpu_recall1024_jax.py` (base, `B=64`) -> `_smallbatch.py` (`B=8, lr_max=1e-4`
-  — the original `B=64, lr_max=6e-4` run was still at the random-baseline loss after 1000 steps,
-  projected 46-60 HOURS to finish; `lr_max=6e-4` was √-scaled for a B≈256 target that was never
-  actually deployed, `6e-4` is too high for the real `B=64`, and large `B` alone means far fewer
-  updates/minute — this exact wrong-LR failure mode already happened once before, see the
-  `hmn_tpu_sanity_w25.py` entry above) -> `_adaptive_mix.py` (extends the weave_mix to `n_chunks`
-  in `{2,4,8,12,16}`, 60 entries total, `bucket_lengths=False` since `w0` scales with `n_chunks`
-  — 5 distinct values, violating the bucket path's shared-`w0` requirement — plus `adaptive=True`).
-  Renamed from `..._curriculum.py` mid-session: "curriculum" was misleading (no staged/sequential
-  difficulty progression, just one stage with adaptive reweighting over a static mixed-difficulty
-  set) — "adaptive_mix" names what it actually is.
-- **Decode-jit rewrite — the big one, fixed a real ~35-minute eval bottleneck.** `ar_decode_
-  traj_kv`'s eager, token-at-a-time Python loop scales badly once `weave_mix` has 60 heterogeneous
-  entries (`out_len` up to ~2000): a live run's eval pass ran for over 35 minutes and still hadn't
-  finished when checked. Root cause understood via a local CPU benchmark (tiny model, one
-  `out_len=352` entry) comparing four approaches: **(A) eager baseline** 85-92s; **(B) naively
-  jit the per-step forward call as-is** (growing `past_kv` via `concat`) ~62-68s extrapolated —
-  barely better, because a DIFFERENT input shape every step forces a full XLA recompile every
-  token, and B's "advantage" is just compiled matmuls beating eager dispatch despite constantly
-  recompiling; **(C) fixed-size KV buffer** (`jax.lax.dynamic_update_slice` instead of `concat`,
-  keeps every step's shapes IDENTICAL) **+ forward-pass-only jit, Python loop**: 0.73-0.39s
-  (~118-236x); **(D) same fixed buffer + the WHOLE loop jitted via `jax.lax.fori_loop`** (zero
-  Python-level dispatch inside the loop at all): 0.24-0.09s (~358-1000x, cached calls fastest).
-  All four verified byte-identical match% against the eager baseline. Two real bugs caught while
-  building this: (1) `apply_rope`'s `jnp.arange(offset, offset+L)` requires a CONCRETE `offset`,
-  which would force a recompile every step even with a fixed buffer — rewritten to `jnp.arange(L)
-  + offset` (mathematically identical, but `offset` can now be a TRACED scalar since only `L`,
-  always static from shape, needs to be concrete) — existing static-offset callers verified
-  bit-exact afterward; (2) the first `write_pos` (fixed-buffer) implementation on `MHAttention.
-  __call__` returned the KV buffer AFTER `null_kv`'s extra column got concatenated onto it,
-  silently growing the "fixed" buffer by one column every call and breaking the static-shape
-  guarantee entirely — caught by a shape-mismatch crash on the SECOND decode step, not silently
-  wrong; fixed by capturing the buffer before the `null_kv` branch. `MHAttention.__call__`/
-  `SingleAttnBlock.__call__`/`HMNModel.__call__` all gained an optional `write_pos` param (default
-  `None`, byte-identical to before — regression-checked via a bit-exact forward-pass comparison
-  before AND after each of the two bug fixes above). `ar_decode_traj_kv_jit` (variant D) is now
-  wired into `train_jax`'s own eval loop, replacing `ar_decode_traj_kv`; compiled decode programs
-  are cached module-level (`_decode_jit_cache`, keyed by `(id(model), prefix_end, out_len)`) and
-  reused across BOTH different trajectories sharing a shape AND repeated eval calls within one
-  run — confirmed on a local smoke test (2.3s first eval including 6 compiles, 0.1s second eval,
-  same 6 shapes, zero new compiles) and then on the real 60-entry/1.12M-param run: **first eval
-  279.8s total** (compiling all 60 decode shapes for the first time) vs. the eager path's 35+
-  minutes and still not done — roughly 7-8x faster even INCLUDING first-time compile cost, with
-  every later eval expected to be dramatically faster still once nothing new needs compiling.
-  `val/weave/decode_time_total` (+ per-entry `decode=Xs` alongside each match% line, + `train.
-  jsonl`'s `eval_decode_total_s`/`traj_decode_s`) now logged every eval specifically to track this.
-  Confirmed the caching itself is correct (not silently serving stale weights) via a direct local
-  test: decode before vs. after 200 real training steps on the same cached compiled function gave
-  different match% (0.57% -> 0.28%), proving `nnx.jit`'s per-call state-splitting reads current
-  params every time — only the compiled PROGRAM is cached by `(id(model), prefix_end, out_len)`,
-  never the weight values.
-
-**Staged curriculum (`hmn_tpu_recall1024_jax_curriculum_staged.py`, 5 sequential stages `n_chunks`
-2→4→8→12→16, each gated by `early_stop_mean=90.0`) — first real run surfaced two genuine bugs in
-`train_jax` itself, both fixed (2026-07-31).** Stage 0 (n_chunks=2, easiest) peaked at val
-MEAN=34.7% around step 16000-17000, then collapsed to ~1% over the next several evals with NO
-warning in the logged training loss (which kept declining smoothly the whole time) — confirmed via
-a direct decode comparison that this was NOT a decode-jit bug (eager vs jit agreed exactly on the
-collapsed checkpoint). Root cause investigation found two real gaps:
-- **No gradient clipping anywhere in `hmn_jax.py`** — `kvmem.hmn`'s own `train()` clips every step
-  (`torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)`, immediately after `backward()`); the
-  JAX port had plain `optax.adamw` with nothing composed in front of it. An unclipped outlier
-  gradient is a textbook cause of exactly this failure signature (loss looks fine, generation
-  quality collapses). Fixed: `hp['grad_clip_norm']` (default `1.0`, matching torch's hardcoded
-  value) composes `optax.clip_by_global_norm` in front of `adamw` via `optax.chain`; set to
-  `None`/`0` to reproduce the old unclipped behavior. Verified the composition actually clips
-  (a `[100,100,100]` gradient reduces to global norm ~1.0) before deploying.
-- **Curriculum stages warm-continued from whatever the live model held, not from that stage's own
-  best checkpoint** — so stage 1 inherited stage 0's COLLAPSED final weights (not its 34.7%-best
-  state) and, unsurprisingly, never recovered (finished its own full 30000 steps at MEAN=0.5%,
-  worse than the collapse it inherited) — a real cascading-failure design gap, not a training
-  instability question at all. Fixed: `hp['warm_start_from_best']` (default `True`) loads the
-  previous stage's own `stage{i-1}_best.pt` at the start of each new stage instead of continuing
-  from wherever training happened to land; set to `False` to reproduce the old always-continue
-  behavior. Verified locally (multi-stage smoke test confirms the "warm-started from stage N's own
-  best checkpoint" log line fires and the loaded weights are actually used).
-
-Both fixes verified independently before combining (grad-clip composition math checked in
-isolation; warm-start log line + checkpoint load confirmed in a 2-stage local smoke test) and
-together (same smoke test, both features active, no errors). Curriculum relaunched from scratch
-with both fixes rather than resumed from the now-poisoned checkpoints.
-
-- **`hmn_tpu_recall1024_jax_adaptive_mix.py` — first full run, done.** 20000 steps, `B=8`,
-  `lr_max=1e-4`, all fixes above combined (small batch, corrected LR, adaptive reweighting, jit
-  decode eval). Compile: 60 training shapes in 154-994s across different runs (noisy, not
-  root-caused — see compile-time-instrumentation entry above). Loss declined from the random
-  baseline (~5.545) down into the 5.25-5.35 range with real per-entry differentiation by step
-  4000-6000 (previously stuck flat at baseline for 2000+ steps before the small-batch/LR fixes).
-  **val MEAN**: 0.2% (step 2000) -> 0.5% (4000) -> 19.1% (6000) -> 33.7% (8000) -> **plateaued at
-  33.7-33.9% for the remaining 12000 steps** (evals at 10000/12000/14000/16000/18000/20000 all
-  landed within 0.2pp of each other) despite train loss continuing to decline the whole time —
-  a genuine generalization plateau, not an artifact (loss-still-falling-but-match-flat is exactly
-  the signature CLAUDE.md's own `hmn_single_recall_c128` entry already documents as "undertrained"
-  ELSEWHERE, but here 12000 steps of flat match against a still-declining loss reads more like a
-  real ceiling at this model scale/step budget than simple undertraining — not conclusively
-  settled either way). **Final: MEAN=33.9%, best checkpoint=33.9%** (same value, `stage0_end.pt`).
-  Adaptive weights stayed close to uniform throughout (0.01-0.02 range) — the difficulty spread
-  across entries was never large enough for the reweighting to meaningfully concentrate effort on
-  a specific subset. Natural next steps, not yet done: longer budget to see if the plateau is
-  truly a ceiling or would eventually break: a bigger model; or inspecting whether specific
-  entries (e.g. the hardest near-start-anchor ones, per this project's own recurring "near-end
-  anchor easy / near-start anchor hard" pattern) are the ones actually capping the MEAN.
+1. **Single-step encode/decode** — **CORRECTED 2026-07-31 (huge-step-back)**: `hmn_tpu_sanity_
+   w25_rope_jax_nocurr.py`'s no-curriculum, all-lengths-mixed-in-one-stage design ran its full
+   200000-step budget on `v6e-4-2` and finished at only **best=17.0% val MEAN** (well below
+   `early_stop_mean=80.0`) — the qualitative eyeball (`log_qualitative_eyeball`, new this session)
+   showed the model getting 1-2 bytes right after warmup then collapsing into repeating a single
+   byte (`'''''''`, `]]]`) rather than tracking the sequence, a genuine partial-learning-then-
+   collapse pattern, not a clean pass. **Reverted to `hmn_tpu_sanity_w25_rope_jax.py`** — a direct
+   JAX port of the ALREADY-PROVEN torch curriculum (`hmn_tpu_sanity_w25_rope.py`/`hmn_notags_w25_
+   rope`'s own staged design: `chunk_len` 8 → 16 → 32 → 64, each stage gated by `early_stop_
+   mean=80.0` before advancing, each later stage rehearsing earlier lengths at `weight=0.5`), at
+   the same `d=128, n_layers=16, n_heads=8` (~1.1M params) architecture the `_nocurr` attempt
+   used — the actual fix is restoring curriculum STAGING, not a model-size change (that part was
+   already correct). One encode chunk, one decode/recall query per entry; proves the target-sized
+   model can do the easy task at all, one length at a time with a real convergence gate, before
+   ever touching multi-chunk chaining.
+2. **Multi-step encode, single-step decode (`stitch`)** — built on the `hmn_tpu_recall1024_jax_
+   hopdrop.py` mechanism (`enc_hops`/`hop_drop_prob`, bounded+stochastically-dropped encoding-
+   chain window — see the "Masking rule names"/`enc_hops` entries near the top of this file), not
+   a plain fixed-window suffix recall. Two requirements, corrected 2026-07-31 (supersedes the
+   original wording of this stage):
+   - **Anchor placement GENERALIZED**: the warmup anchor may sit on ANY chunk (not clustered near
+     the end, which is what let the model find the "near-end anchor easy" positional shortcut
+     documented throughout this file), and the supervised response must cover **two consecutive
+     chunks or more** counted from the anchor's own chunk — UNLESS the anchor's chunk is the last
+     chunk (nothing left to recall past it, a genuine single-chunk-remainder case). Targets the
+     "near-start anchor hard, near-end anchor easy" failure pattern by construction: every anchor
+     position gets a genuinely multi-chunk recall requirement, not just the near-end ones that
+     happen to have a long tail regardless of anchor choice.
+   - **`hop=1`-usable but NOT `hop=1`-only**: the final trained model must work correctly at
+     `hops=1` (the minimal/most-constrained relay window — only the immediately preceding chunk's
+     STATE) since that's the cheapest/most scalable inference mode, but must ALSO generalize to
+     wider `hops` windows with STRICTLY BETTER accuracy as more context becomes available, not
+     brittleness where only the exact hop count trained on works (or worse, where widening the
+     window HURTS). This is precisely what `eval_combinatorial_hops`/`val/weave/hopcombo/S=...`
+     was built to verify — a passing stage 2 should show hopcombo MEAN monotonically
+     non-decreasing as `|S|` grows from `{1}` up to the full `{1..enc_hops}` window, not flat or
+     inverted. `hop_drop_prob`'s own back=1-never-dropped design already trains toward this
+     (every step sees at least the hop=1 case, wider windows are the "bonus" the model must learn
+     to actually use, not just tolerate) — this requirement makes that training-time property an
+     explicit, checked EVAL criterion for calling stage 2 done, not just an implicit hope.
+3. **Bridging stages, inserted as needed** — if stage 2 doesn't converge jumping directly from
+   stage 1, add whatever intermediate task/trajectory shape is required (e.g. a 2-chunk stitch
+   stage before 4/8/16-chunk, a narrower `enc_hops` window before widening it, a smaller anchor
+   grid before the dense one) — this roadmap is deliberately NOT a fixed pre-specified ladder;
+   the stage-2 entry above is the target shape, not a promise that it's reachable in one hop from
+   stage 1. Diagnose the specific failure (per-entry breakdown, not just aggregate MEAN — see the
+   "positional-shortcut-to-content-addressing trade-off" entry above for why) before deciding
+   what bridging stage to insert.
 
 ---
 
@@ -753,6 +185,7 @@ with both fixes rather than resumed from the now-poisoned checkpoints.
 - **Always verify masking changes against the actual attention-mask matrix, not just "does it run"** — a smoke test that completes without crashing says nothing about whether the intended access pattern is actually being enforced (the `hop` encoding-pass leak ran and trained "successfully" for the whole time it was unintentionally leaky). Check specific (row, col) blocks directly, per chain step/op, before trusting a masking change.
 - **Report precisely, never round up** — state exactly what was measured (e.g. a padded/truncated excerpt), not the whole file
 - **Verify infra before trusting it mid-run**: always check process liveness (`ps -p <pid>`) explicitly on every wake, not just log content — a silently-exited process produces no new log lines
+- **Flag suspiciously long/slow jobs instead of silently waiting on them** — a background job with no output for a long stretch is not automatically "still working," but it's also not automatically "stuck": check CPU-time growth (`ps -o pid,time,%cpu`) to distinguish a live-but-slow process from a hung one, and separately sanity-check the workload's own cost model (e.g. full-recompute/`nokv`-style decode is `O(out_len·L²)` — a real production-scale `L` can be 100-1000x more expensive per call than the small shape a script was first verified against) before assuming a stall. If the estimated cost is impractical, don't just let it keep running — kill it and rescope (fewer entries, shorter/prefix-only cases, or a cheaper proxy) rather than wait hours for a check that could've taken minutes. Also route any long-running remote job's stdout to a real file (`nohup ... > file.log 2>&1 &`, then `disown`), never to a bare `&`-backgrounded shell inside an SSH command — the multiplexed channel's pipe can outlive the reader, and a process that eventually tries to write to a dead pipe risks a crash (`BrokenPipeError`) with nothing captured.
 - **Never run two training jobs at once**
 - **Editing `kvmem/hmn.py` while a training job is running is safe** — Python has already loaded the module into the live process's memory; on-disk edits don't affect it. Verified multiple times this session (deleting `h_inject`, the vocab reorder) without disrupting an in-progress run.
 
@@ -764,9 +197,13 @@ with both fixes rather than resumed from the now-poisoned checkpoints.
 |------|-------|
 | **`docs/HMN_RECIPE.md`** — quickstart + current-state-only reference (model architecture, the E/S/Q trajectory DSL, the relay, val/test mechanics) for a newcomer with zero context | [`docs/HMN_RECIPE.md`](docs/HMN_RECIPE.md) |
 | **`docs/HISTORY.md`** — the full narrative: every design decision, terminology evolution, the deleted `relay`/`STATE_QUEUE` mechanism, the vocab reorder, structured-data track detail, compression diagnostics design, a classical/non-DNN alternatives discussion | [`docs/HISTORY.md`](docs/HISTORY.md) |
-| **`docs/TRC_TPU.md`** — planning estimate (not yet implemented) for TPU Research Cloud access: TRC tier specs (v2/v3/v4-8 HBM), 1M/10M/50M-param architecture options sized to this project's `single_attn` param formula, per-tier batch-size ballparks, sequence-packing tradeoffs, bf16 caveats, and the eager-PyTorch→XLA/JAX porting prerequisite | [`docs/TRC_TPU.md`](docs/TRC_TPU.md) |
+| **`docs/RESULTS_LOG.md`** — the append-only experiment ledger going forward: every training run's outcome, chronological, including the pre-TPU torch results and the live Experiment 1/2 roadmap numbers | [`docs/RESULTS_LOG.md`](docs/RESULTS_LOG.md) |
+| **`docs/TPU_JAX_PORT.md`** — the full TPU porting forensics: the abandoned `torch_xla` saga (bugs 1-7, never root-caused instability) and the from-scratch JAX/Flax NNX port that replaced it, now the only supported TPU path | [`docs/TPU_JAX_PORT.md`](docs/TPU_JAX_PORT.md) |
+| **`docs/tpu_setup.md`** + **`docs/tpu_direct_ssh.md`** — day-to-day TPU operational how-to: gcloud commands, persistent SSH, tmux conventions, common failure modes | [`docs/tpu_setup.md`](docs/tpu_setup.md), [`docs/tpu_direct_ssh.md`](docs/tpu_direct_ssh.md) |
+| **`docs/HMN_WALKTHROUGH.md`** — train & eval walkthrough, c64 → weave pipeline | [`docs/HMN_WALKTHROUGH.md`](docs/HMN_WALKTHROUGH.md) |
+| **`kvmem_jax/`** — a deliberately non-DRY, standalone fork of `kvmem/hmn_jax.py` (not imported by or importing from `kvmem/`), created 2026-09-06 (originally `kvmem_mlp/`, renamed) to test capacity-increasing hypotheses at the roadmap-stage-2 `chunk_len=16→32` collapse — added real `block_type='attn_mlp'` support (refuted as the fix) and the STATE-capacity ablation (`state_len=8`/`state_vocab_size=2`): a real 6-10x win at chunk_len=32 (27.5-28.6% vs. 2.4-4.6% collapse) that decayed again by the final stage (14.7-15.8% at chunk_len=64 + bounded `enc_hops` relay, run complete as of 2026-09-10, no early stop reached) — plus the first-ever `n_refine>0` training run in this project. Own `configs/`/`logs/` subdirectories. **Ran entirely single-chip (`data_parallel` never enabled) — see the URGENT MFU note above; a retrain is a TODO before treating the final 14.7-15.8% as a real ceiling rather than an artifact of an exhausted step budget on a badly-underutilized setup.** Full trail: `docs/RESULTS_LOG.md`'s "`kvmem_jax` fork" entry. |
 | The rewrite plan (original design/approval record — every naming decision, worked `STATE_QUEUE` example predating the `hop` mechanism, why each choice was made) | [`/Users/muaz/.claude/plans/design-experiment-which-use-atomic-kay.md`](/Users/muaz/.claude/plans/design-experiment-which-use-atomic-kay.md) |
-| Current implementation | [`kvmem/hmn.py`](kvmem/hmn.py) (single file), active configs in [`kvmem/configs/`](kvmem/configs/) (completed/superseded configs archived under [`kvmem/configs/archive/`](kvmem/configs/archive/)), structured-data generators in [`kvmem/structured_data.py`](kvmem/structured_data.py), compression diagnostics in [`kvmem/eval_compression.py`](kvmem/eval_compression.py), trajectory-generalization diagnostics in [`kvmem/eval_weave.py`](kvmem/eval_weave.py), positional-shortcut diagnostics in [`kvmem/probe_positional_shortcut.py`](kvmem/probe_positional_shortcut.py) (behavioral swap test, `batch`/`interleave_delayed` shapes) and [`kvmem/probe_mechanistic_addressing.py`](kvmem/probe_mechanistic_addressing.py) (attention-mass + gradient-saliency counterpart, uses `MHAttention.capture_attn` in `hmn.py`); the suffix-recall/stitch design's own single-query shape has its own pair, [`kvmem/probe_stitch_content_addressing.py`](kvmem/probe_stitch_content_addressing.py) (behavioral swap test) and [`kvmem/probe_stitch_mechanistic_addressing.py`](kvmem/probe_stitch_mechanistic_addressing.py) (mechanistic counterpart, adapted for `hops=-1` routing) |
+| Current implementation | [`kvmem/hmn.py`](kvmem/hmn.py) (single file), active configs in [`kvmem/configs/`](kvmem/configs/) — 12 configs left active as of 2026-09-06 (the recall1024/Experiment-1-2 lineage, the local torch recipes `hmn_notags_w25(_rope).py`/`hmn_tpu_sanity_w25_rope.py`, the still-open structured-data ablation, `hmn_single_recall_c64.py`, `hmn_squeeze_markov_n4.py`) — everything else moved to [`kvmem/configs/archive/`](kvmem/configs/archive/) (pre-existing archive), [`kvmem/configs/archive_recall1024_superseded/`](kvmem/configs/archive_recall1024_superseded/) (earlier recall1024/stitch attempts superseded by the incremental-curriculum path), or [`kvmem/configs/archive_concluded_investigations/`](kvmem/configs/archive_concluded_investigations/) (positional-shortcut/NoPE/anchor investigations whose findings are already in `docs/HISTORY.md`), structured-data generators in [`kvmem/structured_data.py`](kvmem/structured_data.py), compression diagnostics in [`kvmem/eval_compression.py`](kvmem/eval_compression.py), trajectory-generalization diagnostics in [`kvmem/eval_weave.py`](kvmem/eval_weave.py), positional-shortcut diagnostics in [`kvmem/probe_positional_shortcut.py`](kvmem/probe_positional_shortcut.py) (behavioral swap test, `batch`/`interleave_delayed` shapes) and [`kvmem/probe_mechanistic_addressing.py`](kvmem/probe_mechanistic_addressing.py) (attention-mass + gradient-saliency counterpart, uses `MHAttention.capture_attn` in `hmn.py`); the suffix-recall/stitch design's own single-query shape has its own pair, [`kvmem/probe_stitch_content_addressing.py`](kvmem/probe_stitch_content_addressing.py) (behavioral swap test) and [`kvmem/probe_stitch_mechanistic_addressing.py`](kvmem/probe_stitch_mechanistic_addressing.py) (mechanistic counterpart, adapted for `hops=-1` routing) |
 | `kvmem/hmn.py` dated snapshots (`hmn_v1_backup.py` through `hmn_v4_backup.py` — pre-cleanup draft, post-cleanup, pre-DSL/repeat_batch/stitch feature work, and the pre-promotion old tagged design respectively) were **deleted** (not archived) once the promoted `kvmem/hmn.py` stabilized — they were pure diffing artifacts, never imported by anything, and their content is superseded by the current file plus this doc's own narrative (Results section, `docs/HISTORY.md` §15). `archive_v1/` remains the actual archival record for pre-rewrite code/docs. | — |
 | Everything from before the rewrite (dual-attn discovery, RMSNorm, stitching, `juz1.txt` design, MDL theory, all prior architecture history — code AND docs) | [`archive_v1/`](archive_v1/) — old `kvmem/`, old `experiments/`, old `docs/` (`SRS_RECIPE.md`, `EARLY_ARCHITECTURE_HISTORY.md`, `MDL_MODEL_SIZE.md`, etc. all moved here, `docs/` at the repo root is a fresh start for this rewrite going forward) |
 | Previous version of this file | [`archive_v1/CLAUDE_v1.md`](archive_v1/CLAUDE_v1.md) |

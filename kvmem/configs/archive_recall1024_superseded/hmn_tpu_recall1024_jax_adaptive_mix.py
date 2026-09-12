@@ -49,6 +49,10 @@ hp['name'] = 'hmn_tpu_recall1024_jax_adaptive_mix'
 hp['bucket_lengths'] = False
 hp['adaptive'] = True
 hp['adapt_signal'] = 'val_match'
+hp['grad_clip_norm'] = 1.0  # matches kvmem.hmn's own hardcoded torch value; made explicit
+                            # here (rather than relying on train_jax's own default) since
+                            # several other configs (hmn_notags_w25_rope_jax_sanity_c8*.py,
+                            # hmn_tpu_recall1024_jax_hopdrop.py) load_config from THIS file
 
 
 def _weave_mix_for(n_chunks, chunk_len=64, warmup_lens=(16, 32, 64)):
